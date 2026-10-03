@@ -6278,3 +6278,171 @@ async def v21_scan_now():
         "generated_utc": utc_now(),
     }
 
+
+# =========================
+# V22 TELEGRAM NOTIFICATIONS
+# =========================
+# Operational change only. Frozen Candidate B strategy is unchanged.
+# Secrets are read from Render environment variables.
+
+V22_TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+V22_TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
+
+async def v22_telegram_send(message: str):
+    if not V22_TG_TOKEN or not V22_TG_CHAT_ID:
+        return {"sent": False, "reason": "telegram_not_configured"}
+
+    url = f"https://api.telegram.org/bot{V22_TG_TOKEN}/sendMessage"
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        r = await client.post(
+            url,
+            json={
+                "chat_id": V22_TG_CHAT_ID,
+                "text": message,
+                "disable_web_page_preview": True,
+            },
+        )
+        r.raise_for_status()
+    return {"sent": True}
+
+
+async def v22_run_notify_and_persist():
+    V21_LAST_SCAN["status"] = "RUNNING"
+    V21_LAST_SCAN["started_utc"] = utc_now()
+    V21_LAST_SCAN["error"] = None
+
+    try:
+        result = await v20_scan_once()
+
+        notifications = []
+
+        for p in result.get("new_entries", []):
+            msg = (
+                "ALT V22 PAPER ENTRY\n"
+                f"Coin: {p['symbol']}\n"
+                f"Entry: {p['entry_price']}\n"
+                f"Z: {p['relative_momentum_z']}\n"
+                f"Top percentile: {p['cross_section_percentile']}\n"
+                f"60m continuation: {p['wait_end_change_pct']}%\n"
+                f"BTC 4h: {p['btc_4h_pct']}%\n"
+                f"BTC 24h: {p['btc_24h_pct']}%\n"
+                f"ALT mean 30m: {p['alt_market_mean_30m_pct']}%\n"
+                "Exit: paper, 120 minutes\n"
+                "Trading: FALSE | Orders: FALSE"
+            )
+            notifications.append(await v22_telegram_send(msg))
+
+        for p in result.get("newly_closed", []):
+            msg = (
+                "ALT V22 PAPER EXIT\n"
+                f"Coin: {p['symbol']}\n"
+                f"Entry: {p['entry_price']}\n"
+                f"Exit: {p['exit_price']}\n"
+                f"Gross: {p['gross_pct']}%\n"
+                f"Cost: {p['cost_pct']}%\n"
+                f"NET: {p['net_pct']}%\n"
+                "Trading: FALSE | Orders: FALSE"
+            )
+            notifications.append(await v22_telegram_send(msg))
+
+        if V21_DB_URL:
+            v21_save_state()
+
+        V21_LAST_SCAN["status"] = result.get("status", "OK")
+        result["telegram_notifications"] = notifications
+        return result
+
+    except Exception as e:
+        V21_LAST_SCAN["status"] = "ERROR"
+        V21_LAST_SCAN["error"] = str(e)
+        return {"status": "ERROR", "error": str(e)}
+    finally:
+        V21_LAST_SCAN["finished_utc"] = utc_now()
+
+
+async def v22_auto_loop():
+    await asyncio.sleep(15)
+    while True:
+        await v22_run_notify_and_persist()
+        await asyncio.sleep(V21_SCAN_INTERVAL_SECONDS)
+
+
+# Replace the V21 startup task with the V22 notification-aware loop.
+@app.on_event("startup")
+async def v22_startup():
+    global V21_AUTO_TASK
+    # V21 startup may already have created its loop. Cancel it so there is
+    # exactly one automatic scanner.
+    if V21_AUTO_TASK is not None and not V21_AUTO_TASK.done():
+        V21_AUTO_TASK.cancel()
+
+    try:
+        if V21_DB_URL:
+            v21_init_db()
+            v21_load_state()
+    except Exception as e:
+        V21_LAST_SCAN["status"] = "DB_STARTUP_ERROR"
+        V21_LAST_SCAN["error"] = str(e)
+
+    V21_AUTO_TASK = asyncio.create_task(v22_auto_loop())
+
+
+@app.get("/v22-status")
+async def v22_status():
+    return {
+        "model": MODEL,
+        "mode": "RESEARCH_PAPER_ONLY",
+        "trading": False,
+        "orders": False,
+        "strategy": "V20_FROZEN_CANDIDATE_B_FORWARD_PAPER",
+        "strategy_changed": False,
+        "automation": {
+            "enabled": True,
+            "scan_interval_seconds": V21_SCAN_INTERVAL_SECONDS,
+            "last_scan": V21_LAST_SCAN,
+        },
+        "persistence": {
+            "database_configured": bool(V21_DB_URL),
+            "backend": "POSTGRESQL" if V21_DB_URL else "MEMORY_ONLY",
+        },
+        "telegram": {
+            "configured": bool(V22_TG_TOKEN and V22_TG_CHAT_ID),
+            "entry_notifications": True,
+            "exit_notifications": True,
+        },
+        "paper": v20_public_state(),
+        "generated_utc": utc_now(),
+    }
+
+
+@app.get("/v22-telegram-test")
+async def v22_telegram_test():
+    result = await v22_telegram_send(
+        "ALT Momentum V22 test OK\n"
+        "Forward paper notifications are connected.\n"
+        "Trading: FALSE | Orders: FALSE"
+    )
+    return {
+        "status": "OK" if result.get("sent") else "NOT_CONFIGURED",
+        "telegram": result,
+        "trading": False,
+        "orders": False,
+        "generated_utc": utc_now(),
+    }
+
+
+@app.get("/v22-scan-now")
+async def v22_scan_now():
+    result = await v22_run_notify_and_persist()
+    return {
+        "model": MODEL,
+        "mode": "RESEARCH_PAPER_ONLY",
+        "trading": False,
+        "orders": False,
+        "signal": bool(result.get("new_entries")),
+        "scan": result,
+        "paper": v20_public_state(),
+        "generated_utc": utc_now(),
+    }
+
