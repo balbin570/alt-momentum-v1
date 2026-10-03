@@ -359,6 +359,7 @@ async def root():
             "/continuation-combo90?count=30&days=90",
             "/h6-validate?count=30&days=365",
             "/h6-regime?count=30&days=365",
+            "/h6-trailing?count=30&days=365",
         ],
     }
 
@@ -2846,6 +2847,357 @@ async def h6_regime_v8(
                 "broader trend direction. Regime buckets use only information "
                 "available at the signal time and are descriptive, not yet "
                 "entry filters."
+            ),
+        }
+
+    except Exception as e:
+        return {
+            **MODE_INFO,
+            "status": "ERROR",
+            "signal": False,
+            "error": str(e),
+            "generated_utc": utc_now(),
+        }
+
+TRAILING_LEVELS_V9 = (0.5, 1.0, 1.5)
+MAX_HOLD_MINUTES_V9 = 120
+
+
+def simulate_trailing_v9(candles, signal_index, trail_pct):
+    """
+    Conservative 5m OHLC trailing-stop simulation.
+
+    Entry:
+      next 5m candle OPEN after the completed H6 signal.
+
+    Intrabar rule:
+      At each candle, first test LOW against the stop that was known
+      BEFORE that candle's HIGH is allowed to raise the stop.
+      This avoids assuming a favorable HIGH-before-LOW path.
+
+    Exit:
+      trailing stop if hit, otherwise OPEN exactly 120m after entry.
+    """
+    entry_idx = signal_index + 1
+    max_exit_idx = signal_index + 25  # 120m after next-candle-open entry
+
+    if max_exit_idx >= len(candles):
+        return None
+
+    entry_price = candles[entry_idx]["open"]
+    highest = entry_price
+    stop = highest * (1.0 - trail_pct / 100.0)
+
+    exit_price = None
+    exit_time = None
+    exit_reason = None
+    exit_idx = None
+
+    # Process entry candle through the candle immediately before max-time OPEN.
+    for j in range(entry_idx, max_exit_idx):
+        c = candles[j]
+
+        # Conservative ordering: known stop is tested before current high
+        # can tighten it.
+        if c["low"] <= stop:
+            exit_price = stop
+            exit_time = c["close_time"]
+            exit_reason = "TRAILING_STOP"
+            exit_idx = j
+            break
+
+        if c["high"] > highest:
+            highest = c["high"]
+            stop = highest * (1.0 - trail_pct / 100.0)
+
+    if exit_price is None:
+        exit_price = candles[max_exit_idx]["open"]
+        exit_time = candles[max_exit_idx]["open_time"]
+        exit_reason = "MAX_120M_OPEN"
+        exit_idx = max_exit_idx
+
+    gross = pct_change(entry_price, exit_price)
+    net = gross - ROUND_TRIP_COST_PCT
+
+    # Approximate hold from 5m bars; max-time exit is exactly 120m.
+    hold_minutes = (exit_idx - entry_idx) * 5
+    if exit_reason == "TRAILING_STOP":
+        hold_minutes += 5
+
+    return {
+        "trail_pct": trail_pct,
+        "entry_price": entry_price,
+        "exit_price": exit_price,
+        "gross_pct": gross,
+        "net_pct": net,
+        "exit_reason": exit_reason,
+        "hold_minutes": hold_minutes,
+        "highest_price_seen": highest,
+    }
+
+
+def h6_trailing_events_v9(candles, symbol):
+    """
+    Frozen H6 entry. Only exit mechanics vary.
+    """
+    events = []
+
+    for i in range(7, len(candles) - 25):
+        signal_close = candles[i]["close"]
+
+        mom5 = pct_change(candles[i - 1]["close"], signal_close)
+        mom30 = pct_change(candles[i - 6]["close"], signal_close)
+
+        if not (1.0 <= mom30 < 2.0):
+            continue
+
+        first15 = pct_change(
+            candles[i - 6]["close"],
+            candles[i - 3]["close"],
+        )
+        last15 = pct_change(
+            candles[i - 3]["close"],
+            signal_close,
+        )
+        acceleration = last15 - first15
+
+        window_high = max(
+            candles[j]["high"] for j in range(i - 5, i + 1)
+        )
+        pullback = pct_change(window_high, signal_close)
+
+        old_vol = mean(
+            candles[j]["volume"] for j in range(i - 5, i - 2)
+        )
+        recent_vol = mean(
+            candles[j]["volume"] for j in range(i - 2, i + 1)
+        )
+        vol_persistence = recent_vol / old_vol if old_vol > 0 else 0
+
+        # H6 remains frozen.
+        if vol_persistence < 1.2:
+            continue
+        if pullback >= -0.75:
+            continue
+        if mom5 <= 0:
+            continue
+        if acceleration <= 0.25:
+            continue
+
+        entry = candles[i + 1]
+
+        row = {
+            "symbol": symbol,
+            "signal_time_utc": datetime.fromtimestamp(
+                candles[i]["close_time"] / 1000,
+                tz=timezone.utc,
+            ).isoformat(),
+            "entry_time_utc": datetime.fromtimestamp(
+                entry["open_time"] / 1000,
+                tz=timezone.utc,
+            ).isoformat(),
+            "entry_open_time": entry["open_time"],
+            "momentum_5m_pct": mom5,
+            "momentum_30m_pct": mom30,
+            "volume_persistence_ratio": vol_persistence,
+            "pullback_from_30m_peak_pct": pullback,
+            "acceleration_pct_points": acceleration,
+            "trailing": {},
+        }
+
+        for trail in TRAILING_LEVELS_V9:
+            sim = simulate_trailing_v9(candles, i, trail)
+            if sim is not None:
+                row["trailing"][str(trail)] = sim
+
+        if len(row["trailing"]) == len(TRAILING_LEVELS_V9):
+            # Compatibility: cooldown helper only needs timing; these fields
+            # make the row compatible with existing utilities if required.
+            row["gross_pct"] = row["trailing"]["1.0"]["gross_pct"]
+            row["net_pct"] = row["trailing"]["1.0"]["net_pct"]
+            events.append(row)
+
+    return events
+
+
+def summarize_trailing_v9(events, trail_pct):
+    key = str(trail_pct)
+    vals = [
+        e["trailing"][key]["net_pct"]
+        for e in events
+        if key in e["trailing"]
+    ]
+
+    if not vals:
+        return {
+            "trade_count": 0,
+            "mean_net_pct": None,
+            "median_net_pct": None,
+            "win_rate_net_pct": None,
+            "profit_factor": None,
+            "best_net_pct": None,
+            "worst_net_pct": None,
+            "trailing_stop_exit_pct": None,
+            "max_120m_exit_pct": None,
+            "mean_hold_minutes": None,
+        }
+
+    svals = sorted(vals)
+    n = len(svals)
+    med = (
+        svals[n // 2]
+        if n % 2
+        else (svals[n // 2 - 1] + svals[n // 2]) / 2
+    )
+
+    wins = [x for x in vals if x > 0]
+    losses = [x for x in vals if x < 0]
+    gp = sum(wins)
+    gl = abs(sum(losses))
+    pf = gp / gl if gl > 0 else None
+
+    reasons = [
+        e["trailing"][key]["exit_reason"]
+        for e in events
+        if key in e["trailing"]
+    ]
+    holds = [
+        e["trailing"][key]["hold_minutes"]
+        for e in events
+        if key in e["trailing"]
+    ]
+
+    stop_n = sum(1 for x in reasons if x == "TRAILING_STOP")
+    max_n = sum(1 for x in reasons if x == "MAX_120M_OPEN")
+
+    return {
+        "trade_count": n,
+        "mean_net_pct": round(mean(vals), 4),
+        "median_net_pct": round(med, 4),
+        "win_rate_net_pct": round(len(wins) / n * 100, 2),
+        "profit_factor": round(pf, 4) if pf is not None else None,
+        "best_net_pct": round(max(vals), 4),
+        "worst_net_pct": round(min(vals), 4),
+        "trailing_stop_exit_pct": round(stop_n / n * 100, 2),
+        "max_120m_exit_pct": round(max_n / n * 100, 2),
+        "mean_hold_minutes": round(mean(holds), 2),
+    }
+
+
+def trailing_report_v9(events):
+    return {
+        f"trail_{trail_pct:.1f}pct": summarize_trailing_v9(
+            events, trail_pct
+        )
+        for trail_pct in TRAILING_LEVELS_V9
+    }
+
+
+@app.get("/h6-trailing")
+async def h6_trailing_v9(
+    count: int = Query(default=30, ge=5, le=30),
+    days: int = Query(default=365, ge=90, le=365),
+):
+    """
+    V9: Frozen H6 entry + trailing-stop exit study.
+    Research/paper only. No orders.
+    """
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(180.0)
+        ) as client:
+            universe_data = await build_universe(client)
+            selected = universe_data[:count]
+            semaphore = asyncio.Semaphore(2)
+
+            async def worker(item):
+                async with semaphore:
+                    try:
+                        candles = await get_5m_candles_days(
+                            client, item["symbol"], days
+                        )
+                        events = h6_trailing_events_v9(
+                            candles, item["symbol"]
+                        )
+                        events = apply_symbol_cooldown_v4(events, 60)
+                        return {
+                            "ok": True,
+                            "symbol": item["symbol"],
+                            "events": events,
+                        }
+                    except Exception as e:
+                        return {
+                            "ok": False,
+                            "symbol": item["symbol"],
+                            "error": str(e),
+                        }
+
+            results = await asyncio.gather(
+                *[worker(x) for x in selected]
+            )
+
+        successful = [x for x in results if x.get("ok")]
+        failed = [x for x in results if not x.get("ok")]
+
+        all_events = []
+        for item in successful:
+            all_events.extend(item["events"])
+
+        # Retain the same split convention for comparability with V7/V8.
+        dev, oos = split_dev_oos(all_events)
+
+        per_coin = []
+        for item in successful:
+            if item["events"]:
+                per_coin.append({
+                    "symbol": item["symbol"],
+                    "trade_count": len(item["events"]),
+                    "trailing": trailing_report_v9(item["events"]),
+                })
+
+        return {
+            **MODE_INFO,
+            "status": "OK",
+            "signal": False,
+            "study": "FROZEN_H6_TRAILING_EXIT_STUDY",
+            "days": days,
+            "selected_coin_count": len(selected),
+            "successful_coin_count": len(successful),
+            "failed_coin_count": len(failed),
+            "h6_entry_rule_changed": False,
+            "frozen_h6_rule": {
+                "momentum_30m_pct": ">=1.0 and <2.0",
+                "volume_persistence_ratio": ">=1.2",
+                "pullback_from_30m_peak_pct": "<-0.75",
+                "momentum_5m_pct": ">0",
+                "acceleration_pct_points": ">0.25",
+            },
+            "entry_model": "NEXT_5M_CANDLE_OPEN",
+            "exit_models": [
+                "0.5% trailing stop; max 120m",
+                "1.0% trailing stop; max 120m",
+                "1.5% trailing stop; max 120m",
+            ],
+            "intrabar_assumption": (
+                "CONSERVATIVE: candle LOW tests the previously-known stop "
+                "before that candle HIGH may raise the trailing stop"
+            ),
+            "round_trip_cost_pct": ROUND_TRIP_COST_PCT,
+            "same_symbol_signal_cooldown_minutes": 60,
+            "event_count": len(all_events),
+            "combined": {
+                "all": trailing_report_v9(all_events),
+                "dev_first_2_3": trailing_report_v9(dev),
+                "oos_last_1_3": trailing_report_v9(oos),
+            },
+            "per_coin": per_coin,
+            "failed": failed,
+            "generated_utc": utc_now(),
+            "interpretation_note": (
+                "H6 entry thresholds are frozen. V9 changes only exit "
+                "management. Trailing levels are predefined at 0.5%, 1.0%, "
+                "and 1.5%, each with a 120-minute maximum holding time. "
+                "Results are descriptive research and do not place orders."
             ),
         }
 
