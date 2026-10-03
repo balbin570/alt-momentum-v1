@@ -361,6 +361,7 @@ async def root():
             "/h6-regime?count=30&days=365",
             "/h6-trailing?count=30&days=365",
             "/pattern-discovery?count=30&days=365",
+            "/pullback-reentry?count=30&days=365",
         ],
     }
 
@@ -3552,6 +3553,289 @@ async def pattern_discovery_v10(
                 "Feature quintile edges are defined from the first 2/3 only "
                 "and then reused unchanged on the last 1/3. Do not select "
                 "a final entry rule from this endpoint alone."
+            ),
+        }
+
+    except Exception as e:
+        return {
+            **MODE_INFO,
+            "status": "ERROR",
+            "signal": False,
+            "error": str(e),
+            "generated_utc": utc_now(),
+        }
+
+PULLBACK_LEVELS_V11 = (0.5, 1.0, 1.5)
+PULLBACK_WATCH_MINUTES_V11 = 60
+REENTRY_HOLD_MINUTES_V11 = 60
+
+
+def pullback_reentry_events_v11(candles, symbol, pullback_pct):
+    """
+    V11 hypothesis:
+      1) Observe an already-completed 30m rise >= +1.0%.
+      2) Do NOT buy immediately.
+      3) During the next 60m, wait until price has pulled back at least
+         pullback_pct from the post-signal running high.
+      4) After that pullback has occurred, wait for the FIRST subsequently
+         completed bullish 5m candle (close > previous close).
+      5) Enter at the NEXT 5m candle OPEN.
+      6) Exit at OPEN exactly 60m after entry.
+      7) Subtract 0.15% round-trip cost.
+
+    No future data is used to decide the entry.
+    """
+    rows = []
+
+    # Need: 30m lookback + 60m watch + 60m post-entry horizon.
+    for i in range(7, len(candles) - 26):
+        signal_close = candles[i]["close"]
+        mom30 = pct_change(candles[i - 6]["close"], signal_close)
+
+        if mom30 < 1.0:
+            continue
+
+        signal_time = candles[i]["close_time"]
+
+        # Start with the signal close as the known peak reference.
+        running_high = signal_close
+        pullback_seen = False
+        pullback_first_seen_idx = None
+        reentry_signal_idx = None
+        max_pullback_seen = 0.0
+
+        # Next 12 completed 5m candles = 60m observation window.
+        for j in range(i + 1, min(i + 13, len(candles) - 13)):
+            c = candles[j]
+
+            if c["high"] > running_high:
+                running_high = c["high"]
+
+            # Conservative: pullback is considered observed from completed
+            # candle data. We do not enter inside the same candle.
+            dd_from_high = pct_change(running_high, c["low"])
+            if dd_from_high < max_pullback_seen:
+                max_pullback_seen = dd_from_high
+
+            if (not pullback_seen) and dd_from_high <= -pullback_pct:
+                pullback_seen = True
+                pullback_first_seen_idx = j
+                # No same-candle re-entry confirmation. Confirmation must
+                # occur on a later completed candle.
+                continue
+
+            if pullback_seen and j > pullback_first_seen_idx:
+                # First close-to-close positive 5m candle after pullback.
+                if c["close"] > candles[j - 1]["close"]:
+                    reentry_signal_idx = j
+                    break
+
+        if reentry_signal_idx is None:
+            continue
+
+        entry_idx = reentry_signal_idx + 1
+        exit_idx = entry_idx + 12  # OPEN 60m after entry OPEN
+
+        if exit_idx >= len(candles):
+            continue
+
+        entry_price = candles[entry_idx]["open"]
+        exit_price = candles[exit_idx]["open"]
+        gross = pct_change(entry_price, exit_price)
+        net = gross - ROUND_TRIP_COST_PCT
+
+        rows.append({
+            "symbol": symbol,
+            "pullback_level_pct": pullback_pct,
+            "initial_signal_time_utc": datetime.fromtimestamp(
+                signal_time / 1000, tz=timezone.utc
+            ).isoformat(),
+            "pullback_first_seen_time_utc": datetime.fromtimestamp(
+                candles[pullback_first_seen_idx]["close_time"] / 1000,
+                tz=timezone.utc
+            ).isoformat(),
+            "reentry_confirmation_time_utc": datetime.fromtimestamp(
+                candles[reentry_signal_idx]["close_time"] / 1000,
+                tz=timezone.utc
+            ).isoformat(),
+            "entry_time_utc": datetime.fromtimestamp(
+                candles[entry_idx]["open_time"] / 1000,
+                tz=timezone.utc
+            ).isoformat(),
+            "entry_open_time": candles[entry_idx]["open_time"],
+            "initial_momentum_30m_pct": mom30,
+            "max_pullback_seen_pct": max_pullback_seen,
+            "minutes_signal_to_entry": round(
+                (candles[entry_idx]["open_time"] - candles[i]["close_time"])
+                / 60000, 2
+            ),
+            "entry_price": entry_price,
+            "exit_price_60m": exit_price,
+            "gross_60m_pct": gross,
+            "net_60m_pct": net,
+            # compatibility with existing helper
+            "gross_pct": gross,
+            "net_pct": net,
+        })
+
+    return rows
+
+
+def summarize_v11(events):
+    vals = [e["net_60m_pct"] for e in events]
+    if not vals:
+        return {
+            "n": 0,
+            "mean_net_60m_pct": None,
+            "median_net_60m_pct": None,
+            "win_rate_pct": None,
+            "profit_factor": None,
+            "best_net_pct": None,
+            "worst_net_pct": None,
+            "mean_minutes_signal_to_entry": None,
+        }
+
+    wins = [x for x in vals if x > 0]
+    losses = [x for x in vals if x < 0]
+    gp = sum(wins)
+    gl = abs(sum(losses))
+    pf = gp / gl if gl > 0 else None
+
+    return {
+        "n": len(vals),
+        "mean_net_60m_pct": round(mean(vals), 4),
+        "median_net_60m_pct": round(safe_median_v10(vals), 4),
+        "win_rate_pct": round(len(wins) / len(vals) * 100, 2),
+        "profit_factor": round(pf, 4) if pf is not None else None,
+        "best_net_pct": round(max(vals), 4),
+        "worst_net_pct": round(min(vals), 4),
+        "mean_minutes_signal_to_entry": round(
+            mean([e["minutes_signal_to_entry"] for e in events]), 2
+        ),
+    }
+
+
+def v11_level_report(events_by_level):
+    return {
+        f"pullback_{level:.1f}pct": summarize_v11(
+            events_by_level.get(level, [])
+        )
+        for level in PULLBACK_LEVELS_V11
+    }
+
+
+@app.get("/pullback-reentry")
+async def pullback_reentry_v11(
+    count: int = Query(default=30, ge=5, le=30),
+    days: int = Query(default=365, ge=90, le=365),
+):
+    """
+    V11: post-rise pullback + re-entry hypothesis study.
+    Research/paper only; no orders.
+    """
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(180.0)
+        ) as client:
+            universe_data = await build_universe(client)
+            selected = universe_data[:count]
+            semaphore = asyncio.Semaphore(2)
+
+            async def worker(item):
+                async with semaphore:
+                    try:
+                        candles = await get_5m_candles_days(
+                            client, item["symbol"], days
+                        )
+
+                        by_level = {}
+                        for level in PULLBACK_LEVELS_V11:
+                            ev = pullback_reentry_events_v11(
+                                candles, item["symbol"], level
+                            )
+                            # Same-symbol re-entry signals at least 60m apart.
+                            ev = apply_symbol_cooldown_v4(ev, 60)
+                            by_level[level] = ev
+
+                        return {
+                            "ok": True,
+                            "symbol": item["symbol"],
+                            "events_by_level": by_level,
+                        }
+                    except Exception as e:
+                        return {
+                            "ok": False,
+                            "symbol": item["symbol"],
+                            "error": str(e),
+                        }
+
+            results = await asyncio.gather(
+                *[worker(x) for x in selected]
+            )
+
+        successful = [x for x in results if x.get("ok")]
+        failed = [x for x in results if not x.get("ok")]
+
+        combined = {level: [] for level in PULLBACK_LEVELS_V11}
+        per_coin = []
+
+        for item in successful:
+            coin_report = {"symbol": item["symbol"], "levels": {}}
+            for level in PULLBACK_LEVELS_V11:
+                events = item["events_by_level"][level]
+                combined[level].extend(events)
+                coin_report["levels"][f"{level:.1f}"] = summarize_v11(events)
+            per_coin.append(coin_report)
+
+        # Chronological split independently for each predefined level.
+        split_reports = {}
+        for level in PULLBACK_LEVELS_V11:
+            ev = sorted(
+                combined[level],
+                key=lambda e: e["entry_open_time"]
+            )
+            cut = int(len(ev) * 2 / 3)
+            dev = ev[:cut]
+            ref = ev[cut:]
+
+            split_reports[f"pullback_{level:.1f}pct"] = {
+                "all": summarize_v11(ev),
+                "discovery_first_2_3": summarize_v11(dev),
+                "reference_last_1_3": summarize_v11(ref),
+            }
+
+        return {
+            **MODE_INFO,
+            "status": "OK",
+            "signal": False,
+            "study": "POST_RISE_PULLBACK_REENTRY",
+            "days": days,
+            "selected_coin_count": len(selected),
+            "successful_coin_count": len(successful),
+            "failed_coin_count": len(failed),
+            "initial_event": "completed 30m rise >= +1.0%",
+            "pullback_levels_pct": list(PULLBACK_LEVELS_V11),
+            "pullback_watch_window_minutes": PULLBACK_WATCH_MINUTES_V11,
+            "reentry_confirmation": (
+                "first subsequently completed 5m candle whose close is "
+                "above the previous 5m close; confirmation cannot be the "
+                "same candle that first satisfies the pullback"
+            ),
+            "entry_model": "NEXT_5M_CANDLE_OPEN_AFTER_CONFIRMATION",
+            "primary_exit": "OPEN_60_MIN_AFTER_ENTRY",
+            "round_trip_cost_pct": ROUND_TRIP_COST_PCT,
+            "same_symbol_reentry_cooldown_minutes": 60,
+            "results": split_reports,
+            "per_coin": per_coin,
+            "failed": failed,
+            "generated_utc": utc_now(),
+            "interpretation_note": (
+                "V11 tests three predefined pullback depths after an "
+                "already-observed >=1% 30m rise. It does not predict which "
+                "coin will rise. The three levels are hypothesis variants, "
+                "not optimized thresholds. Reference results must be read "
+                "together with discovery results; a single favorable level "
+                "should not be promoted automatically."
             ),
         }
 
