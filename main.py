@@ -1,54 +1,352 @@
-from fastapi import FastAPI, Query
-import httpx
 import asyncio
 from datetime import datetime, timezone
+from statistics import mean
 
-app = FastAPI(
-    title="ALT-MOMENTUM-V1",
-    version="1.0"
-)
+import httpx
+from fastapi import FastAPI, Query
+
+app = FastAPI(title="ALT-MOMENTUM-V1")
 
 BINANCE = "https://data-api.binance.vision"
-
 MODEL = "ALT-MOMENTUM-V1"
 
-FLAGS = {
+MIN_QUOTE_VOLUME_USDT = 5_000_000
+
+# Altcoin araştırması için istemediğimiz baz varlıklar
+EXCLUDED_BASES = {
+    "BTC",
+    "USDC",
+    "FDUSD",
+    "TUSD",
+    "USDP",
+    "DAI",
+    "USD1",
+    "RLUSD",
+    "BFUSD",
+    "EUR",
+    "TRY",
+    "GBP",
+    "BRL",
+    "AUD",
+    "BIDR",
+    "IDRT",
+    "UAH",
+    "RUB",
+}
+
+MODE_INFO = {
+    "model": MODEL,
     "mode": "RESEARCH_PAPER_ONLY",
     "trading": False,
     "orders": False,
 }
 
-# Stablecoin / fiat / leveraged vb. tarama dışında tut
-EXCLUDED_BASES = {
-    "USDC", "FDUSD", "TUSD", "USDP", "DAI",
-    "EUR", "TRY", "GBP", "BRL", "AUD",
-    "BIDR", "IDRT", "UAH", "RUB",
-}
 
-MIN_QUOTE_VOLUME_USDT = 5_000_000
+def utc_now():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def pct_change(old, new):
+    if old == 0:
+        return 0.0
+    return ((new / old) - 1.0) * 100.0
+
+
+def valid_base(base):
+    if base in EXCLUDED_BASES:
+        return False
+
+    if base.endswith(("UP", "DOWN", "BULL", "BEAR")):
+        return False
+
+    return True
 
 
 async def get_json(client, path, params=None):
-    r = await client.get(
-        BINANCE + path,
+    response = await client.get(
+        f"{BINANCE}{path}",
         params=params,
-        timeout=15,
+        timeout=30.0,
     )
-    r.raise_for_status()
-    return r.json()
+    response.raise_for_status()
+    return response.json()
+
+
+async def build_universe(client):
+    exchange_info, tickers = await asyncio.gather(
+        get_json(client, "/api/v3/exchangeInfo"),
+        get_json(client, "/api/v3/ticker/24hr"),
+    )
+
+    ticker_map = {
+        x["symbol"]: x
+        for x in tickers
+        if "symbol" in x
+    }
+
+    results = []
+
+    for s in exchange_info.get("symbols", []):
+        symbol = s.get("symbol")
+        base = s.get("baseAsset")
+        quote = s.get("quoteAsset")
+
+        if quote != "USDT":
+            continue
+
+        if s.get("status") != "TRADING":
+            continue
+
+        if not s.get("isSpotTradingAllowed", False):
+            continue
+
+        if not valid_base(base):
+            continue
+
+        ticker = ticker_map.get(symbol)
+
+        if not ticker:
+            continue
+
+        try:
+            quote_volume = float(ticker.get("quoteVolume", 0))
+        except Exception:
+            continue
+
+        if quote_volume < MIN_QUOTE_VOLUME_USDT:
+            continue
+
+        results.append(
+            {
+                "symbol": symbol,
+                "base_asset": base,
+                "quote_volume_24h": round(quote_volume, 2),
+            }
+        )
+
+    results.sort(
+        key=lambda x: x["quote_volume_24h"],
+        reverse=True,
+    )
+
+    return results
+
+
+async def get_completed_5m_candles(client, symbol, limit=100):
+    raw = await get_json(
+        client,
+        "/api/v3/klines",
+        params={
+            "symbol": symbol,
+            "interval": "5m",
+            "limit": limit,
+        },
+    )
+
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+
+    candles = []
+
+    for k in raw:
+        if int(k[6]) >= now_ms:
+            continue
+
+        candles.append(
+            {
+                "open_time": int(k[0]),
+                "open": float(k[1]),
+                "high": float(k[2]),
+                "low": float(k[3]),
+                "close": float(k[4]),
+                "volume": float(k[5]),
+                "close_time": int(k[6]),
+            }
+        )
+
+    return candles
+
+
+def analyze_latest(symbol, candles, quote_volume):
+    if len(candles) < 8:
+        return None
+
+    closes = [x["close"] for x in candles]
+    volumes = [x["volume"] for x in candles]
+
+    current = closes[-1]
+
+    mom5 = pct_change(closes[-2], current)
+    mom15 = pct_change(closes[-4], current)
+    mom30 = pct_change(closes[-7], current)
+
+    previous_volumes = volumes[-7:-1]
+
+    avg_volume = (
+        mean(previous_volumes)
+        if previous_volumes
+        else 0
+    )
+
+    volume_ratio = (
+        volumes[-1] / avg_volume
+        if avg_volume > 0
+        else 0
+    )
+
+    research_score = (
+        (mom5 * 3)
+        + (mom15 * 2)
+        + mom30
+        + min(volume_ratio, 5)
+    )
+
+    return {
+        "symbol": symbol,
+        "price": current,
+        "momentum_5m_pct": round(mom5, 4),
+        "momentum_15m_pct": round(mom15, 4),
+        "momentum_30m_pct": round(mom30, 4),
+        "volume_ratio": round(volume_ratio, 3),
+        "quote_volume_24h": quote_volume,
+        "research_score": round(research_score, 4),
+    }
+
+
+def historical_events(candles):
+    """
+    Burada AL sinyali üretmiyoruz.
+
+    Amaç:
+    Geçmişte belirli momentum + hacim koşulları oluştuğunda
+    fiyatın 15/30/60 dakika sonra ne yaptığını ölçmek.
+    """
+
+    events = []
+
+    # İleri ölçüm için 12 mum = 60 dakika gerekir.
+    for i in range(7, len(candles) - 12):
+
+        current = candles[i]["close"]
+
+        mom5 = pct_change(
+            candles[i - 1]["close"],
+            current,
+        )
+
+        mom15 = pct_change(
+            candles[i - 3]["close"],
+            current,
+        )
+
+        mom30 = pct_change(
+            candles[i - 6]["close"],
+            current,
+        )
+
+        previous_volumes = [
+            candles[j]["volume"]
+            for j in range(i - 6, i)
+        ]
+
+        avg_volume = mean(previous_volumes)
+
+        volume_ratio = (
+            candles[i]["volume"] / avg_volume
+            if avg_volume > 0
+            else 0
+        )
+
+        # İlk araştırma koşulu.
+        # Bunlar nihai parametre değildir.
+        if mom5 < 0.30:
+            continue
+
+        if mom15 < 0.50:
+            continue
+
+        if mom30 < 0.50:
+            continue
+
+        if volume_ratio < 1.20:
+            continue
+
+        # Çoktan aşırı koşmuş hareketleri ilk aşamada ayır.
+        if mom5 > 3.00:
+            continue
+
+        if mom30 > 6.00:
+            continue
+
+        price_15 = candles[i + 3]["close"]
+        price_30 = candles[i + 6]["close"]
+        price_60 = candles[i + 12]["close"]
+
+        ret15 = pct_change(current, price_15)
+        ret30 = pct_change(current, price_30)
+        ret60 = pct_change(current, price_60)
+
+        events.append(
+            {
+                "time_utc": datetime.fromtimestamp(
+                    candles[i]["close_time"] / 1000,
+                    tz=timezone.utc,
+                ).isoformat(),
+                "entry_reference": current,
+                "momentum_5m_pct": round(mom5, 4),
+                "momentum_15m_pct": round(mom15, 4),
+                "momentum_30m_pct": round(mom30, 4),
+                "volume_ratio": round(volume_ratio, 3),
+                "return_15m_pct": round(ret15, 4),
+                "return_30m_pct": round(ret30, 4),
+                "return_60m_pct": round(ret60, 4),
+            }
+        )
+
+    return events
+
+
+def summarize_events(events):
+    if not events:
+        return {
+            "event_count": 0,
+            "return_15m": None,
+            "return_30m": None,
+            "return_60m": None,
+        }
+
+    def stats(field):
+        values = [x[field] for x in events]
+
+        return {
+            "mean_pct": round(mean(values), 4),
+            "win_rate_pct": round(
+                sum(1 for x in values if x > 0)
+                / len(values)
+                * 100,
+                2,
+            ),
+            "best_pct": round(max(values), 4),
+            "worst_pct": round(min(values), 4),
+        }
+
+    return {
+        "event_count": len(events),
+        "return_15m": stats("return_15m_pct"),
+        "return_30m": stats("return_30m_pct"),
+        "return_60m": stats("return_60m_pct"),
+    }
 
 
 @app.get("/")
 async def root():
     return {
-        "model": MODEL,
-        **FLAGS,
-        "status": "ONLINE",
-        "purpose": "BINANCE_USDT_ALTCOIN_MOMENTUM_RESEARCH",
+        **MODE_INFO,
+        "status": "OK",
         "endpoints": [
             "/health",
             "/universe",
-            "/scan",
+            "/scan?count=20",
+            "/backtest/TIAUSDT?limit=1000",
         ],
     }
 
@@ -63,209 +361,42 @@ async def health():
             )
 
         return {
-            "model": MODEL,
-            **FLAGS,
+            **MODE_INFO,
             "status": "OK",
             "binance": "CONNECTED",
             "server_time": data.get("serverTime"),
-            "checked_utc": datetime.now(
-                timezone.utc
-            ).isoformat(),
+            "checked_utc": utc_now(),
         }
 
-    except Exception as exc:
+    except Exception as e:
         return {
-            "model": MODEL,
-            **FLAGS,
+            **MODE_INFO,
             "status": "ERROR",
-            "binance": "NOT_CONNECTED",
-            "error": type(exc).__name__,
-            "detail": str(exc),
+            "error": str(e),
+            "checked_utc": utc_now(),
         }
-
-
-async def build_universe():
-    async with httpx.AsyncClient() as client:
-
-        exchange_info, tickers = await asyncio.gather(
-            get_json(client, "/api/v3/exchangeInfo"),
-            get_json(client, "/api/v3/ticker/24hr"),
-        )
-
-    ticker_map = {
-        x["symbol"]: x
-        for x in tickers
-    }
-
-    universe = []
-
-    for s in exchange_info["symbols"]:
-
-        if s.get("quoteAsset") != "USDT":
-            continue
-
-        if s.get("status") != "TRADING":
-            continue
-
-        if not s.get("isSpotTradingAllowed", False):
-            continue
-
-        base = s.get("baseAsset", "")
-
-        if base in EXCLUDED_BASES:
-            continue
-
-        # Leveraged tokenları ele
-        if (
-            base.endswith("UP")
-            or base.endswith("DOWN")
-            or base.endswith("BULL")
-            or base.endswith("BEAR")
-        ):
-            continue
-
-        ticker = ticker_map.get(s["symbol"])
-
-        if not ticker:
-            continue
-
-        try:
-            quote_volume = float(
-                ticker.get("quoteVolume", 0)
-            )
-        except Exception:
-            continue
-
-        if quote_volume < MIN_QUOTE_VOLUME_USDT:
-            continue
-
-        universe.append({
-            "symbol": s["symbol"],
-            "base_asset": base,
-            "quote_volume_24h": round(
-                quote_volume, 2
-            ),
-        })
-
-    universe.sort(
-        key=lambda x: x["quote_volume_24h"],
-        reverse=True,
-    )
-
-    return universe
 
 
 @app.get("/universe")
 async def universe():
     try:
-        data = await build_universe()
+        async with httpx.AsyncClient() as client:
+            symbols = await build_universe(client)
 
         return {
-            "model": MODEL,
-            **FLAGS,
+            **MODE_INFO,
             "status": "OK",
-            "min_quote_volume_usdt":
-                MIN_QUOTE_VOLUME_USDT,
-            "symbol_count": len(data),
-            "symbols": data,
+            "min_quote_volume_usdt": MIN_QUOTE_VOLUME_USDT,
+            "symbol_count": len(symbols),
+            "symbols": symbols,
         }
 
-    except Exception as exc:
+    except Exception as e:
         return {
-            "model": MODEL,
-            **FLAGS,
+            **MODE_INFO,
             "status": "ERROR",
-            "error": type(exc).__name__,
-            "detail": str(exc),
+            "error": str(e),
         }
-
-
-async def analyze_symbol(
-    client,
-    symbol,
-    volume24h,
-    semaphore,
-):
-    async with semaphore:
-
-        try:
-            klines = await get_json(
-                client,
-                "/api/v3/klines",
-                {
-                    "symbol": symbol,
-                    "interval": "5m",
-                    "limit": 20,
-                },
-            )
-
-            if len(klines) < 7:
-                return None
-
-            now_ms = int(
-                datetime.now(
-                    timezone.utc
-                ).timestamp() * 1000
-            )
-
-            # Sadece tamamlanmış mumlar
-            closed = [
-                k for k in klines
-                if int(k[6]) < now_ms
-            ]
-
-            if len(closed) < 7:
-                return None
-
-            closes = [
-                float(k[4])
-                for k in closed
-            ]
-
-            volumes = [
-                float(k[5])
-                for k in closed
-            ]
-
-            current = closes[-1]
-
-            def momentum(n):
-                old = closes[-1 - n]
-                return (
-                    current / old - 1
-                ) * 100
-
-            mom_5m = momentum(1)
-            mom_15m = momentum(3)
-            mom_30m = momentum(6)
-
-            avg_volume = (
-                sum(volumes[-7:-1]) / 6
-            )
-
-            volume_ratio = (
-                volumes[-1] / avg_volume
-                if avg_volume > 0
-                else 0
-            )
-
-            return {
-                "symbol": symbol,
-                "price": current,
-                "momentum_5m_pct":
-                    round(mom_5m, 4),
-                "momentum_15m_pct":
-                    round(mom_15m, 4),
-                "momentum_30m_pct":
-                    round(mom_30m, 4),
-                "volume_ratio":
-                    round(volume_ratio, 3),
-                "quote_volume_24h":
-                    round(volume24h, 2),
-            }
-
-        except Exception:
-            return None
 
 
 @app.get("/scan")
@@ -277,47 +408,41 @@ async def scan(
     )
 ):
     try:
-        universe_data = await build_universe()
-
-        semaphore = asyncio.Semaphore(12)
-
         async with httpx.AsyncClient() as client:
 
+            universe_data = await build_universe(client)
+
+            semaphore = asyncio.Semaphore(12)
+
+            async def worker(item):
+                async with semaphore:
+                    try:
+                        candles = await get_completed_5m_candles(
+                            client,
+                            item["symbol"],
+                            20,
+                        )
+
+                        return analyze_latest(
+                            item["symbol"],
+                            candles,
+                            item["quote_volume_24h"],
+                        )
+
+                    except Exception:
+                        return None
+
             tasks = [
-                analyze_symbol(
-                    client,
-                    x["symbol"],
-                    x["quote_volume_24h"],
-                    semaphore,
-                )
-                for x in universe_data
+                worker(item)
+                for item in universe_data
             ]
 
-            results = await asyncio.gather(
-                *tasks
-            )
+            results = await asyncio.gather(*tasks)
 
         results = [
             x for x in results
             if x is not None
         ]
-
-        # İlk araştırma skoru.
-        # Henüz al/sat sinyali DEĞİLDİR.
-        for x in results:
-
-            score = (
-                x["momentum_5m_pct"] * 3
-                + x["momentum_15m_pct"] * 2
-                + x["momentum_30m_pct"]
-                + min(
-                    x["volume_ratio"], 5
-                )
-            )
-
-            x["research_score"] = round(
-                score, 4
-            )
 
         results.sort(
             key=lambda x: x["research_score"],
@@ -325,31 +450,81 @@ async def scan(
         )
 
         return {
-            "model": MODEL,
-            **FLAGS,
+            **MODE_INFO,
             "status": "OK",
             "signal": False,
-            "note":
-                "RESEARCH RANKING ONLY - NOT A BUY SIGNAL",
-            "universe_size":
-                len(universe_data),
-            "analyzed":
-                len(results),
-            "returned":
-                min(count, len(results)),
-            "generated_utc":
-                datetime.now(
-                    timezone.utc
-                ).isoformat(),
-            "leaders":
-                results[:count],
+            "note": "RESEARCH RANKING ONLY - NOT A BUY SIGNAL",
+            "universe_size": len(universe_data),
+            "analyzed": len(results),
+            "returned": min(count, len(results)),
+            "generated_utc": utc_now(),
+            "leaders": results[:count],
         }
 
-    except Exception as exc:
+    except Exception as e:
         return {
-            "model": MODEL,
-            **FLAGS,
+            **MODE_INFO,
             "status": "ERROR",
-            "error": type(exc).__name__,
-            "detail": str(exc),
+            "error": str(e),
+        }
+
+
+@app.get("/backtest/{symbol}")
+async def backtest(
+    symbol: str,
+    limit: int = Query(
+        default=1000,
+        ge=100,
+        le=1000,
+    ),
+):
+    """
+    Research endpoint.
+    Emir üretmez.
+    Paper trade açmaz.
+    """
+
+    symbol = symbol.upper().strip()
+
+    try:
+        async with httpx.AsyncClient() as client:
+            candles = await get_completed_5m_candles(
+                client,
+                symbol,
+                limit,
+            )
+
+        events = historical_events(candles)
+        summary = summarize_events(events)
+
+        return {
+            **MODE_INFO,
+            "status": "OK",
+            "signal": False,
+            "symbol": symbol,
+            "candle_count": len(candles),
+            "research_conditions": {
+                "momentum_5m_min_pct": 0.30,
+                "momentum_15m_min_pct": 0.50,
+                "momentum_30m_min_pct": 0.50,
+                "volume_ratio_min": 1.20,
+                "momentum_5m_max_pct": 3.00,
+                "momentum_30m_max_pct": 6.00,
+            },
+            "summary": summary,
+            "last_events": events[-10:],
+            "generated_utc": utc_now(),
+            "note": (
+                "RESEARCH EVENT STUDY ONLY - "
+                "NOT A VALIDATED TRADING STRATEGY"
+            ),
+        }
+
+    except Exception as e:
+        return {
+            **MODE_INFO,
+            "status": "ERROR",
+            "symbol": symbol,
+            "error": str(e),
+            "generated_utc": utc_now(),
         }
