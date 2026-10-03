@@ -2496,7 +2496,7 @@ async def h6_validate_v7(
     """
     try:
         async with httpx.AsyncClient(
-            timeout=httpx.Timeout(180.0)
+            timeout=httpx.Timeout(240.0)
         ) as client:
             universe_data = await build_universe(client)
             selected = universe_data[:count]
@@ -2758,7 +2758,7 @@ async def h6_regime_v8(
     """
     try:
         async with httpx.AsyncClient(
-            timeout=httpx.Timeout(180.0)
+            timeout=httpx.Timeout(240.0)
         ) as client:
             universe_data = await build_universe(client)
             selected = universe_data[:count]
@@ -3107,7 +3107,7 @@ async def h6_trailing_v9(
     """
     try:
         async with httpx.AsyncClient(
-            timeout=httpx.Timeout(180.0)
+            timeout=httpx.Timeout(240.0)
         ) as client:
             universe_data = await build_universe(client)
             selected = universe_data[:count]
@@ -3455,7 +3455,7 @@ async def pattern_discovery_v10(
     """
     try:
         async with httpx.AsyncClient(
-            timeout=httpx.Timeout(180.0)
+            timeout=httpx.Timeout(240.0)
         ) as client:
             universe_data = await build_universe(client)
             selected = universe_data[:count]
@@ -3736,7 +3736,7 @@ async def pullback_reentry_v11(
     """
     try:
         async with httpx.AsyncClient(
-            timeout=httpx.Timeout(180.0)
+            timeout=httpx.Timeout(240.0)
         ) as client:
             universe_data = await build_universe(client)
             selected = universe_data[:count]
@@ -3857,23 +3857,45 @@ RELATIVE_RANK_BUCKETS_V12 = (
 )
 
 
-def rolling_volatility_30m_v12(candles, i, lookback_bars=288):
+def precompute_rolling_volatility_v12(candles, lookback_bars=288):
     """
-    Historical volatility of 30m returns using only information available
-    up to signal candle i. Default lookback: 24h of 5m bars.
+    O(n) rolling mean/std for 30m returns.
+    Replaces the original O(n*288) implementation to avoid Render gateway
+    timeouts on 365d histories.
     """
-    start = max(6, i - lookback_bars + 1)
-    vals = []
-    for j in range(start, i + 1):
-        vals.append(pct_change(candles[j - 6]["close"], candles[j]["close"]))
+    n = len(candles)
+    ret30 = [None] * n
+    mus = [None] * n
+    sigmas = [None] * n
 
-    if len(vals) < 30:
-        return None, None
+    for i in range(6, n):
+        ret30[i] = pct_change(candles[i - 6]["close"], candles[i]["close"])
 
-    mu = mean(vals)
-    variance = sum((x - mu) ** 2 for x in vals) / len(vals)
-    sigma = variance ** 0.5
-    return mu, sigma
+    window = []
+    running_sum = 0.0
+    running_sq = 0.0
+    left = 6
+
+    for i in range(6, n):
+        x = ret30[i]
+        window.append(x)
+        running_sum += x
+        running_sq += x * x
+
+        while i - left + 1 > lookback_bars:
+            old = ret30[left]
+            running_sum -= old
+            running_sq -= old * old
+            left += 1
+
+        count = len(window) - (left - 6)
+        if count >= 30:
+            mu = running_sum / count
+            var = max(0.0, running_sq / count - mu * mu)
+            mus[i] = mu
+            sigmas[i] = var ** 0.5
+
+    return ret30, mus, sigmas
 
 
 def relative_candidates_v12(candles, symbol):
@@ -3888,16 +3910,17 @@ def relative_candidates_v12(candles, symbol):
     Outcome: next 5m OPEN -> OPEN 60m later, minus 0.15% cost.
     """
     rows = []
+    ret30, mus, sigmas = precompute_rolling_volatility_v12(candles, 288)
 
     for i in range(294, len(candles) - 13):
-        mom30 = pct_change(candles[i - 6]["close"], candles[i]["close"])
+        mom30 = ret30[i]
 
         # We are still studying coins that have ALREADY risen.
-        if mom30 <= 0:
+        if mom30 is None or mom30 <= 0:
             continue
 
-        mu, sigma = rolling_volatility_30m_v12(candles, i, 288)
-        if sigma is None or sigma <= 0:
+        mu, sigma = mus[i], sigmas[i]
+        if mu is None or sigma is None or sigma <= 0:
             continue
 
         z = (mom30 - mu) / sigma
@@ -4037,7 +4060,7 @@ async def relative_momentum_v12(
     """
     try:
         async with httpx.AsyncClient(
-            timeout=httpx.Timeout(180.0)
+            timeout=httpx.Timeout(240.0)
         ) as client:
             universe_data = await build_universe(client)
             selected = universe_data[:count]
