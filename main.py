@@ -6659,3 +6659,136 @@ async def v27_status():
         "paper": v20_public_state(),
         "generated_utc": utc_now(),
     }
+
+
+# ---------------------------------------------------------------------------
+# V27 RESEARCH ONLY: daily top gainers + daily quote volume
+# Does NOT change Candidate B, paper state, entries, exits, or automation.
+# Uses the same dynamic universe builder as V27, then fetches daily klines.
+# ---------------------------------------------------------------------------
+
+@app.get("/v27-daily-gainers")
+async def v27_daily_gainers(days: int = 30, top_n: int = 5):
+    days = max(1, min(int(days), 60))
+    top_n = max(1, min(int(top_n), 20))
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        universe = await build_universe(client)
+
+        sem = asyncio.Semaphore(12)
+
+        async def fetch_daily(symbol: str):
+            async with sem:
+                try:
+                    r = await client.get(
+                        f"{BINANCE}/api/v3/klines",
+                        params={"symbol": symbol, "interval": "1d", "limit": days + 2},
+                    )
+                    r.raise_for_status()
+                    return symbol, r.json(), None
+                except Exception as e:
+                    return symbol, [], str(e)
+
+        fetched = await asyncio.gather(*(fetch_daily(s) for s in universe))
+
+    # date -> list of rows
+    by_day = {}
+    errors = []
+    for symbol, rows, err in fetched:
+        if err:
+            errors.append({"symbol": symbol, "error": err})
+            continue
+
+        for k in rows:
+            try:
+                open_ms = int(k[0])
+                o = float(k[1])
+                c = float(k[4])
+                quote_volume = float(k[7])  # quote asset volume = USDT for USDT pairs
+                if o <= 0:
+                    continue
+                day = datetime.fromtimestamp(open_ms / 1000, tz=timezone.utc).date().isoformat()
+                pct = (c / o - 1.0) * 100.0
+                by_day.setdefault(day, []).append({
+                    "symbol": symbol,
+                    "rise_pct_open_to_close": round(pct, 4),
+                    "quote_volume_usdt": round(quote_volume, 2),
+                    "quote_volume_million_usdt": round(quote_volume / 1_000_000.0, 4),
+                })
+            except Exception:
+                continue
+
+    dates = sorted(by_day.keys())
+    # Exclude the current UTC day because its daily candle may be incomplete.
+    today_utc = datetime.now(timezone.utc).date().isoformat()
+    dates = [d for d in dates if d != today_utc][-days:]
+
+    result = []
+    all_top_volumes = []
+    below_250k = 0
+    total_top_rows = 0
+
+    for d in dates:
+        ranked = sorted(
+            by_day[d],
+            key=lambda x: x["rise_pct_open_to_close"],
+            reverse=True
+        )[:top_n]
+
+        for i, row in enumerate(ranked, 1):
+            row["rank"] = i
+            total_top_rows += 1
+            v = row["quote_volume_usdt"]
+            all_top_volumes.append(v)
+            if v < 250_000:
+                below_250k += 1
+
+        result.append({"date_utc": d, "top_gainers": ranked})
+
+    vols_sorted = sorted(all_top_volumes)
+    def median(vals):
+        n = len(vals)
+        if not n:
+            return None
+        if n % 2:
+            return vals[n // 2]
+        return (vals[n//2 - 1] + vals[n//2]) / 2
+
+    summary = {
+        "days_returned": len(result),
+        "top_n_per_day": top_n,
+        "observations": total_top_rows,
+        "v27_universe_symbols": len(universe),
+        "volume_floor_reference_usdt": 250000,
+        "top_gainer_rows_below_250k_daily_volume": below_250k,
+        "top_gainer_rows_below_250k_pct": (
+            round(100.0 * below_250k / total_top_rows, 2) if total_top_rows else None
+        ),
+        "median_daily_quote_volume_usdt": (
+            round(median(vols_sorted), 2) if vols_sorted else None
+        ),
+        "min_daily_quote_volume_usdt": (
+            round(min(vols_sorted), 2) if vols_sorted else None
+        ),
+        "max_daily_quote_volume_usdt": (
+            round(max(vols_sorted), 2) if vols_sorted else None
+        ),
+    }
+
+    return {
+        "model": MODEL,
+        "mode": "RESEARCH_ONLY",
+        "trading": False,
+        "orders": False,
+        "strategy_changed": False,
+        "note": (
+            "Daily ranking uses UTC 1d candle open-to-close return. "
+            "Volume is Binance kline quote-asset volume (USDT). "
+            "Current incomplete UTC day is excluded."
+        ),
+        "summary": summary,
+        "days": result,
+        "fetch_error_count": len(errors),
+        "fetch_errors": errors[:20],
+        "generated_utc": utc_now(),
+    }
