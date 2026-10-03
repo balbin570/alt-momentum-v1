@@ -6677,7 +6677,9 @@ async def v27_daily_gainers(days: int = 30, top_n: int = 5):
 
         sem = asyncio.Semaphore(12)
 
-        async def fetch_daily(symbol: str):
+        async def fetch_daily(item):
+            # build_universe() returns dict rows, not plain symbol strings.
+            symbol = item["symbol"] if isinstance(item, dict) else str(item)
             async with sem:
                 try:
                     r = await client.get(
