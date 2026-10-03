@@ -1,3 +1,5 @@
+import json
+import os
 import asyncio
 from datetime import datetime, timezone
 from statistics import mean, median
@@ -6087,6 +6089,192 @@ async def v20_forward_status():
             "In-memory forward-paper state. Render restart resets this first "
             "verification version. No exchange orders are sent."
         ),
+        "generated_utc": utc_now(),
+    }
+
+
+# =========================
+# V21 AUTO + POSTGRES PERSISTENCE
+# =========================
+# Candidate B remains FROZEN. This section changes operations only:
+# automatic scanning + durable paper state. It does NOT place orders.
+
+V21_SCAN_INTERVAL_SECONDS = 300
+V21_DB_URL = os.getenv("DATABASE_URL", "").strip()
+V21_AUTO_TASK = None
+V21_LAST_SCAN = {
+    "status": "NOT_RUN",
+    "started_utc": None,
+    "finished_utc": None,
+    "error": None,
+}
+
+
+def v21_db_connect():
+    if not V21_DB_URL:
+        return None
+    import psycopg
+    return psycopg.connect(V21_DB_URL)
+
+
+def v21_init_db():
+    if not V21_DB_URL:
+        return False
+    with v21_db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS alt_v21_paper_state (
+                    id INTEGER PRIMARY KEY,
+                    payload JSONB NOT NULL,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+        conn.commit()
+    return True
+
+
+def v21_serializable_state():
+    return {
+        "open": V20_STATE["open"],
+        "closed": V20_STATE["closed"],
+        "seen_signal_keys": sorted(V20_STATE["seen_signal_keys"]),
+        "started_utc": V20_STATE["started_utc"],
+    }
+
+
+def v21_save_state():
+    if not V21_DB_URL:
+        return False
+    payload = json.dumps(v21_serializable_state())
+    with v21_db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO alt_v21_paper_state (id, payload, updated_at)
+                VALUES (1, %s::jsonb, NOW())
+                ON CONFLICT (id) DO UPDATE
+                SET payload = EXCLUDED.payload,
+                    updated_at = NOW()
+            """, (payload,))
+        conn.commit()
+    return True
+
+
+def v21_load_state():
+    if not V21_DB_URL:
+        return False
+    with v21_db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT payload FROM alt_v21_paper_state WHERE id = 1"
+            )
+            row = cur.fetchone()
+    if not row:
+        v21_save_state()
+        return True
+
+    payload = row[0]
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+
+    V20_STATE["open"] = payload.get("open", {})
+    V20_STATE["closed"] = payload.get("closed", [])
+    V20_STATE["seen_signal_keys"] = set(
+        payload.get("seen_signal_keys", [])
+    )
+    V20_STATE["started_utc"] = payload.get(
+        "started_utc", V20_STATE["started_utc"]
+    )
+    return True
+
+
+async def v21_run_and_persist():
+    V21_LAST_SCAN["status"] = "RUNNING"
+    V21_LAST_SCAN["started_utc"] = utc_now()
+    V21_LAST_SCAN["error"] = None
+    try:
+        result = await v20_scan_once()
+        if V21_DB_URL:
+            v21_save_state()
+        V21_LAST_SCAN["status"] = result.get("status", "OK")
+        return result
+    except Exception as e:
+        V21_LAST_SCAN["status"] = "ERROR"
+        V21_LAST_SCAN["error"] = str(e)
+        return {"status": "ERROR", "error": str(e)}
+    finally:
+        V21_LAST_SCAN["finished_utc"] = utc_now()
+
+
+async def v21_auto_loop():
+    # Small delay lets the web service become healthy first.
+    await asyncio.sleep(15)
+    while True:
+        await v21_run_and_persist()
+        await asyncio.sleep(V21_SCAN_INTERVAL_SECONDS)
+
+
+@app.on_event("startup")
+async def v21_startup():
+    global V21_AUTO_TASK
+    try:
+        if V21_DB_URL:
+            v21_init_db()
+            v21_load_state()
+    except Exception as e:
+        V21_LAST_SCAN["status"] = "DB_STARTUP_ERROR"
+        V21_LAST_SCAN["error"] = str(e)
+
+    if V21_AUTO_TASK is None or V21_AUTO_TASK.done():
+        V21_AUTO_TASK = asyncio.create_task(v21_auto_loop())
+
+
+@app.on_event("shutdown")
+async def v21_shutdown():
+    global V21_AUTO_TASK
+    try:
+        if V21_DB_URL:
+            v21_save_state()
+    except Exception:
+        pass
+    if V21_AUTO_TASK is not None:
+        V21_AUTO_TASK.cancel()
+
+
+@app.get("/v21-status")
+async def v21_status():
+    return {
+        "model": MODEL,
+        "mode": "RESEARCH_PAPER_ONLY",
+        "trading": False,
+        "orders": False,
+        "strategy": "V20_FROZEN_CANDIDATE_B_FORWARD_PAPER",
+        "strategy_changed": False,
+        "automation": {
+            "enabled": True,
+            "scan_interval_seconds": V21_SCAN_INTERVAL_SECONDS,
+            "last_scan": V21_LAST_SCAN,
+        },
+        "persistence": {
+            "database_configured": bool(V21_DB_URL),
+            "backend": "POSTGRESQL" if V21_DB_URL else "MEMORY_ONLY",
+        },
+        "paper": v20_public_state(),
+        "generated_utc": utc_now(),
+    }
+
+
+@app.get("/v21-scan-now")
+async def v21_scan_now():
+    result = await v21_run_and_persist()
+    return {
+        "model": MODEL,
+        "mode": "RESEARCH_PAPER_ONLY",
+        "trading": False,
+        "orders": False,
+        "signal": bool(result.get("new_entries")),
+        "scan": result,
+        "paper": v20_public_state(),
+        "database_configured": bool(V21_DB_URL),
         "generated_utc": utc_now(),
     }
 
