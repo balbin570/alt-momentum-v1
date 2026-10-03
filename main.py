@@ -358,6 +358,7 @@ async def root():
             "/continuation-quality90?count=30&days=90",
             "/continuation-combo90?count=30&days=90",
             "/h6-validate?count=30&days=365",
+            "/h6-regime?count=30&days=365",
         ],
     }
 
@@ -2591,6 +2592,260 @@ async def h6_validate_v7(
                 "This endpoint validates the same rule over a longer window "
                 "and reports multiple fixed exit horizons. It does not "
                 "optimize thresholds or place orders."
+            ),
+        }
+
+    except Exception as e:
+        return {
+            **MODE_INFO,
+            "status": "ERROR",
+            "signal": False,
+            "error": str(e),
+            "generated_utc": utc_now(),
+        }
+
+def enrich_h6_with_regime_v8(events, alt_candles, btc_candles):
+    """
+    V8: H6 eşiklerine DOKUNMADAN, sinyal anındaki rejimi ekler.
+    Gelecek veri kullanılmaz.
+
+    Rejim değişkenleri:
+      BTC 1h / 4h / 24h return
+      ALT 1h / 4h / 24h return
+    5m tamamlanmış mumlardan hesaplanır.
+    """
+    alt_by_close = {c["close_time"]: idx for idx, c in enumerate(alt_candles)}
+    btc_by_close = {c["close_time"]: idx for idx, c in enumerate(btc_candles)}
+
+    enriched = []
+
+    for e in events:
+        # Signal close time from ISO.
+        signal_ms = int(
+            datetime.fromisoformat(
+                e["signal_time_utc"].replace("Z", "+00:00")
+            ).timestamp() * 1000
+        )
+
+        # Binance close_time may differ by 1 ms; use latest completed candle <= signal.
+        alt_idx = None
+        btc_idx = None
+
+        # Fast exact/near-exact lookup first.
+        for delta in (0, -1, 1):
+            if signal_ms + delta in alt_by_close:
+                alt_idx = alt_by_close[signal_ms + delta]
+                break
+        for delta in (0, -1, 1):
+            if signal_ms + delta in btc_by_close:
+                btc_idx = btc_by_close[signal_ms + delta]
+                break
+
+        if alt_idx is None:
+            # fallback: aligned 5m open time derived from signal
+            candidates = [
+                i for i, c in enumerate(alt_candles)
+                if c["close_time"] <= signal_ms
+            ]
+            if candidates:
+                alt_idx = candidates[-1]
+
+        if btc_idx is None:
+            candidates = [
+                i for i, c in enumerate(btc_candles)
+                if c["close_time"] <= signal_ms
+            ]
+            if candidates:
+                btc_idx = candidates[-1]
+
+        if alt_idx is None or btc_idx is None:
+            continue
+
+        # Need 24h history = 288 x 5m.
+        if alt_idx < 288 or btc_idx < 288:
+            continue
+
+        row = dict(e)
+
+        for label, bars in (("1h", 12), ("4h", 48), ("24h", 288)):
+            row[f"alt_{label}_return_pct"] = pct_change(
+                alt_candles[alt_idx - bars]["close"],
+                alt_candles[alt_idx]["close"],
+            )
+            row[f"btc_{label}_return_pct"] = pct_change(
+                btc_candles[btc_idx - bars]["close"],
+                btc_candles[btc_idx]["close"],
+            )
+
+        enriched.append(row)
+
+    return enriched
+
+
+def regime_report_v8(events):
+    """
+    Önceden tanımlı, kaba rejim ayrımları.
+    Amaç 'en iyi eşik' aramak değil; H6'nın hangi piyasa yönünde
+    bozulduğunu veya iyileştiğini görmek.
+    """
+    regimes = [
+        ("ALL", lambda e: True),
+
+        ("BTC_1H_POS", lambda e: e["btc_1h_return_pct"] > 0),
+        ("BTC_1H_NEG_OR_ZERO", lambda e: e["btc_1h_return_pct"] <= 0),
+
+        ("BTC_4H_POS", lambda e: e["btc_4h_return_pct"] > 0),
+        ("BTC_4H_NEG_OR_ZERO", lambda e: e["btc_4h_return_pct"] <= 0),
+
+        ("BTC_24H_POS", lambda e: e["btc_24h_return_pct"] > 0),
+        ("BTC_24H_NEG_OR_ZERO", lambda e: e["btc_24h_return_pct"] <= 0),
+
+        ("ALT_4H_POS", lambda e: e["alt_4h_return_pct"] > 0),
+        ("ALT_4H_NEG_OR_ZERO", lambda e: e["alt_4h_return_pct"] <= 0),
+
+        ("ALT_24H_POS", lambda e: e["alt_24h_return_pct"] > 0),
+        ("ALT_24H_NEG_OR_ZERO", lambda e: e["alt_24h_return_pct"] <= 0),
+
+        (
+            "BTC4H_POS_AND_ALT4H_POS",
+            lambda e:
+                e["btc_4h_return_pct"] > 0
+                and e["alt_4h_return_pct"] > 0
+        ),
+        (
+            "BTC4H_NEG_AND_ALT4H_POS",
+            lambda e:
+                e["btc_4h_return_pct"] <= 0
+                and e["alt_4h_return_pct"] > 0
+        ),
+        (
+            "BTC4H_POS_AND_ALT4H_NEG",
+            lambda e:
+                e["btc_4h_return_pct"] > 0
+                and e["alt_4h_return_pct"] <= 0
+        ),
+        (
+            "BTC4H_NEG_AND_ALT4H_NEG",
+            lambda e:
+                e["btc_4h_return_pct"] <= 0
+                and e["alt_4h_return_pct"] <= 0
+        ),
+    ]
+
+    rows = []
+    for name, predicate in regimes:
+        subset = [e for e in events if predicate(e)]
+        rows.append({
+            "regime": name,
+            "horizons": horizon_report_v7(subset),
+        })
+    return rows
+
+
+@app.get("/h6-regime")
+async def h6_regime_v8(
+    count: int = Query(default=30, ge=5, le=30),
+    days: int = Query(default=365, ge=90, le=365),
+):
+    """
+    V8 regime study.
+    Frozen H6 signal + BTC/ALT broader market direction.
+    Research/paper only. No orders.
+    """
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(180.0)
+        ) as client:
+            universe_data = await build_universe(client)
+            selected = universe_data[:count]
+
+            # Fetch BTC once as the common market-regime reference.
+            btc_candles = await get_5m_candles_days(
+                client, "BTCUSDT", days
+            )
+
+            semaphore = asyncio.Semaphore(2)
+
+            async def worker(item):
+                async with semaphore:
+                    try:
+                        candles = await get_5m_candles_days(
+                            client, item["symbol"], days
+                        )
+                        h6 = h6_validation_events_v7(
+                            candles, item["symbol"]
+                        )
+                        h6 = apply_symbol_cooldown_v4(h6, 60)
+                        enriched = enrich_h6_with_regime_v8(
+                            h6, candles, btc_candles
+                        )
+                        return {
+                            "ok": True,
+                            "symbol": item["symbol"],
+                            "events": enriched,
+                        }
+                    except Exception as e:
+                        return {
+                            "ok": False,
+                            "symbol": item["symbol"],
+                            "error": str(e),
+                        }
+
+            results = await asyncio.gather(
+                *[worker(x) for x in selected]
+            )
+
+        successful = [x for x in results if x.get("ok")]
+        failed = [x for x in results if not x.get("ok")]
+
+        all_events = []
+        for item in successful:
+            all_events.extend(item["events"])
+
+        # Same existing split method retained so V7 and V8 are directly comparable.
+        dev, oos = split_dev_oos(all_events)
+
+        return {
+            **MODE_INFO,
+            "status": "OK",
+            "signal": False,
+            "study": "FROZEN_H6_MARKET_REGIME_STUDY",
+            "days": days,
+            "selected_coin_count": len(selected),
+            "successful_coin_count": len(successful),
+            "failed_coin_count": len(failed),
+            "h6_rule_changed": False,
+            "frozen_rule": {
+                "momentum_30m_pct": ">=1.0 and <2.0",
+                "volume_persistence_ratio": ">=1.2",
+                "pullback_from_30m_peak_pct": "<-0.75",
+                "momentum_5m_pct": ">0",
+                "acceleration_pct_points": ">0.25",
+            },
+            "regime_features": [
+                "BTC 1h return",
+                "BTC 4h return",
+                "BTC 24h return",
+                "ALT 1h return",
+                "ALT 4h return",
+                "ALT 24h return",
+            ],
+            "entry_model": "NEXT_5M_CANDLE_OPEN",
+            "exit_horizons": ["15m", "30m", "60m", "120m"],
+            "round_trip_cost_pct": ROUND_TRIP_COST_PCT,
+            "same_symbol_cooldown_minutes": 60,
+            "event_count": len(all_events),
+            "regimes_all": regime_report_v8(all_events),
+            "regimes_dev": regime_report_v8(dev),
+            "regimes_oos": regime_report_v8(oos),
+            "failed": failed,
+            "generated_utc": utc_now(),
+            "interpretation_note": (
+                "H6 thresholds remain frozen. V8 asks whether the same H6 "
+                "event behaves differently depending on BTC and altcoin "
+                "broader trend direction. Regime buckets use only information "
+                "available at the signal time and are descriptive, not yet "
+                "entry filters."
             ),
         }
 
