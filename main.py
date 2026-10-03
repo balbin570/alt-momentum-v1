@@ -12,7 +12,7 @@ app = FastAPI(title="ALT-MOMENTUM-V1")
 BINANCE = "https://data-api.binance.vision"
 MODEL = "ALT-MOMENTUM-V1"
 
-MIN_QUOTE_VOLUME_USDT = 1_000_000
+MIN_QUOTE_VOLUME_USDT = 250_000
 ROUND_TRIP_COST_PCT = 0.15
 
 # Altcoin araştırması için istemediğimiz baz varlıklar
@@ -5870,7 +5870,7 @@ def v20_public_state():
         "mode": "RESEARCH_PAPER_ONLY",
         "trading": False,
         "orders": False,
-        "strategy": "V24_CANDIDATE_B_BROAD_UNIVERSE_FORWARD_PAPER",
+        "strategy": "V25_CANDIDATE_B_VERY_BROAD_UNIVERSE_FORWARD_PAPER",
         "started_utc": V20_STATE["started_utc"],
         "open_count": len(V20_STATE["open"]),
         "closed_count": len(closed),
@@ -6250,7 +6250,7 @@ async def v21_status():
         "mode": "RESEARCH_PAPER_ONLY",
         "trading": False,
         "orders": False,
-        "strategy": "V24_CANDIDATE_B_BROAD_UNIVERSE_FORWARD_PAPER",
+        "strategy": "V25_CANDIDATE_B_VERY_BROAD_UNIVERSE_FORWARD_PAPER",
         "strategy_changed": True,
         "strategy_change": "Universe broadened further by lowering the 24h quote-volume floor from 5M USDT to 1M USDT; Candidate B signal thresholds unchanged.",
         "automation": {
@@ -6399,7 +6399,7 @@ async def v22_status():
         "mode": "RESEARCH_PAPER_ONLY",
         "trading": False,
         "orders": False,
-        "strategy": "V24_CANDIDATE_B_BROAD_UNIVERSE_FORWARD_PAPER",
+        "strategy": "V25_CANDIDATE_B_VERY_BROAD_UNIVERSE_FORWARD_PAPER",
         "strategy_changed": True,
         "strategy_change": "Universe broadened further by lowering the 24h quote-volume floor from 5M USDT to 1M USDT; Candidate B signal thresholds unchanged.",
         "automation": {
@@ -6459,7 +6459,7 @@ async def v23_status():
         "mode": "RESEARCH_PAPER_ONLY",
         "trading": False,
         "orders": False,
-        "strategy": "V24_CANDIDATE_B_BROAD_UNIVERSE_FORWARD_PAPER",
+        "strategy": "V25_CANDIDATE_B_VERY_BROAD_UNIVERSE_FORWARD_PAPER",
         "strategy_changed": True,
         "strategy_change": (
             "Universe expanded from 10 coins to all eligible dynamic Binance "
@@ -6502,7 +6502,7 @@ async def v24_status():
         "mode": "RESEARCH_PAPER_ONLY",
         "trading": False,
         "orders": False,
-        "strategy": "V24_CANDIDATE_B_BROAD_UNIVERSE_FORWARD_PAPER",
+        "strategy": "V25_CANDIDATE_B_VERY_BROAD_UNIVERSE_FORWARD_PAPER",
         "strategy_changed": True,
         "strategy_change": (
             "24h quote-volume floor lowered from 5M to 1M USDT. "
@@ -6534,3 +6534,45 @@ async def v24_status():
         "paper": v20_public_state(),
         "generated_utc": utc_now(),
     }
+
+
+@app.get("/v25-status")
+async def v25_status():
+    return {
+        "model": MODEL,
+        "mode": "RESEARCH_PAPER_ONLY",
+        "trading": False,
+        "orders": False,
+        "strategy": "V25_CANDIDATE_B_VERY_BROAD_UNIVERSE_FORWARD_PAPER",
+        "strategy_changed": True,
+        "strategy_change": (
+            "24h quote-volume floor lowered from 1M to 250k USDT. "
+            "Candidate B signal thresholds are unchanged."
+        ),
+        "universe": {
+            "mode": "VERY_BROAD_DYNAMIC",
+            "min_quote_volume_usdt_24h": MIN_QUOTE_VOLUME_USDT,
+            "fixed_coin_count": False,
+            "note": (
+                "All Binance USDT spot symbols passing the existing eligibility "
+                "exclusions and >=250k USDT 24h quote volume are scanned."
+            ),
+        },
+        "automation": {
+            "enabled": True,
+            "scan_interval_seconds": V21_SCAN_INTERVAL_SECONDS,
+            "last_scan": V21_LAST_SCAN,
+        },
+        "persistence": {
+            "database_configured": bool(V21_DB_URL),
+            "backend": "POSTGRESQL" if V21_DB_URL else "MEMORY_ONLY",
+        },
+        "telegram": {
+            "configured": bool(V22_TG_TOKEN and V22_TG_CHAT_ID),
+            "entry_notifications": True,
+            "exit_notifications": True,
+        },
+        "paper": v20_public_state(),
+        "generated_utc": utc_now(),
+    }
+
