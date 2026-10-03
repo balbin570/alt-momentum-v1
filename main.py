@@ -364,6 +364,7 @@ async def root():
             "/pullback-reentry?count=30&days=365",
             "/relative-momentum?count=30&days=365",
             "/relative-momentum-horizons?count=10&days=90",
+            "/relative-momentum-entry-delay?count=10&days=90",
         ],
     }
 
@@ -4374,6 +4375,241 @@ async def relative_momentum_horizons_v13(
                 "continuation exists briefly after entry and then decays or "
                 "reverses. Do not choose a horizon from one favorable cell; "
                 "look for a coherent time pattern in discovery and reference."
+            ),
+        }
+
+    except Exception as e:
+        return {
+            **MODE_INFO,
+            "status": "ERROR",
+            "signal": False,
+            "error": str(e),
+            "generated_utc": utc_now(),
+        }
+
+V14_ENTRY_DELAYS_MINUTES = (0, 15, 30, 60, 120)
+V14_HOLD_MINUTES = 120
+
+
+def relative_candidates_v14(candles, symbol):
+    """
+    V14 keeps the V12 relative-momentum signal frozen and changes only
+    entry timing.
+
+    Signal: completed 5m candle; coin has already risen over 30m.
+    Entry delays tested: 0/15/30/60/120 minutes after the original
+    next-5m-open entry point.
+    Hold: fixed 120 minutes from each delayed entry.
+    Cost: 0.15% round trip for every delay.
+    """
+    rows = []
+    ret30, mus, sigmas = precompute_rolling_volatility_v12(candles, 288)
+
+    max_delay_bars = max(V14_ENTRY_DELAYS_MINUTES) // 5
+    hold_bars = V14_HOLD_MINUTES // 5
+
+    for i in range(294, len(candles) - max_delay_bars - hold_bars - 2):
+        mom30 = ret30[i]
+        if mom30 is None or mom30 <= 0:
+            continue
+
+        mu, sigma = mus[i], sigmas[i]
+        if mu is None or sigma is None or sigma <= 0:
+            continue
+
+        z = (mom30 - mu) / sigma
+        original_entry_idx = i + 1
+
+        outcomes = {}
+        for delay in V14_ENTRY_DELAYS_MINUTES:
+            entry_idx = original_entry_idx + delay // 5
+            exit_idx = entry_idx + hold_bars
+            entry_price = candles[entry_idx]["open"]
+            exit_price = candles[exit_idx]["open"]
+            gross = pct_change(entry_price, exit_price)
+            outcomes[delay] = gross - ROUND_TRIP_COST_PCT
+
+        rows.append({
+            "symbol": symbol,
+            "signal_time_ms": candles[i]["close_time"],
+            "entry_open_time": candles[original_entry_idx]["open_time"],
+            "momentum_30m_pct": mom30,
+            "relative_momentum_z": z,
+            "outcomes": outcomes,
+        })
+
+    return rows
+
+
+def summarize_delay_v14(events, delay):
+    vals = [e["outcomes"][delay] for e in events]
+    if not vals:
+        return {
+            "n": 0,
+            "mean_net_120m_pct": None,
+            "median_net_120m_pct": None,
+            "win_rate_pct": None,
+            "profit_factor": None,
+        }
+
+    wins = [x for x in vals if x > 0]
+    losses = [x for x in vals if x < 0]
+    gp = sum(wins)
+    gl = abs(sum(losses))
+    pf = gp / gl if gl > 0 else None
+
+    return {
+        "n": len(vals),
+        "mean_net_120m_pct": round(mean(vals), 4),
+        "median_net_120m_pct": round(safe_median_v10(vals), 4),
+        "win_rate_pct": round(len(wins) / len(vals) * 100, 2),
+        "profit_factor": round(pf, 4) if pf is not None else None,
+    }
+
+
+def delay_report_v14(events):
+    ev = sorted(events, key=lambda e: e["entry_open_time"])
+    cut = int(len(ev) * 2 / 3)
+    dev, ref = ev[:cut], ev[cut:]
+
+    report = {}
+    for delay in V14_ENTRY_DELAYS_MINUTES:
+        report[f"delay_{delay}m"] = {
+            "all": summarize_delay_v14(ev, delay),
+            "discovery_first_2_3": summarize_delay_v14(dev, delay),
+            "reference_last_1_3": summarize_delay_v14(ref, delay),
+        }
+    return report
+
+
+@app.get("/relative-momentum-entry-delay")
+async def relative_momentum_entry_delay_v14(
+    count: int = Query(default=10, ge=10, le=30),
+    days: int = Query(default=90, ge=90, le=365),
+):
+    """
+    V14 entry-delay diagnostic.
+    Entry hypotheses remain frozen from V12/V13.
+    Only entry timing changes; hold is fixed at 120m.
+    Research/paper only.
+    """
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(240.0)
+        ) as client:
+            universe_data = await build_universe(client)
+            selected = universe_data[:count]
+            semaphore = asyncio.Semaphore(2)
+
+            async def worker(item):
+                async with semaphore:
+                    try:
+                        candles = await get_5m_candles_days(
+                            client, item["symbol"], days
+                        )
+                        return {
+                            "ok": True,
+                            "symbol": item["symbol"],
+                            "events": relative_candidates_v14(
+                                candles, item["symbol"]
+                            ),
+                        }
+                    except Exception as e:
+                        return {
+                            "ok": False,
+                            "symbol": item["symbol"],
+                            "error": str(e),
+                        }
+
+            results = await asyncio.gather(
+                *[worker(x) for x in selected]
+            )
+
+        successful = [x for x in results if x.get("ok")]
+        failed = [x for x in results if not x.get("ok")]
+
+        raw = []
+        for item in successful:
+            raw.extend(item["events"])
+
+        # Same V12/V13 cross-sectional ranking.
+        by_time = {}
+        for e in raw:
+            by_time.setdefault(e["signal_time_ms"], []).append(e)
+
+        ranked = []
+        for group in by_time.values():
+            if len(group) < 5:
+                continue
+            ordered = sorted(group, key=lambda x: x["relative_momentum_z"])
+            n = len(ordered)
+            for idx, e in enumerate(ordered):
+                row = dict(e)
+                row["cross_section_percentile"] = (
+                    idx / (n - 1) if n > 1 else 1.0
+                )
+                ranked.append(row)
+
+        # Keep the original signal-observation cooldown frozen at 60m.
+        ranked.sort(key=lambda e: (e["symbol"], e["entry_open_time"]))
+        cooled = []
+        last_by_symbol = {}
+        for e in ranked:
+            t = e["entry_open_time"]
+            last = last_by_symbol.get(e["symbol"])
+            if last is None or t - last >= 60 * 60 * 1000:
+                cooled.append(e)
+                last_by_symbol[e["symbol"]] = t
+
+        hypotheses = {
+            "Z_GE_1.0": [
+                e for e in cooled
+                if e["relative_momentum_z"] >= 1.0
+            ],
+            "Z_GE_1.0_AND_TOP_10_PCT": [
+                e for e in cooled
+                if e["relative_momentum_z"] >= 1.0
+                and e["cross_section_percentile"] >= 0.90
+            ],
+            "Z_GE_1.0_AND_TOP_20_PCT": [
+                e for e in cooled
+                if e["relative_momentum_z"] >= 1.0
+                and e["cross_section_percentile"] >= 0.80
+            ],
+        }
+
+        return {
+            **MODE_INFO,
+            "status": "OK",
+            "signal": False,
+            "study": "RELATIVE_MOMENTUM_ENTRY_DELAY_DIAGNOSTIC",
+            "days": days,
+            "selected_coin_count": len(selected),
+            "successful_coin_count": len(successful),
+            "failed_coin_count": len(failed),
+            "entry_hypotheses_frozen_from_v12_v13": [
+                "Z_GE_1.0",
+                "Z_GE_1.0_AND_TOP_10_PCT",
+                "Z_GE_1.0_AND_TOP_20_PCT",
+            ],
+            "signal_observation": "COMPLETED_5M_CANDLE",
+            "baseline_entry": "NEXT_5M_OPEN_AFTER_COMPLETED_SIGNAL",
+            "entry_delays_minutes": list(V14_ENTRY_DELAYS_MINUTES),
+            "hold_minutes_after_each_entry": V14_HOLD_MINUTES,
+            "round_trip_cost_pct": ROUND_TRIP_COST_PCT,
+            "same_symbol_signal_cooldown_minutes": 60,
+            "results": {
+                name: delay_report_v14(events)
+                for name, events in hypotheses.items()
+            },
+            "failed": failed,
+            "generated_utc": utc_now(),
+            "interpretation_note": (
+                "V14 changes only entry timing. The signal definition, "
+                "relative-momentum thresholds, cross-sectional ranking, "
+                "cost and signal cooldown are frozen. Look for a coherent "
+                "improvement with delay in both discovery and reference; "
+                "do not select a delay from one favorable cell."
             ),
         }
 
