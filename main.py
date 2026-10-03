@@ -365,6 +365,7 @@ async def root():
             "/relative-momentum?count=30&days=365",
             "/relative-momentum-horizons?count=10&days=90",
             "/relative-momentum-entry-delay?count=10&days=90",
+            "/post-rise-behavior?count=10&days=90",
         ],
     }
 
@@ -4610,6 +4611,293 @@ async def relative_momentum_entry_delay_v14(
                 "cost and signal cooldown are frozen. Look for a coherent "
                 "improvement with delay in both discovery and reference; "
                 "do not select a delay from one favorable cell."
+            ),
+        }
+
+    except Exception as e:
+        return {
+            **MODE_INFO,
+            "status": "ERROR",
+            "signal": False,
+            "error": str(e),
+            "generated_utc": utc_now(),
+        }
+
+V15_WAIT_MINUTES = 60
+V15_HOLD_MINUTES = 120
+
+
+def classify_post_rise_behavior_v15(candles, signal_i):
+    """
+    Observe the 60 minutes AFTER the original next-open reference.
+    No entry decision is made until that observation window is complete.
+
+    Categories are descriptive and fixed before seeing V15 results:
+    - CONTINUED_UP: price kept advancing during the wait.
+    - SHALLOW_CONSOLIDATION: stayed near signal price with limited drawdown.
+    - PULLBACK_RECOVERY: meaningful pullback, then recovered near/above signal.
+    - PULLBACK_UNRECOVERED: meaningful pullback and remained below signal.
+    """
+    start_idx = signal_i + 1
+    end_idx = start_idx + V15_WAIT_MINUTES // 5
+
+    signal_close = candles[signal_i]["close"]
+    window = candles[start_idx:end_idx + 1]
+    if len(window) < (V15_WAIT_MINUTES // 5 + 1):
+        return None
+
+    end_price = candles[end_idx]["open"]
+    highs = [c["high"] for c in window]
+    lows = [c["low"] for c in window]
+
+    end_change = pct_change(signal_close, end_price)
+    max_up = pct_change(signal_close, max(highs))
+    max_down = pct_change(signal_close, min(lows))
+
+    # Fixed descriptive thresholds; not optimized from results.
+    if end_change >= 0.75:
+        label = "CONTINUED_UP"
+    elif max_down > -0.75 and -0.50 <= end_change < 0.75:
+        label = "SHALLOW_CONSOLIDATION"
+    elif max_down <= -0.75 and end_change >= -0.25:
+        label = "PULLBACK_RECOVERY"
+    else:
+        label = "PULLBACK_UNRECOVERED"
+
+    return {
+        "behavior": label,
+        "wait_end_change_pct": end_change,
+        "wait_max_up_pct": max_up,
+        "wait_max_down_pct": max_down,
+        "entry_idx": end_idx,
+    }
+
+
+def relative_candidates_v15(candles, symbol):
+    """
+    Frozen V12 relative-momentum signal.
+    Observe post-rise behavior for 60m, then enter at the observation-window
+    end OPEN and hold 120m. Cost remains 0.15%.
+    """
+    rows = []
+    ret30, mus, sigmas = precompute_rolling_volatility_v12(candles, 288)
+    hold_bars = V15_HOLD_MINUTES // 5
+
+    for i in range(294, len(candles) - (V15_WAIT_MINUTES // 5) - hold_bars - 3):
+        mom30 = ret30[i]
+        if mom30 is None or mom30 <= 0:
+            continue
+
+        mu, sigma = mus[i], sigmas[i]
+        if mu is None or sigma is None or sigma <= 0:
+            continue
+
+        z = (mom30 - mu) / sigma
+        behavior = classify_post_rise_behavior_v15(candles, i)
+        if behavior is None:
+            continue
+
+        entry_idx = behavior["entry_idx"]
+        exit_idx = entry_idx + hold_bars
+        entry_price = candles[entry_idx]["open"]
+        exit_price = candles[exit_idx]["open"]
+        gross = pct_change(entry_price, exit_price)
+        net = gross - ROUND_TRIP_COST_PCT
+
+        rows.append({
+            "symbol": symbol,
+            "signal_time_ms": candles[i]["close_time"],
+            "entry_open_time": candles[entry_idx]["open_time"],
+            "momentum_30m_pct": mom30,
+            "relative_momentum_z": z,
+            "behavior": behavior["behavior"],
+            "wait_end_change_pct": behavior["wait_end_change_pct"],
+            "wait_max_up_pct": behavior["wait_max_up_pct"],
+            "wait_max_down_pct": behavior["wait_max_down_pct"],
+            "net_120m_pct": net,
+        })
+
+    return rows
+
+
+def summarize_behavior_v15(events):
+    vals = [e["net_120m_pct"] for e in events]
+    if not vals:
+        return {
+            "n": 0,
+            "mean_net_120m_pct": None,
+            "median_net_120m_pct": None,
+            "win_rate_pct": None,
+            "profit_factor": None,
+        }
+
+    wins = [x for x in vals if x > 0]
+    losses = [x for x in vals if x < 0]
+    gp = sum(wins)
+    gl = abs(sum(losses))
+    pf = gp / gl if gl > 0 else None
+
+    return {
+        "n": len(vals),
+        "mean_net_120m_pct": round(mean(vals), 4),
+        "median_net_120m_pct": round(safe_median_v10(vals), 4),
+        "win_rate_pct": round(len(wins) / len(vals) * 100, 2),
+        "profit_factor": round(pf, 4) if pf is not None else None,
+    }
+
+
+def behavior_report_v15(events):
+    ev = sorted(events, key=lambda e: e["entry_open_time"])
+    cut = int(len(ev) * 2 / 3)
+    dev, ref = ev[:cut], ev[cut:]
+
+    labels = (
+        "CONTINUED_UP",
+        "SHALLOW_CONSOLIDATION",
+        "PULLBACK_RECOVERY",
+        "PULLBACK_UNRECOVERED",
+    )
+
+    report = {}
+    for label in labels:
+        a = [e for e in ev if e["behavior"] == label]
+        d = [e for e in dev if e["behavior"] == label]
+        r = [e for e in ref if e["behavior"] == label]
+        report[label] = {
+            "all": summarize_behavior_v15(a),
+            "discovery_first_2_3": summarize_behavior_v15(d),
+            "reference_last_1_3": summarize_behavior_v15(r),
+        }
+    return report
+
+
+@app.get("/post-rise-behavior")
+async def post_rise_behavior_v15(
+    count: int = Query(default=10, ge=10, le=30),
+    days: int = Query(default=90, ge=90, le=365),
+):
+    """
+    V15: after a relative-momentum rise, observe 60m price behavior before
+    entry. Tests whether continuation depends on consolidation/pullback shape.
+    Research/paper only.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(240.0)) as client:
+            universe_data = await build_universe(client)
+            selected = universe_data[:count]
+            semaphore = asyncio.Semaphore(2)
+
+            async def worker(item):
+                async with semaphore:
+                    try:
+                        candles = await get_5m_candles_days(
+                            client, item["symbol"], days
+                        )
+                        return {
+                            "ok": True,
+                            "symbol": item["symbol"],
+                            "events": relative_candidates_v15(
+                                candles, item["symbol"]
+                            ),
+                        }
+                    except Exception as e:
+                        return {
+                            "ok": False,
+                            "symbol": item["symbol"],
+                            "error": str(e),
+                        }
+
+            results = await asyncio.gather(*[worker(x) for x in selected])
+
+        successful = [x for x in results if x.get("ok")]
+        failed = [x for x in results if not x.get("ok")]
+
+        raw = []
+        for item in successful:
+            raw.extend(item["events"])
+
+        # Same-time cross-sectional rank, frozen from V12-V14.
+        by_time = {}
+        for e in raw:
+            by_time.setdefault(e["signal_time_ms"], []).append(e)
+
+        ranked = []
+        for group in by_time.values():
+            if len(group) < 5:
+                continue
+            ordered = sorted(group, key=lambda x: x["relative_momentum_z"])
+            n = len(ordered)
+            for idx, e in enumerate(ordered):
+                row = dict(e)
+                row["cross_section_percentile"] = (
+                    idx / (n - 1) if n > 1 else 1.0
+                )
+                ranked.append(row)
+
+        # Frozen 60m signal cooldown.
+        ranked.sort(key=lambda e: (e["symbol"], e["entry_open_time"]))
+        cooled = []
+        last_by_symbol = {}
+        for e in ranked:
+            t = e["entry_open_time"]
+            last = last_by_symbol.get(e["symbol"])
+            if last is None or t - last >= 60 * 60 * 1000:
+                cooled.append(e)
+                last_by_symbol[e["symbol"]] = t
+
+        hypotheses = {
+            "Z_GE_1.0": [
+                e for e in cooled if e["relative_momentum_z"] >= 1.0
+            ],
+            "Z_GE_1.0_AND_TOP_10_PCT": [
+                e for e in cooled
+                if e["relative_momentum_z"] >= 1.0
+                and e["cross_section_percentile"] >= 0.90
+            ],
+            "Z_GE_1.0_AND_TOP_20_PCT": [
+                e for e in cooled
+                if e["relative_momentum_z"] >= 1.0
+                and e["cross_section_percentile"] >= 0.80
+            ],
+        }
+
+        return {
+            **MODE_INFO,
+            "status": "OK",
+            "signal": False,
+            "study": "POST_RISE_BEHAVIOR_AFTER_RELATIVE_MOMENTUM",
+            "days": days,
+            "selected_coin_count": len(selected),
+            "successful_coin_count": len(successful),
+            "failed_coin_count": len(failed),
+            "signal_hypotheses_frozen_from_v12_v14": list(hypotheses.keys()),
+            "observation_wait_minutes": V15_WAIT_MINUTES,
+            "entry": "OPEN_AT_END_OF_60M_OBSERVATION_WINDOW",
+            "hold_minutes": V15_HOLD_MINUTES,
+            "round_trip_cost_pct": ROUND_TRIP_COST_PCT,
+            "behavior_definitions": {
+                "CONTINUED_UP": "wait_end_change >= +0.75%",
+                "SHALLOW_CONSOLIDATION": (
+                    "max drawdown > -0.75% and wait end change between "
+                    "-0.50% and +0.75%"
+                ),
+                "PULLBACK_RECOVERY": (
+                    "max drawdown <= -0.75% and wait end change >= -0.25%"
+                ),
+                "PULLBACK_UNRECOVERED": "remaining meaningful pullback cases",
+            },
+            "results": {
+                name: behavior_report_v15(events)
+                for name, events in hypotheses.items()
+            },
+            "failed": failed,
+            "generated_utc": utc_now(),
+            "interpretation_note": (
+                "V15 studies observed post-rise behavior rather than adding "
+                "another momentum threshold. Categories are predefined. "
+                "A behavior is interesting only if discovery and reference "
+                "show similar direction with adequate sample size; isolated "
+                "positive cells should not be promoted."
             ),
         }
 
