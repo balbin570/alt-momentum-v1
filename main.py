@@ -1,7 +1,7 @@
 import json
 import os
 import asyncio
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from statistics import mean, median
 
 import httpx
@@ -7560,5 +7560,221 @@ async def v27_causal_volume_all(days_ago: int = 1):
         "rows": events,
         "fetch_error_count": len(all_errors),
         "fetch_errors": all_errors[:50],
+        "generated_utc": utc_now(),
+    }
+
+# ---------------------------------------------------------------------------
+# V27 RESEARCH ONLY - Candidate-B aligned causal volume diagnostic
+# V27 forward-paper logic/state is NOT changed.
+#
+# Alignment:
+#   1) Build the exact frozen Candidate-B historical candidates:
+#      z >= 1, cross-sectional percentile >= .80, CONTINUED_UP,
+#      BTC_BULL, selected-alt mean 30m < +0.5%.
+#   2) Candidate-B already waits 60m after the relative-momentum signal.
+#      At its existing entry OPEN, all 12 observation candles are known.
+#   3) Volume ratio = base volume in the LAST 30m of that known 60m
+#      continuation window / base volume in the FIRST 30m.
+#      Therefore no extra waiting and no look-ahead are introduced.
+#   4) Measure net 30/60/120m from the SAME frozen Candidate-B entry OPEN.
+# ---------------------------------------------------------------------------
+
+@app.get("/v27-candidate-b-volume")
+async def v27_candidate_b_volume(days_ago: int = Query(default=1, ge=1, le=30)):
+    target_day = (datetime.now(timezone.utc) - timedelta(days=days_ago)).date()
+    # Need >=24h history before the signal plus the target day and 120m after entry.
+    fetch_days = max(3, days_ago + 2)
+
+    async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
+        universe = await build_universe(client)
+        # Deterministic snapshot for this run; BTC is fetched separately if excluded.
+        symbols = sorted({x["symbol"] for x in universe if x["symbol"] != "BTCUSDT"})
+        semaphore = asyncio.Semaphore(12)
+
+        async def fetch_symbol(sym):
+            async with semaphore:
+                try:
+                    c = await get_5m_candles_days(client, sym, fetch_days)
+                    return sym, c, None
+                except Exception as e:
+                    return sym, None, str(e)
+
+        fetched = await asyncio.gather(*[fetch_symbol(s) for s in symbols])
+        good = {s: c for s, c, err in fetched if c}
+        errors = [{"symbol": s, "error": err} for s, c, err in fetched if err]
+
+        try:
+            btc = await get_5m_candles_days(client, "BTCUSDT", fetch_days)
+        except Exception as e:
+            return {"status": "ERROR", "error": f"BTC fetch failed: {e}"}
+
+    # Exact V27/V20 candidate construction.
+    raw = []
+    for sym, candles in good.items():
+        rows = relative_candidates_v15(candles, sym)
+        if rows:
+            raw.extend(rows)
+
+    by_time = {}
+    for e in raw:
+        by_time.setdefault(e["signal_time_ms"], []).append(e)
+
+    ranked = []
+    for group in by_time.values():
+        if len(group) < 5:
+            continue
+        ordered = sorted(group, key=lambda x: x["relative_momentum_z"])
+        n = len(ordered)
+        for idx, e in enumerate(ordered):
+            row = dict(e)
+            row["cross_section_percentile"] = idx / (n - 1) if n > 1 else 1.0
+            ranked.append(row)
+
+    # Same true selected-alt mean 30m snapshot used by frozen Candidate B.
+    snapshots = {}
+    for sym, candles in good.items():
+        for i in range(6, len(candles)):
+            t = candles[i]["close_time"]
+            r30 = pct_change(candles[i - 6]["close"], candles[i]["close"])
+            snapshots.setdefault(t, []).append(r30)
+
+    frozen = []
+    for e in ranked:
+        if e["relative_momentum_z"] < 1.0:
+            continue
+        if e["cross_section_percentile"] < 0.80:
+            continue
+        if e["behavior"] != "CONTINUED_UP":
+            continue
+        reg = btc_regime_at_v17(btc, e["signal_time_ms"])
+        if not reg or reg["btc_trend"] != "BTC_BULL":
+            continue
+        vals = snapshots.get(e["signal_time_ms"], [])
+        if not vals:
+            continue
+        alt_mean = mean(vals)
+        if alt_mean >= 0.5:
+            continue
+
+        entry_dt = datetime.fromtimestamp(e["entry_open_time"] / 1000, tz=timezone.utc)
+        if entry_dt.date() != target_day:
+            continue
+
+        row = dict(e)
+        row["btc_4h_pct"] = reg["btc_4h_pct"]
+        row["btc_24h_pct"] = reg["btc_24h_pct"]
+        row["alt_market_mean_30m_pct"] = alt_mean
+        frozen.append(row)
+
+    events = []
+    for e in frozen:
+        candles = good.get(e["symbol"], [])
+        # Signal candle index and frozen Candidate-B entry index.
+        sig_idx = next((i for i, c in enumerate(candles) if c["close_time"] == e["signal_time_ms"]), None)
+        entry_idx = next((i for i, c in enumerate(candles) if c["open_time"] == e["entry_open_time"]), None)
+        if sig_idx is None or entry_idx is None or entry_idx - sig_idx < 12:
+            continue
+        if entry_idx + 24 >= len(candles):
+            continue
+
+        # The 12 completed 5m candles after the signal are already known at entry.
+        obs = candles[sig_idx + 1:entry_idx]
+        if len(obs) < 12:
+            continue
+        obs = obs[-12:]
+        first30 = sum(c["volume"] for c in obs[:6])
+        last30 = sum(c["volume"] for c in obs[6:12])
+        if first30 <= 0:
+            continue
+        vr = last30 / first30
+
+        entry_price = candles[entry_idx]["open"]
+        def net_after(bars):
+            px = candles[entry_idx + bars]["open"]
+            return pct_change(entry_price, px) - 0.15
+
+        net30 = net_after(6)
+        net60 = net_after(12)
+        net120 = net_after(24)
+        gross60 = net60 + 0.15
+        events.append({
+            "symbol": e["symbol"],
+            "signal_utc": datetime.fromtimestamp(e["signal_time_ms"] / 1000, tz=timezone.utc).isoformat(),
+            "entry_utc": datetime.fromtimestamp(e["entry_open_time"] / 1000, tz=timezone.utc).isoformat(),
+            "relative_momentum_z": round(e["relative_momentum_z"], 4),
+            "cross_section_percentile": round(e["cross_section_percentile"], 4),
+            "wait_end_change_pct": round(e["wait_end_change_pct"], 4),
+            "btc_4h_pct": round(e["btc_4h_pct"], 4),
+            "btc_24h_pct": round(e["btc_24h_pct"], 4),
+            "alt_market_mean_30m_pct": round(e["alt_market_mean_30m_pct"], 4),
+            "volume_ratio_last30_vs_first30_of_known_60m": round(vr, 4),
+            "net_30m_pct_after_0_15_cost": round(net30, 4),
+            "net_60m_pct_after_0_15_cost": round(net60, 4),
+            "net_120m_pct_after_0_15_cost": round(net120, 4),
+            "continued_60m_ge_0_75_from_entry": gross60 >= 0.75,
+        })
+
+    def stats(group):
+        n = len(group)
+        if not n:
+            return {"n": 0, "continued_n": 0, "continuation_rate_pct": None,
+                    "mean_net_30m_pct": None, "median_net_30m_pct": None,
+                    "mean_net_60m_pct": None, "median_net_60m_pct": None,
+                    "mean_net_120m_pct": None, "median_net_120m_pct": None}
+        def sm(key):
+            vals = [x[key] for x in group]
+            return round(mean(vals), 4), round(safe_median_v10(vals), 4)
+        m30, md30 = sm("net_30m_pct_after_0_15_cost")
+        m60, md60 = sm("net_60m_pct_after_0_15_cost")
+        m120, md120 = sm("net_120m_pct_after_0_15_cost")
+        cn = sum(1 for x in group if x["continued_60m_ge_0_75_from_entry"])
+        return {"n": n, "continued_n": cn, "continuation_rate_pct": round(100*cn/n, 2),
+                "mean_net_30m_pct": m30, "median_net_30m_pct": md30,
+                "mean_net_60m_pct": m60, "median_net_60m_pct": md60,
+                "mean_net_120m_pct": m120, "median_net_120m_pct": md120}
+
+    # Pre-specified broad groups only; no threshold mining.
+    bucket_defs = [("<1x", 0, 1), ("1-2x", 1, 2), ("2-3x", 2, 3), (">=3x", 3, float("inf"))]
+    buckets = []
+    key = "volume_ratio_last30_vs_first30_of_known_60m"
+    for label, lo, hi in bucket_defs:
+        g = [x for x in events if lo <= x[key] < hi]
+        buckets.append({"bucket": label, **stats(g)})
+
+    return {
+        "model": MODEL,
+        "mode": "RESEARCH_ONLY",
+        "trading": False,
+        "orders": False,
+        "strategy_changed": False,
+        "forward_v27_untouched": True,
+        "test": "V27_CANDIDATE_B_ALIGNED_CAUSAL_VOLUME",
+        "date_utc": target_day.isoformat(),
+        "days_ago": days_ago,
+        "universe_snapshot_symbols": len(symbols),
+        "symbols_fetched_ok": len(good),
+        "fetch_error_count": len(errors),
+        "candidate_b": {
+            "relative_momentum_z_min": 1.0,
+            "cross_section_percentile_min": 0.80,
+            "behavior": "CONTINUED_UP",
+            "wait_end_change_min_pct": 0.75,
+            "btc_regime": "BTC_BULL (4h>0 and 24h>0)",
+            "alt_market_mean_30m_max_exclusive_pct": 0.5,
+            "entry": "same frozen Candidate-B entry OPEN after the existing 60m observation",
+            "round_trip_cost_pct": 0.15,
+        },
+        "volume_diagnostic": {
+            "ratio": "last 30m base volume / first 30m base volume inside Candidate-B's already-known 60m continuation window",
+            "decision_time": "Candidate-B entry OPEN; entire 60m continuation window and volume ratio are already known",
+            "extra_wait_added": False,
+            "lookahead_at_entry": False,
+            "thresholds_optimized": False,
+        },
+        "events": len(events),
+        "all": stats(events),
+        "broad_volume_buckets": buckets,
+        "rows": sorted(events, key=lambda x: x["entry_utc"]),
+        "fetch_errors": errors[:50],
         "generated_utc": utc_now(),
     }
