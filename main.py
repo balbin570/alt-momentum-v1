@@ -5116,3 +5116,12 @@ async def v16_validate(
             "generated_utc": utc_now(),
         }
 
+@app.get("/v16-validate-light")
+async def v16_validate_light():
+    """
+    Render-friendly V16 validation.
+    Frozen strategy rules are unchanged.
+    Only workload is reduced to 10 coins / 180 days.
+    """
+    return await v16_validate(count=10, days=180)
+
