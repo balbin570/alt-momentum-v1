@@ -16,6 +16,9 @@ ROUND_TRIP_COST_PCT = 0.15
 # Altcoin araştırması için istemediğimiz baz varlıklar
 EXCLUDED_BASES = {
     "BTC",
+    "ETH",
+    "XAUT",
+    "PAXG",
     "USDC",
     "FDUSD",
     "TUSD",
@@ -350,6 +353,8 @@ async def root():
             "/backtest/TIAUSDT?limit=1000",
             "/backtest-all?count=30&limit=1000",
             "/backtest30?count=30&days=30",
+            "/backtest90?count=30&days=90",
+            "/continuation90?count=30&days=90",
         ],
     }
 
@@ -1160,6 +1165,691 @@ async def backtest30(
                 "DEV/OOS is chronological but this version does not optimize parameters on DEV.",
                 "Per-coin DEV/OOS samples may be small even with 30 days of data.",
             ],
+        }
+
+    except Exception as e:
+        return {
+            **MODE_INFO,
+            "status": "ERROR",
+            "signal": False,
+            "error": str(e),
+            "generated_utc": utc_now(),
+        }
+
+def ema_series(values, period):
+    if not values:
+        return []
+
+    alpha = 2.0 / (period + 1.0)
+    result = [float(values[0])]
+
+    for value in values[1:]:
+        result.append(
+            (float(value) * alpha)
+            + (result[-1] * (1.0 - alpha))
+        )
+
+    return result
+
+
+def btc_regime_map_from_5m(candles):
+    """
+    BTC 5m verisini 1 saatlik kapanışlara indirger.
+    Rejim:
+      BULL    = close > EMA50 > EMA200
+      BEAR    = close < EMA50 < EMA200
+      NEUTRAL = diğer durumlar
+    Her 5m zaman damgası için yalnızca o ana kadar tamamlanmış 1H bilgi kullanılır.
+    """
+    if not candles:
+        return {}
+
+    hourly = {}
+    hour_ms = 60 * 60 * 1000
+
+    for c in candles:
+        bucket = (c["open_time"] // hour_ms) * hour_ms
+        hourly[bucket] = c["close"]
+
+    hours = sorted(hourly)
+    closes = [hourly[h] for h in hours]
+
+    ema50 = ema_series(closes, 50)
+    ema200 = ema_series(closes, 200)
+
+    regime_by_hour = {}
+
+    for idx, h in enumerate(hours):
+        if idx < 199:
+            regime_by_hour[h] = "UNKNOWN"
+            continue
+
+        close = closes[idx]
+        e50 = ema50[idx]
+        e200 = ema200[idx]
+
+        if close > e50 > e200:
+            regime = "BULL"
+        elif close < e50 < e200:
+            regime = "BEAR"
+        else:
+            regime = "NEUTRAL"
+
+        regime_by_hour[h] = regime
+
+    return regime_by_hour
+
+
+def attach_regime(trades, regime_by_hour):
+    hour_ms = 60 * 60 * 1000
+
+    for t in trades:
+        bucket = (
+            int(t["entry_open_time"]) // hour_ms
+        ) * hour_ms
+
+        t["market_regime"] = regime_by_hour.get(
+            bucket,
+            "UNKNOWN",
+        )
+
+    return trades
+
+
+def summarize_by_regime(trades):
+    result = {}
+
+    for regime in ["BULL", "NEUTRAL", "BEAR", "UNKNOWN"]:
+        subset = [
+            x for x in trades
+            if x.get("market_regime") == regime
+        ]
+        result[regime] = summarize_trades_v2(subset)
+
+    return result
+
+
+def simulate_portfolio_v3(
+    trades,
+    max_positions=5,
+    allocation_per_trade_pct=20.0,
+):
+    """
+    Daha gerçekçi ortak-portföy araştırma simülasyonu.
+
+    - Başlangıç equity = 100.
+    - Aynı anda en fazla max_positions.
+    - Her yeni pozisyon başlangıçtaki değil, o andaki equity'nin sabit yüzdesi
+      kadar nominal sermaye kullanır.
+    - Pozisyonlar 60 dk sonra kapanır.
+    - Aynı timestamp'teki sinyaller deterministik olarak symbol sırasına göre işlenir.
+    - Kaldıraç yok; toplam hedef tahsis <= %100.
+    """
+    if not trades:
+        return {
+            "accepted_trade_count": 0,
+            "skipped_capacity_count": 0,
+            "ending_equity": 100.0,
+            "return_pct": 0.0,
+            "max_drawdown_pct": 0.0,
+            "max_positions": max_positions,
+            "allocation_per_trade_pct": allocation_per_trade_pct,
+        }
+
+    ordered = sorted(
+        trades,
+        key=lambda x: (
+            x["entry_open_time"],
+            x["symbol"],
+        ),
+    )
+
+    equity = 100.0
+    peak = 100.0
+    max_dd = 0.0
+    active = []
+    accepted = 0
+    skipped = 0
+
+    def close_due(now_ms):
+        nonlocal equity, peak, max_dd, active
+
+        still_open = []
+
+        for pos in active:
+            if pos["exit_ms"] <= now_ms:
+                pnl = (
+                    pos["notional"]
+                    * pos["net_pct"]
+                    / 100.0
+                )
+                equity += pnl
+                peak = max(peak, equity)
+
+                if peak > 0:
+                    dd = (
+                        (equity / peak) - 1.0
+                    ) * 100.0
+                    max_dd = min(max_dd, dd)
+            else:
+                still_open.append(pos)
+
+        active = still_open
+
+    for t in ordered:
+        entry_ms = int(t["entry_open_time"])
+        close_due(entry_ms)
+
+        if len(active) >= max_positions:
+            skipped += 1
+            continue
+
+        notional = equity * (
+            allocation_per_trade_pct / 100.0
+        )
+
+        exit_ms = int(
+            datetime.fromisoformat(
+                t["exit_time_utc"]
+            ).timestamp() * 1000
+        )
+
+        active.append(
+            {
+                "exit_ms": exit_ms,
+                "notional": notional,
+                "net_pct": float(t["net_pct"]),
+            }
+        )
+        accepted += 1
+
+    # Kalan pozisyonları son exit zamanına kadar kapat.
+    if active:
+        final_ms = max(x["exit_ms"] for x in active)
+        close_due(final_ms)
+
+    return {
+        "accepted_trade_count": accepted,
+        "skipped_capacity_count": skipped,
+        "ending_equity": round(equity, 4),
+        "return_pct": round(equity - 100.0, 4),
+        "max_drawdown_pct": round(max_dd, 4),
+        "max_positions": max_positions,
+        "allocation_per_trade_pct": allocation_per_trade_pct,
+    }
+
+
+@app.get("/backtest90")
+async def backtest90(
+    count: int = Query(
+        default=30,
+        ge=5,
+        le=30,
+    ),
+    days: int = Query(
+        default=90,
+        ge=30,
+        le=90,
+    ),
+):
+    """
+    ALT-MOMENTUM V3:
+    - 30-90 gün sayfalı 5m veri
+    - next-candle-open giriş
+    - 60 dk hold / 60 dk same-symbol cooldown
+    - %0.15 round-trip cost
+    - BTC 1H EMA50/EMA200 piyasa rejimi
+    - kronolojik DEV/OOS
+    - max 5 eşzamanlı pozisyonlu ortak portföy simülasyonu
+    """
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(120.0)
+        ) as client:
+            universe_data = await build_universe(client)
+            selected = universe_data[:count]
+
+            # Önce BTC rejim verisi.
+            btc_candles = await get_5m_candles_days(
+                client,
+                "BTCUSDT",
+                days,
+            )
+            regime_map = btc_regime_map_from_5m(
+                btc_candles
+            )
+
+            # 90 gün x 30 coin ağır bir iş; kontrollü concurrency.
+            semaphore = asyncio.Semaphore(3)
+
+            async def worker(item):
+                async with semaphore:
+                    try:
+                        candles = await get_5m_candles_days(
+                            client,
+                            item["symbol"],
+                            days,
+                        )
+
+                        trades = historical_trades_v2(
+                            candles,
+                            item["symbol"],
+                        )
+                        attach_regime(
+                            trades,
+                            regime_map,
+                        )
+
+                        return {
+                            "ok": True,
+                            "symbol": item["symbol"],
+                            "quote_volume_24h": item["quote_volume_24h"],
+                            "candle_count": len(candles),
+                            "trades": trades,
+                        }
+
+                    except Exception as e:
+                        return {
+                            "ok": False,
+                            "symbol": item["symbol"],
+                            "error": str(e),
+                        }
+
+            results = await asyncio.gather(
+                *[worker(item) for item in selected]
+            )
+
+        successful = [
+            x for x in results if x.get("ok")
+        ]
+        failed = [
+            x for x in results if not x.get("ok")
+        ]
+
+        all_trades = []
+        per_coin = []
+
+        for item in successful:
+            trades = item["trades"]
+            dev, oos = split_dev_oos(trades)
+
+            all_trades.extend(trades)
+
+            per_coin.append(
+                {
+                    "symbol": item["symbol"],
+                    "quote_volume_24h": item["quote_volume_24h"],
+                    "candle_count": item["candle_count"],
+                    "all": summarize_trades_v2(trades),
+                    "dev": summarize_trades_v2(dev),
+                    "oos": summarize_trades_v2(oos),
+                    "regimes": summarize_by_regime(trades),
+                }
+            )
+
+        combined_dev, combined_oos = split_dev_oos(
+            all_trades
+        )
+
+        # Portföy simülasyonu aynı birleşik kronolojik trade akışında.
+        portfolio_all = simulate_portfolio_v3(
+            all_trades
+        )
+        portfolio_dev = simulate_portfolio_v3(
+            combined_dev
+        )
+        portfolio_oos = simulate_portfolio_v3(
+            combined_oos
+        )
+
+        return {
+            **MODE_INFO,
+            "status": "OK",
+            "signal": False,
+            "note": (
+                "ALT-MOMENTUM V3 90-DAY RESEARCH BACKTEST ONLY - "
+                "NOT A VALIDATED TRADING STRATEGY"
+            ),
+            "days": days,
+            "universe_size": len(universe_data),
+            "requested_coin_count": count,
+            "selected_coin_count": len(selected),
+            "successful_coin_count": len(successful),
+            "failed_coin_count": len(failed),
+            "excluded_from_alt_universe": [
+                "BTC",
+                "ETH",
+                "XAUT",
+                "PAXG",
+                "stable/fiat-like assets",
+            ],
+            "round_trip_cost_pct": ROUND_TRIP_COST_PCT,
+            "entry_model": "NEXT_5M_CANDLE_OPEN",
+            "exit_model": "OPEN_60_MIN_AFTER_ENTRY",
+            "same_symbol_cooldown_minutes": 60,
+            "market_regime_model": (
+                "BTC 1H: BULL=close>EMA50>EMA200; "
+                "BEAR=close<EMA50<EMA200; else NEUTRAL"
+            ),
+            "research_conditions": {
+                "momentum_5m_min_pct": 0.30,
+                "momentum_15m_min_pct": 0.50,
+                "momentum_30m_min_pct": 0.50,
+                "volume_ratio_min": 1.20,
+                "momentum_5m_max_pct": 3.00,
+                "momentum_30m_max_pct": 6.00,
+            },
+            "combined": {
+                "all": summarize_trades_v2(
+                    all_trades
+                ),
+                "dev_first_2_3": summarize_trades_v2(
+                    combined_dev
+                ),
+                "oos_last_1_3": summarize_trades_v2(
+                    combined_oos
+                ),
+                "regimes_all": summarize_by_regime(
+                    all_trades
+                ),
+                "regimes_oos": summarize_by_regime(
+                    combined_oos
+                ),
+            },
+            "portfolio": {
+                "assumption": (
+                    "max 5 simultaneous positions; "
+                    "20% current-equity notional per accepted trade; "
+                    "no leverage"
+                ),
+                "all": portfolio_all,
+                "dev_first_2_3": portfolio_dev,
+                "oos_last_1_3": portfolio_oos,
+            },
+            "per_coin": per_coin,
+            "failed": failed,
+            "generated_utc": utc_now(),
+            "limitations": [
+                "Universe is selected from current 24h liquidity; survivorship/current-universe bias remains.",
+                "Fixed 0.15% round-trip cost is an assumption; variable slippage is not modeled.",
+                "BTC regime uses completed historical 1H information derived from 5m candles.",
+                "DEV/OOS is chronological and no V3 parameter optimization is performed.",
+                "Portfolio capacity selection among simultaneous signals is deterministic by symbol, not a ranking model.",
+            ],
+        }
+
+    except Exception as e:
+        return {
+            **MODE_INFO,
+            "status": "ERROR",
+            "signal": False,
+            "error": str(e),
+            "generated_utc": utc_now(),
+        }
+
+def continuation_events_v4(candles, symbol):
+    """
+    Amaç tahmin etmek değil:
+    Coin ZATEN yükselmişken ve hacim artmışken, sonraki 60 dakikada
+    hareket devam ediyor mu sorusunu ölçmek.
+
+    Sinyal tamamlanmış 5m mum kapanışında görülür.
+    Giriş bir sonraki 5m mum OPEN.
+    Çıkış 60 dakika sonraki OPEN.
+    """
+    events = []
+
+    for i in range(7, len(candles) - 13):
+        signal_close = candles[i]["close"]
+
+        mom5 = pct_change(candles[i - 1]["close"], signal_close)
+        mom15 = pct_change(candles[i - 3]["close"], signal_close)
+        mom30 = pct_change(candles[i - 6]["close"], signal_close)
+
+        previous_volumes = [
+            candles[j]["volume"]
+            for j in range(i - 6, i)
+        ]
+        avg_volume = mean(previous_volumes)
+        volume_ratio = (
+            candles[i]["volume"] / avg_volume
+            if avg_volume > 0 else 0
+        )
+
+        # Sadece halihazırda yükselmiş hareketleri inceliyoruz.
+        if mom5 <= 0 or mom15 <= 0 or mom30 < 0.50:
+            continue
+
+        entry = candles[i + 1]
+        exit_60 = candles[i + 13]
+
+        gross = pct_change(entry["open"], exit_60["open"])
+        net = gross - ROUND_TRIP_COST_PCT
+
+        events.append({
+            "symbol": symbol,
+            "signal_time_utc": datetime.fromtimestamp(
+                candles[i]["close_time"] / 1000,
+                tz=timezone.utc,
+            ).isoformat(),
+            "entry_time_utc": datetime.fromtimestamp(
+                entry["open_time"] / 1000,
+                tz=timezone.utc,
+            ).isoformat(),
+            "entry_open_time": entry["open_time"],
+            "momentum_5m_pct": mom5,
+            "momentum_15m_pct": mom15,
+            "momentum_30m_pct": mom30,
+            "volume_ratio": volume_ratio,
+            "gross_pct": gross,
+            "net_pct": net,
+        })
+
+    return events
+
+
+def bucket_label(value, cuts, labels):
+    for idx, cut in enumerate(cuts):
+        if value < cut:
+            return labels[idx]
+    return labels[-1]
+
+
+def continuation_bucket_report(events):
+    """
+    Önceden belirlenmiş geniş kovalar.
+    Bunlar optimize edilmiş giriş eşikleri değildir; davranışı görmek içindir.
+    """
+    momentum_labels = [
+        "0.50-0.99%",
+        "1.00-1.49%",
+        "1.50-1.99%",
+        "2.00-2.99%",
+        "3.00%+",
+    ]
+    volume_labels = [
+        "<1.20x",
+        "1.20-1.49x",
+        "1.50-1.99x",
+        "2.00-2.99x",
+        "3.00x+",
+    ]
+
+    groups = {}
+
+    for e in events:
+        m = bucket_label(
+            e["momentum_30m_pct"],
+            [1.00, 1.50, 2.00, 3.00],
+            momentum_labels,
+        )
+        v = bucket_label(
+            e["volume_ratio"],
+            [1.20, 1.50, 2.00, 3.00],
+            volume_labels,
+        )
+
+        groups.setdefault((m, v), []).append(e)
+
+    rows = []
+
+    for m in momentum_labels:
+        for v in volume_labels:
+            subset = groups.get((m, v), [])
+            if not subset:
+                continue
+
+            s = summarize_trades_v2(subset)
+
+            rows.append({
+                "momentum_30m_bucket": m,
+                "volume_ratio_bucket": v,
+                **s,
+            })
+
+    return rows
+
+
+def apply_symbol_cooldown_v4(events, minutes=60):
+    by_symbol = {}
+
+    for e in sorted(
+        events,
+        key=lambda x: (x["symbol"], x["entry_open_time"]),
+    ):
+        by_symbol.setdefault(e["symbol"], []).append(e)
+
+    kept = []
+    cooldown_ms = minutes * 60 * 1000
+
+    for symbol, rows in by_symbol.items():
+        last_entry = None
+
+        for e in rows:
+            if (
+                last_entry is None
+                or e["entry_open_time"] - last_entry >= cooldown_ms
+            ):
+                kept.append(e)
+                last_entry = e["entry_open_time"]
+
+    return sorted(
+        kept,
+        key=lambda x: (x["entry_open_time"], x["symbol"]),
+    )
+
+
+@app.get("/continuation90")
+async def continuation90(
+    count: int = Query(default=30, ge=5, le=30),
+    days: int = Query(default=90, ge=30, le=90),
+):
+    """
+    V4 continuation study:
+    'Hangisi yükselecek?' değil,
+    'Zaten yükselmiş coin ne zaman yükselmeye devam ediyor?' testi.
+    """
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(120.0)
+        ) as client:
+            universe_data = await build_universe(client)
+            selected = universe_data[:count]
+
+            semaphore = asyncio.Semaphore(3)
+
+            async def worker(item):
+                async with semaphore:
+                    try:
+                        candles = await get_5m_candles_days(
+                            client,
+                            item["symbol"],
+                            days,
+                        )
+                        events = continuation_events_v4(
+                            candles,
+                            item["symbol"],
+                        )
+                        return {
+                            "ok": True,
+                            "symbol": item["symbol"],
+                            "candle_count": len(candles),
+                            "events": events,
+                        }
+                    except Exception as e:
+                        return {
+                            "ok": False,
+                            "symbol": item["symbol"],
+                            "error": str(e),
+                        }
+
+            results = await asyncio.gather(
+                *[worker(x) for x in selected]
+            )
+
+        successful = [x for x in results if x.get("ok")]
+        failed = [x for x in results if not x.get("ok")]
+
+        raw_events = []
+        per_coin = []
+
+        for item in successful:
+            raw_events.extend(item["events"])
+            cooled = apply_symbol_cooldown_v4(
+                item["events"],
+                60,
+            )
+            per_coin.append({
+                "symbol": item["symbol"],
+                "candle_count": item["candle_count"],
+                "raw_event_count": len(item["events"]),
+                "cooldown_event_count": len(cooled),
+                "cooldown_summary": summarize_trades_v2(cooled),
+            })
+
+        cooled_all = apply_symbol_cooldown_v4(
+            raw_events,
+            60,
+        )
+        dev, oos = split_dev_oos(cooled_all)
+
+        return {
+            **MODE_INFO,
+            "status": "OK",
+            "signal": False,
+            "study": "MOMENTUM_CONTINUATION_AFTER_PRICE_ALREADY_RISEN",
+            "question": (
+                "After an altcoin has already risen, which combinations "
+                "of 30m momentum and volume expansion are followed by "
+                "positive 60m continuation?"
+            ),
+            "days": days,
+            "selected_coin_count": len(selected),
+            "successful_coin_count": len(successful),
+            "failed_coin_count": len(failed),
+            "entry_model": "NEXT_5M_CANDLE_OPEN_AFTER_OBSERVED_RISE",
+            "exit_model": "OPEN_60_MIN_AFTER_ENTRY",
+            "round_trip_cost_pct": ROUND_TRIP_COST_PCT,
+            "same_symbol_cooldown_minutes": 60,
+            "raw_event_count": len(raw_events),
+            "cooldown_event_count": len(cooled_all),
+            "combined": {
+                "all": summarize_trades_v2(cooled_all),
+                "dev_first_2_3": summarize_trades_v2(dev),
+                "oos_last_1_3": summarize_trades_v2(oos),
+            },
+            "bucket_matrix_all": continuation_bucket_report(cooled_all),
+            "bucket_matrix_dev": continuation_bucket_report(dev),
+            "bucket_matrix_oos": continuation_bucket_report(oos),
+            "per_coin": per_coin,
+            "failed": failed,
+            "generated_utc": utc_now(),
+            "interpretation_note": (
+                "Buckets are descriptive research groups, not optimized "
+                "buy thresholds. We will look for continuation patterns "
+                "that remain positive in OOS rather than choosing the "
+                "best in-sample bucket."
+            ),
         }
 
     except Exception as e:
