@@ -5381,3 +5381,231 @@ async def v17_regime(
             "error": str(e), "generated_utc": utc_now()
         }
 
+# =========================
+# V18 REGIME VALIDATION
+# =========================
+
+def split_thirds_v18(events):
+    ev = sorted(events, key=lambda e: e["entry_open_time"])
+    n = len(ev)
+    a, b = n // 3, (2 * n) // 3
+    return {
+        "ALL": summarize_v17(ev),
+        "T1_OLDEST": summarize_v17(ev[:a]),
+        "T2_MIDDLE": summarize_v17(ev[a:b]),
+        "T3_NEWEST": summarize_v17(ev[b:]),
+    }
+
+
+@app.get("/v18-regime-validate")
+async def v18_regime_validate(
+    count: int = Query(default=10, ge=10, le=20),
+    days: int = Query(default=180, ge=90, le=180),
+):
+    """
+    V18: frozen continuation signal + predefined regime validation.
+    No trading. No regime threshold optimization.
+
+    Important fix vs V17:
+    true alt breadth is calculated from ALL selected coins' completed
+    30m returns at each timestamp, not from positive-momentum candidates.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(300.0)) as client:
+            universe_data = await build_universe(client)
+            selected = universe_data[:count]
+            semaphore = asyncio.Semaphore(2)
+
+            async def worker(item):
+                async with semaphore:
+                    try:
+                        candles = await get_5m_candles_days(
+                            client, item["symbol"], days
+                        )
+                        return {
+                            "ok": True,
+                            "symbol": item["symbol"],
+                            "candles": candles,
+                            "events": relative_candidates_v15(
+                                candles, item["symbol"]
+                            ),
+                        }
+                    except Exception as e:
+                        return {
+                            "ok": False,
+                            "symbol": item["symbol"],
+                            "error": str(e),
+                        }
+
+            coin_results, btc = await asyncio.gather(
+                asyncio.gather(*[worker(x) for x in selected]),
+                fetch_btc_5m_for_v17(client, days),
+            )
+
+        successful = [x for x in coin_results if x.get("ok")]
+        failed = [x for x in coin_results if not x.get("ok")]
+
+        raw = []
+        for item in successful:
+            raw.extend(item["events"])
+
+        # Same frozen cross-sectional relative-momentum ranking.
+        by_time = {}
+        for e in raw:
+            by_time.setdefault(e["signal_time_ms"], []).append(e)
+
+        ranked = []
+        for group in by_time.values():
+            if len(group) < 5:
+                continue
+            ordered = sorted(group, key=lambda x: x["relative_momentum_z"])
+            n = len(ordered)
+            for idx, e in enumerate(ordered):
+                row = dict(e)
+                row["cross_section_percentile"] = (
+                    idx / (n - 1) if n > 1 else 1.0
+                )
+                ranked.append(row)
+
+        ranked.sort(key=lambda e: (e["symbol"], e["entry_open_time"]))
+        cooled, last_by_symbol = [], {}
+        for e in ranked:
+            t = e["entry_open_time"]
+            last = last_by_symbol.get(e["symbol"])
+            if last is None or t - last >= 60 * 60 * 1000:
+                cooled.append(e)
+                last_by_symbol[e["symbol"]] = t
+
+        events = [
+            dict(e) for e in cooled
+            if e["relative_momentum_z"] >= 1.0
+            and e["cross_section_percentile"] >= 0.80
+            and e["behavior"] == "CONTINUED_UP"
+        ]
+
+        # Build TRUE market snapshots from all successfully fetched coins.
+        # Keyed by completed 5m candle close_time.
+        snapshots = {}
+        for item in successful:
+            candles = item["candles"]
+            for i in range(6, len(candles)):
+                t = candles[i]["close_time"]
+                mom30 = pct_change(candles[i - 6]["close"], candles[i]["close"])
+                snapshots.setdefault(t, []).append(mom30)
+
+        for e in events:
+            vals = snapshots.get(e["signal_time_ms"], [])
+            if vals:
+                e["true_alt_breadth_positive_pct"] = (
+                    100 * sum(1 for x in vals if x > 0) / len(vals)
+                )
+                e["true_alt_market_mean_30m_pct"] = mean(vals)
+                e["breadth_coin_count"] = len(vals)
+            else:
+                e["true_alt_breadth_positive_pct"] = None
+                e["true_alt_market_mean_30m_pct"] = None
+                e["breadth_coin_count"] = 0
+
+            reg = btc_regime_at_v17(btc, e["signal_time_ms"])
+            if reg:
+                e.update(reg)
+            else:
+                e["btc_trend"] = "UNKNOWN"
+
+        # Predefined diagnostic/validation groups. No threshold search.
+        groups = {
+            "BTC_BULL": [
+                e for e in events if e.get("btc_trend") == "BTC_BULL"
+            ],
+            "ALT_MEAN_30M_GE_0_5": [
+                e for e in events
+                if e.get("true_alt_market_mean_30m_pct") is not None
+                and e["true_alt_market_mean_30m_pct"] >= 0.5
+            ],
+            "BTC_BULL_AND_ALT_GE_0_5": [
+                e for e in events
+                if e.get("btc_trend") == "BTC_BULL"
+                and e.get("true_alt_market_mean_30m_pct") is not None
+                and e["true_alt_market_mean_30m_pct"] >= 0.5
+            ],
+            "BTC_BULL_AND_ALT_LT_0_5": [
+                e for e in events
+                if e.get("btc_trend") == "BTC_BULL"
+                and e.get("true_alt_market_mean_30m_pct") is not None
+                and e["true_alt_market_mean_30m_pct"] < 0.5
+            ],
+        }
+
+        true_breadth_groups = {
+            "TRUE_BREADTH_LT_40": [
+                e for e in events
+                if e.get("true_alt_breadth_positive_pct") is not None
+                and e["true_alt_breadth_positive_pct"] < 40
+            ],
+            "TRUE_BREADTH_40_TO_60": [
+                e for e in events
+                if e.get("true_alt_breadth_positive_pct") is not None
+                and 40 <= e["true_alt_breadth_positive_pct"] < 60
+            ],
+            "TRUE_BREADTH_GE_60": [
+                e for e in events
+                if e.get("true_alt_breadth_positive_pct") is not None
+                and e["true_alt_breadth_positive_pct"] >= 60
+            ],
+        }
+
+        return {
+            **MODE_INFO,
+            "status": "OK",
+            "signal": False,
+            "study": "V18_FROZEN_REGIME_VALIDATION",
+            "days": days,
+            "selected_coin_count": len(selected),
+            "successful_coin_count": len(successful),
+            "failed_coin_count": len(failed),
+            "frozen_entry_rule": {
+                "relative_momentum_z_min": 1.0,
+                "cross_section_percentile_min": 0.80,
+                "behavior": "CONTINUED_UP",
+                "continued_up_definition": "wait_end_change >= +0.75%",
+                "observation_wait_minutes": 60,
+                "entry": "OPEN_AT_END_OF_60M_OBSERVATION_WINDOW",
+                "hold_minutes": 120,
+                "round_trip_cost_pct": ROUND_TRIP_COST_PCT,
+            },
+            "v17_breadth_bug_fixed": True,
+            "breadth_definition": (
+                "percentage of ALL successfully fetched selected coins whose "
+                "completed 30m return is > 0 at the signal timestamp"
+            ),
+            "overall": split_thirds_v18(events),
+            "predefined_regime_groups": {
+                name: split_thirds_v18(arr)
+                for name, arr in groups.items()
+            },
+            "true_alt_breadth_groups": {
+                name: split_thirds_v18(arr)
+                for name, arr in true_breadth_groups.items()
+            },
+            "event_count": len(events),
+            "failed": failed,
+            "generated_utc": utc_now(),
+            "interpretation_note": (
+                "V18 validates predefined V17 regime observations without "
+                "changing the frozen entry rule. BTC_BULL is especially useful "
+                "only if direction is reasonably consistent across T1/T2/T3. "
+                "The combined BTC+ALT group is descriptive and must not be "
+                "promoted merely because one subgroup is strong. True breadth "
+                "is now computed from all selected coins, fixing V17."
+            ),
+        }
+
+    except Exception as e:
+        return {
+            **MODE_INFO,
+            "status": "ERROR",
+            "signal": False,
+            "error": str(e),
+            "generated_utc": utc_now(),
+        }
+
