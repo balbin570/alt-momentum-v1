@@ -1,6 +1,6 @@
 import asyncio
 from datetime import datetime, timezone
-from statistics import mean
+from statistics import mean, median
 
 import httpx
 from fastapi import FastAPI, Query
@@ -349,6 +349,7 @@ async def root():
             "/scan?count=20",
             "/backtest/TIAUSDT?limit=1000",
             "/backtest-all?count=30&limit=1000",
+            "/backtest30?count=30&days=30",
         ],
     }
 
@@ -751,6 +752,413 @@ async def backtest_all(
                 "Entry reference is the event candle close, not a simulated next-candle fill.",
                 "Cost is a fixed research assumption and does not model variable slippage.",
                 "1000 x 5m candles is only about 3.5 days of data.",
+            ],
+        }
+
+    except Exception as e:
+        return {
+            **MODE_INFO,
+            "status": "ERROR",
+            "signal": False,
+            "error": str(e),
+            "generated_utc": utc_now(),
+        }
+
+async def get_5m_candles_days(client, symbol, days=30):
+    """
+    Binance 1000-kline limitini geriye doğru sayfalayarak tamamlanmış
+    5m mumları toplar. Varsayılan 30 gün ~= 8640 mum.
+    """
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    start_ms = now_ms - (days * 24 * 60 * 60 * 1000)
+    end_time = now_ms
+    by_open_time = {}
+
+    # 30 gün için yaklaşık 9 istek gerekir. Güvenli üst sınır bırakıyoruz.
+    max_pages = max(2, int((days * 288) / 1000) + 3)
+
+    for _ in range(max_pages):
+        raw = await get_json(
+            client,
+            "/api/v3/klines",
+            params={
+                "symbol": symbol,
+                "interval": "5m",
+                "limit": 1000,
+                "endTime": end_time,
+            },
+        )
+
+        if not raw:
+            break
+
+        oldest_open = int(raw[0][0])
+
+        for k in raw:
+            open_time = int(k[0])
+            close_time = int(k[6])
+
+            if close_time >= now_ms:
+                continue
+
+            if open_time < start_ms:
+                continue
+
+            by_open_time[open_time] = {
+                "open_time": open_time,
+                "open": float(k[1]),
+                "high": float(k[2]),
+                "low": float(k[3]),
+                "close": float(k[4]),
+                "volume": float(k[5]),
+                "close_time": close_time,
+            }
+
+        if oldest_open <= start_ms:
+            break
+
+        # Bir önceki sayfanın sonundan daha eski veriye git.
+        end_time = oldest_open - 1
+
+        # Binance'a gereksiz burst yapmamak için küçük bir ara.
+        await asyncio.sleep(0.03)
+
+    candles = sorted(
+        by_open_time.values(),
+        key=lambda x: x["open_time"],
+    )
+
+    return candles
+
+
+def historical_trades_v2(candles, symbol):
+    """
+    V2 research trade modeli:
+    - Sinyal tamamlanmış 5m mum kapanışında hesaplanır.
+    - Giriş bir sonraki 5m mumun OPEN fiyatıdır.
+    - Çıkış girişten tam 60 dakika sonraki mumun OPEN fiyatıdır.
+    - Aynı coin için girişler arasında en az 60 dakika cooldown.
+    - Sabit %0.15 round-trip araştırma maliyeti.
+    """
+    trades = []
+    last_entry_open_time = None
+    cooldown_ms = 60 * 60 * 1000
+
+    # i sinyal mumu; i+1 giriş; i+13 = girişten 60 dk sonraki open.
+    for i in range(7, len(candles) - 13):
+        signal_close = candles[i]["close"]
+
+        mom5 = pct_change(
+            candles[i - 1]["close"],
+            signal_close,
+        )
+        mom15 = pct_change(
+            candles[i - 3]["close"],
+            signal_close,
+        )
+        mom30 = pct_change(
+            candles[i - 6]["close"],
+            signal_close,
+        )
+
+        previous_volumes = [
+            candles[j]["volume"]
+            for j in range(i - 6, i)
+        ]
+        avg_volume = mean(previous_volumes)
+
+        volume_ratio = (
+            candles[i]["volume"] / avg_volume
+            if avg_volume > 0
+            else 0
+        )
+
+        if mom5 < 0.30:
+            continue
+        if mom15 < 0.50:
+            continue
+        if mom30 < 0.50:
+            continue
+        if volume_ratio < 1.20:
+            continue
+        if mom5 > 3.00:
+            continue
+        if mom30 > 6.00:
+            continue
+
+        entry_candle = candles[i + 1]
+        exit_candle = candles[i + 13]
+
+        entry_open_time = entry_candle["open_time"]
+
+        if (
+            last_entry_open_time is not None
+            and entry_open_time - last_entry_open_time < cooldown_ms
+        ):
+            continue
+
+        entry_price = entry_candle["open"]
+        exit_price = exit_candle["open"]
+
+        gross_pct = pct_change(entry_price, exit_price)
+        net_pct = gross_pct - ROUND_TRIP_COST_PCT
+
+        trades.append(
+            {
+                "symbol": symbol,
+                "signal_time_utc": datetime.fromtimestamp(
+                    candles[i]["close_time"] / 1000,
+                    tz=timezone.utc,
+                ).isoformat(),
+                "entry_time_utc": datetime.fromtimestamp(
+                    entry_candle["open_time"] / 1000,
+                    tz=timezone.utc,
+                ).isoformat(),
+                "exit_time_utc": datetime.fromtimestamp(
+                    exit_candle["open_time"] / 1000,
+                    tz=timezone.utc,
+                ).isoformat(),
+                "entry_open_time": entry_open_time,
+                "entry_price": entry_price,
+                "exit_price": exit_price,
+                "momentum_5m_pct": round(mom5, 4),
+                "momentum_15m_pct": round(mom15, 4),
+                "momentum_30m_pct": round(mom30, 4),
+                "volume_ratio": round(volume_ratio, 3),
+                "gross_pct": round(gross_pct, 6),
+                "net_pct": round(net_pct, 6),
+            }
+        )
+
+        last_entry_open_time = entry_open_time
+
+    return trades
+
+
+def summarize_trades_v2(trades):
+    if not trades:
+        return {
+            "trade_count": 0,
+            "mean_net_pct": None,
+            "median_net_pct": None,
+            "win_rate_net_pct": None,
+            "profit_factor": None,
+            "max_drawdown_pct": None,
+            "compounded_return_pct": None,
+            "best_net_pct": None,
+            "worst_net_pct": None,
+        }
+
+    ordered = sorted(
+        trades,
+        key=lambda x: x["entry_open_time"],
+    )
+
+    values = [float(x["net_pct"]) for x in ordered]
+
+    wins = [x for x in values if x > 0]
+    losses = [x for x in values if x < 0]
+
+    gross_profit = sum(wins)
+    gross_loss = abs(sum(losses))
+
+    if gross_loss > 0:
+        profit_factor = gross_profit / gross_loss
+    elif gross_profit > 0:
+        profit_factor = None
+    else:
+        profit_factor = 0.0
+
+    equity = 1.0
+    peak = 1.0
+    max_dd = 0.0
+
+    for value in values:
+        equity *= 1.0 + (value / 100.0)
+        peak = max(peak, equity)
+
+        if peak > 0:
+            dd = ((equity / peak) - 1.0) * 100.0
+            max_dd = min(max_dd, dd)
+
+    return {
+        "trade_count": len(values),
+        "mean_net_pct": round(mean(values), 4),
+        "median_net_pct": round(median(values), 4),
+        "win_rate_net_pct": round(
+            len(wins) / len(values) * 100.0,
+            2,
+        ),
+        "profit_factor": (
+            round(profit_factor, 4)
+            if profit_factor is not None
+            else None
+        ),
+        "max_drawdown_pct": round(max_dd, 4),
+        "compounded_return_pct": round(
+            (equity - 1.0) * 100.0,
+            4,
+        ),
+        "best_net_pct": round(max(values), 4),
+        "worst_net_pct": round(min(values), 4),
+    }
+
+
+def split_dev_oos(trades):
+    if not trades:
+        return [], []
+
+    ordered = sorted(
+        trades,
+        key=lambda x: x["entry_open_time"],
+    )
+
+    split_index = int(len(ordered) * 2 / 3)
+
+    # Çok küçük örneklerde yine kronolojik bir ayrım yap.
+    if len(ordered) >= 2:
+        split_index = min(
+            max(split_index, 1),
+            len(ordered) - 1,
+        )
+
+    return ordered[:split_index], ordered[split_index:]
+
+
+@app.get("/backtest30")
+async def backtest30(
+    count: int = Query(
+        default=30,
+        ge=5,
+        le=30,
+    ),
+    days: int = Query(
+        default=30,
+        ge=7,
+        le=30,
+    ),
+):
+    """
+    30 günlük çoklu-altcoin V2 araştırma backtesti.
+
+    Bu endpoint:
+    - gerçek emir üretmez,
+    - paper trade açmaz,
+    - next-candle-open giriş kullanır,
+    - 60 dk hold + 60 dk same-symbol cooldown kullanır,
+    - %0.15 maliyet düşer,
+    - kronolojik DEV/OOS raporu üretir.
+    """
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(90.0)
+        ) as client:
+            universe_data = await build_universe(client)
+            selected = universe_data[:count]
+
+            # 30 coin x ~9 Binance sayfası. Render/Binance için kontrollü eşzamanlılık.
+            semaphore = asyncio.Semaphore(3)
+
+            async def worker(item):
+                async with semaphore:
+                    try:
+                        candles = await get_5m_candles_days(
+                            client,
+                            item["symbol"],
+                            days,
+                        )
+
+                        trades = historical_trades_v2(
+                            candles,
+                            item["symbol"],
+                        )
+
+                        dev, oos = split_dev_oos(trades)
+
+                        return {
+                            "ok": True,
+                            "symbol": item["symbol"],
+                            "quote_volume_24h": item["quote_volume_24h"],
+                            "candle_count": len(candles),
+                            "all": summarize_trades_v2(trades),
+                            "dev": summarize_trades_v2(dev),
+                            "oos": summarize_trades_v2(oos),
+                            "trades": trades,
+                        }
+
+                    except Exception as e:
+                        return {
+                            "ok": False,
+                            "symbol": item["symbol"],
+                            "error": str(e),
+                        }
+
+            results = await asyncio.gather(
+                *[worker(item) for item in selected]
+            )
+
+        successful = [x for x in results if x.get("ok")]
+        failed = [x for x in results if not x.get("ok")]
+
+        all_trades = []
+        per_coin = []
+
+        for item in successful:
+            all_trades.extend(item["trades"])
+            per_coin.append(
+                {
+                    "symbol": item["symbol"],
+                    "quote_volume_24h": item["quote_volume_24h"],
+                    "candle_count": item["candle_count"],
+                    "all": item["all"],
+                    "dev": item["dev"],
+                    "oos": item["oos"],
+                }
+            )
+
+        # Birleşik DEV/OOS coin başına değil, tüm işlemlerin kronolojik
+        # ilk 2/3 ve son 1/3'ü olarak da raporlanır.
+        combined_dev, combined_oos = split_dev_oos(all_trades)
+
+        return {
+            **MODE_INFO,
+            "status": "OK",
+            "signal": False,
+            "note": (
+                "30-DAY MULTI-COIN V2 RESEARCH BACKTEST ONLY - "
+                "NOT A VALIDATED TRADING STRATEGY"
+            ),
+            "days": days,
+            "universe_size": len(universe_data),
+            "requested_coin_count": count,
+            "selected_coin_count": len(selected),
+            "successful_coin_count": len(successful),
+            "failed_coin_count": len(failed),
+            "round_trip_cost_pct": ROUND_TRIP_COST_PCT,
+            "entry_model": "NEXT_5M_CANDLE_OPEN",
+            "exit_model": "OPEN_60_MIN_AFTER_ENTRY",
+            "same_symbol_cooldown_minutes": 60,
+            "research_conditions": {
+                "momentum_5m_min_pct": 0.30,
+                "momentum_15m_min_pct": 0.50,
+                "momentum_30m_min_pct": 0.50,
+                "volume_ratio_min": 1.20,
+                "momentum_5m_max_pct": 3.00,
+                "momentum_30m_max_pct": 6.00,
+            },
+            "combined": {
+                "all": summarize_trades_v2(all_trades),
+                "dev_first_2_3": summarize_trades_v2(combined_dev),
+                "oos_last_1_3": summarize_trades_v2(combined_oos),
+            },
+            "per_coin": per_coin,
+            "failed": failed,
+            "generated_utc": utc_now(),
+            "limitations": [
+                "Universe is selected from current 24h liquidity; survivorship/current-universe bias remains.",
+                "Fixed 0.15% round-trip cost is an assumption; variable slippage is not modeled.",
+                "DEV/OOS is chronological but this version does not optimize parameters on DEV.",
+                "Per-coin DEV/OOS samples may be small even with 30 days of data.",
             ],
         }
 
