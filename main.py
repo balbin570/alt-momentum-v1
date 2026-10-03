@@ -5125,3 +5125,259 @@ async def v16_validate_light():
     """
     return await v16_validate(count=10, days=180)
 
+# =========================
+# V17 MARKET REGIME DIAGNOSTIC
+# =========================
+
+async def fetch_btc_5m_for_v17(client, days):
+    return await get_5m_candles_days(client, "BTCUSDT", days)
+
+
+def btc_regime_at_v17(btc, t_ms):
+    # Find last completed BTC candle before/at event time.
+    lo, hi = 0, len(btc) - 1
+    idx = None
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if btc[mid]["close_time"] <= t_ms:
+            idx = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+
+    if idx is None or idx < 288:
+        return None
+
+    def r(bars):
+        j = idx - bars
+        if j < 0:
+            return None
+        return pct_change(btc[j]["close"], btc[idx]["close"])
+
+    r1h = r(12)
+    r4h = r(48)
+    r24h = r(288)
+
+    if r4h is None or r24h is None:
+        return None
+
+    if r4h > 0 and r24h > 0:
+        trend = "BTC_BULL"
+    elif r4h < 0 and r24h < 0:
+        trend = "BTC_BEAR"
+    else:
+        trend = "BTC_MIXED"
+
+    return {
+        "btc_1h_pct": r1h,
+        "btc_4h_pct": r4h,
+        "btc_24h_pct": r24h,
+        "btc_trend": trend,
+    }
+
+
+def summarize_v17(events):
+    vals = [e["net_120m_pct"] for e in events]
+    if not vals:
+        return {"n": 0, "mean_net_pct": None, "median_net_pct": None,
+                "win_rate_pct": None, "profit_factor": None}
+    wins = [x for x in vals if x > 0]
+    losses = [x for x in vals if x < 0]
+    gp = sum(wins)
+    gl = abs(sum(losses))
+    return {
+        "n": len(vals),
+        "mean_net_pct": round(mean(vals), 4),
+        "median_net_pct": round(safe_median_v10(vals), 4),
+        "win_rate_pct": round(100 * len(wins) / len(vals), 2),
+        "profit_factor": round(gp / gl, 4) if gl > 0 else None,
+    }
+
+
+@app.get("/v17-regime")
+async def v17_regime(
+    count: int = Query(default=10, ge=10, le=20),
+    days: int = Query(default=180, ge=90, le=180),
+):
+    """
+    Diagnostic only. V16 CONTINUED_UP entry rule remains frozen.
+    V17 does NOT filter trades. It labels them by market regime.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(300.0)) as client:
+            universe_data = await build_universe(client)
+            selected = universe_data[:count]
+            semaphore = asyncio.Semaphore(2)
+
+            async def worker(item):
+                async with semaphore:
+                    try:
+                        candles = await get_5m_candles_days(client, item["symbol"], days)
+                        return {"ok": True, "symbol": item["symbol"],
+                                "events": relative_candidates_v15(candles, item["symbol"])}
+                    except Exception as e:
+                        return {"ok": False, "symbol": item["symbol"], "error": str(e)}
+
+            coin_results, btc = await asyncio.gather(
+                asyncio.gather(*[worker(x) for x in selected]),
+                fetch_btc_5m_for_v17(client, days),
+            )
+
+        successful = [x for x in coin_results if x.get("ok")]
+        failed = [x for x in coin_results if not x.get("ok")]
+
+        raw = []
+        for item in successful:
+            raw.extend(item["events"])
+
+        # Same cross-sectional ranking as V12-V16.
+        by_time = {}
+        for e in raw:
+            by_time.setdefault(e["signal_time_ms"], []).append(e)
+
+        ranked = []
+        for group in by_time.values():
+            if len(group) < 5:
+                continue
+            ordered = sorted(group, key=lambda x: x["relative_momentum_z"])
+            n = len(ordered)
+            for idx, e in enumerate(ordered):
+                row = dict(e)
+                row["cross_section_percentile"] = idx / (n - 1) if n > 1 else 1.0
+                ranked.append(row)
+
+        ranked.sort(key=lambda e: (e["symbol"], e["entry_open_time"]))
+        cooled, last_by_symbol = [], {}
+        for e in ranked:
+            t = e["entry_open_time"]
+            last = last_by_symbol.get(e["symbol"])
+            if last is None or t - last >= 60 * 60 * 1000:
+                cooled.append(e)
+                last_by_symbol[e["symbol"]] = t
+
+        # Frozen V16 primary candidate. No regime filter.
+        events = [
+            dict(e) for e in cooled
+            if e["relative_momentum_z"] >= 1.0
+            and e["cross_section_percentile"] >= 0.80
+            and e["behavior"] == "CONTINUED_UP"
+        ]
+
+        # Cross-sectional breadth at each signal time:
+        # fraction of available coins with positive 30m return.
+        raw_by_time = {}
+        for e in raw:
+            raw_by_time.setdefault(e["signal_time_ms"], []).append(e)
+
+        for e in events:
+            peers = raw_by_time.get(e["signal_time_ms"], [])
+            if peers:
+                positive = sum(1 for x in peers if x["momentum_30m_pct"] > 0)
+                e["alt_breadth_positive_pct"] = 100 * positive / len(peers)
+                e["alt_market_mean_30m_pct"] = mean(
+                    [x["momentum_30m_pct"] for x in peers]
+                )
+            else:
+                e["alt_breadth_positive_pct"] = None
+                e["alt_market_mean_30m_pct"] = None
+
+            reg = btc_regime_at_v17(btc, e["signal_time_ms"])
+            if reg:
+                e.update(reg)
+            else:
+                e["btc_trend"] = "UNKNOWN"
+
+        # Fixed descriptive regime buckets; no filtering.
+        btc_groups = {}
+        for label in ("BTC_BULL", "BTC_MIXED", "BTC_BEAR", "UNKNOWN"):
+            btc_groups[label] = summarize_v17(
+                [e for e in events if e.get("btc_trend") == label]
+            )
+
+        breadth_groups = {
+            "BREADTH_LT_40": summarize_v17([
+                e for e in events
+                if e.get("alt_breadth_positive_pct") is not None
+                and e["alt_breadth_positive_pct"] < 40
+            ]),
+            "BREADTH_40_TO_60": summarize_v17([
+                e for e in events
+                if e.get("alt_breadth_positive_pct") is not None
+                and 40 <= e["alt_breadth_positive_pct"] < 60
+            ]),
+            "BREADTH_GE_60": summarize_v17([
+                e for e in events
+                if e.get("alt_breadth_positive_pct") is not None
+                and e["alt_breadth_positive_pct"] >= 60
+            ]),
+        }
+
+        alt_momentum_groups = {
+            "ALT_MEAN_30M_LE_0": summarize_v17([
+                e for e in events
+                if e.get("alt_market_mean_30m_pct") is not None
+                and e["alt_market_mean_30m_pct"] <= 0
+            ]),
+            "ALT_MEAN_30M_0_TO_0_5": summarize_v17([
+                e for e in events
+                if e.get("alt_market_mean_30m_pct") is not None
+                and 0 < e["alt_market_mean_30m_pct"] < 0.5
+            ]),
+            "ALT_MEAN_30M_GE_0_5": summarize_v17([
+                e for e in events
+                if e.get("alt_market_mean_30m_pct") is not None
+                and e["alt_market_mean_30m_pct"] >= 0.5
+            ]),
+        }
+
+        # Chronological thirds, useful for checking whether a regime effect persists.
+        ev = sorted(events, key=lambda e: e["entry_open_time"])
+        n = len(ev)
+        a, b = n // 3, (2 * n) // 3
+        thirds = {
+            "T1_OLDEST": summarize_v17(ev[:a]),
+            "T2_MIDDLE": summarize_v17(ev[a:b]),
+            "T3_NEWEST": summarize_v17(ev[b:]),
+        }
+
+        return {
+            **MODE_INFO,
+            "status": "OK",
+            "signal": False,
+            "study": "V17_MARKET_REGIME_DIAGNOSTIC",
+            "days": days,
+            "selected_coin_count": len(selected),
+            "successful_coin_count": len(successful),
+            "failed_coin_count": len(failed),
+            "frozen_entry_rule": {
+                "relative_momentum_z_min": 1.0,
+                "cross_section_percentile_min": 0.80,
+                "behavior": "CONTINUED_UP",
+                "continued_up_definition": "wait_end_change >= +0.75%",
+                "observation_wait_minutes": 60,
+                "entry": "OPEN_AT_END_OF_60M_OBSERVATION_WINDOW",
+                "hold_minutes": 120,
+                "round_trip_cost_pct": ROUND_TRIP_COST_PCT,
+            },
+            "overall": summarize_v17(events),
+            "btc_regime": btc_groups,
+            "alt_breadth_regime": breadth_groups,
+            "alt_market_30m_regime": alt_momentum_groups,
+            "chronological_thirds": thirds,
+            "event_count": len(events),
+            "failed": failed,
+            "generated_utc": utc_now(),
+            "interpretation_note": (
+                "V17 is diagnostic only. It does not use BTC trend, alt breadth, "
+                "or alt-market momentum to accept/reject trades. Look for regime "
+                "effects that are economically meaningful and sufficiently sampled. "
+                "Do not promote a regime from a single favorable bucket."
+            ),
+        }
+
+    except Exception as e:
+        return {
+            **MODE_INFO, "status": "ERROR", "signal": False,
+            "error": str(e), "generated_utc": utc_now()
+        }
+
