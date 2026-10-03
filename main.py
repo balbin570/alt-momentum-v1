@@ -1,7 +1,7 @@
 import json
 import os
 import asyncio
-from datetime import datetime, timezone
+import datetime as dt
 from statistics import mean, median
 
 import httpx
@@ -49,7 +49,7 @@ MODE_INFO = {
 
 
 def utc_now():
-    return datetime.now(timezone.utc).isoformat()
+    return dt.datetime.now(dt.UTC).isoformat()
 
 
 def pct_change(old, new):
@@ -154,7 +154,7 @@ async def get_completed_5m_candles(client, symbol, limit=100):
         },
     )
 
-    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    now_ms = int(dt.datetime.now(dt.UTC).timestamp() * 1000)
 
     candles = []
 
@@ -298,9 +298,9 @@ def historical_events(candles):
 
         events.append(
             {
-                "time_utc": datetime.fromtimestamp(
+                "time_utc": dt.datetime.fromtimestamp(
                     candles[i]["close_time"] / 1000,
-                    tz=timezone.utc,
+                    tz=dt.UTC,
                 ).isoformat(),
                 "entry_reference": current,
                 "momentum_5m_pct": round(mom5, 4),
@@ -569,7 +569,7 @@ def apply_cooldown(events, cooldown_minutes):
     cooldown_seconds = cooldown_minutes * 60
 
     for event in events:
-        event_time = datetime.fromisoformat(event["time_utc"])
+        event_time = dt.datetime.fromisoformat(event["time_utc"])
 
         if last_kept_time is None:
             kept.append(event)
@@ -793,7 +793,7 @@ async def get_5m_candles_days(client, symbol, days=30):
     Binance 1000-kline limitini geriye doğru sayfalayarak tamamlanmış
     5m mumları toplar. Varsayılan 30 gün ~= 8640 mum.
     """
-    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    now_ms = int(dt.datetime.now(dt.UTC).timestamp() * 1000)
     start_ms = now_ms - (days * 24 * 60 * 60 * 1000)
     end_time = now_ms
     by_open_time = {}
@@ -930,17 +930,17 @@ def historical_trades_v2(candles, symbol):
         trades.append(
             {
                 "symbol": symbol,
-                "signal_time_utc": datetime.fromtimestamp(
+                "signal_time_utc": dt.datetime.fromtimestamp(
                     candles[i]["close_time"] / 1000,
-                    tz=timezone.utc,
+                    tz=dt.UTC,
                 ).isoformat(),
-                "entry_time_utc": datetime.fromtimestamp(
+                "entry_time_utc": dt.datetime.fromtimestamp(
                     entry_candle["open_time"] / 1000,
-                    tz=timezone.utc,
+                    tz=dt.UTC,
                 ).isoformat(),
-                "exit_time_utc": datetime.fromtimestamp(
+                "exit_time_utc": dt.datetime.fromtimestamp(
                     exit_candle["open_time"] / 1000,
-                    tz=timezone.utc,
+                    tz=dt.UTC,
                 ).isoformat(),
                 "entry_open_time": entry_open_time,
                 "entry_price": entry_price,
@@ -1368,7 +1368,7 @@ def simulate_portfolio_v3(
         )
 
         exit_ms = int(
-            datetime.fromisoformat(
+            dt.datetime.fromisoformat(
                 t["exit_time_utc"]
             ).timestamp() * 1000
         )
@@ -1647,13 +1647,13 @@ def continuation_events_v4(candles, symbol):
 
         events.append({
             "symbol": symbol,
-            "signal_time_utc": datetime.fromtimestamp(
+            "signal_time_utc": dt.datetime.fromtimestamp(
                 candles[i]["close_time"] / 1000,
-                tz=timezone.utc,
+                tz=dt.UTC,
             ).isoformat(),
-            "entry_time_utc": datetime.fromtimestamp(
+            "entry_time_utc": dt.datetime.fromtimestamp(
                 entry["open_time"] / 1000,
-                tz=timezone.utc,
+                tz=dt.UTC,
             ).isoformat(),
             "entry_open_time": entry["open_time"],
             "momentum_5m_pct": mom5,
@@ -1962,13 +1962,13 @@ def continuation_quality_events_v5(candles, symbol):
 
         events.append({
             "symbol": symbol,
-            "signal_time_utc": datetime.fromtimestamp(
+            "signal_time_utc": dt.datetime.fromtimestamp(
                 candles[i]["close_time"] / 1000,
-                tz=timezone.utc,
+                tz=dt.UTC,
             ).isoformat(),
-            "entry_time_utc": datetime.fromtimestamp(
+            "entry_time_utc": dt.datetime.fromtimestamp(
                 entry["open_time"] / 1000,
-                tz=timezone.utc,
+                tz=dt.UTC,
             ).isoformat(),
             "entry_open_time": entry["open_time"],
             "momentum_5m_pct": mom5,
@@ -2418,13 +2418,13 @@ def h6_validation_events_v7(candles, symbol):
 
         row = {
             "symbol": symbol,
-            "signal_time_utc": datetime.fromtimestamp(
+            "signal_time_utc": dt.datetime.fromtimestamp(
                 candles[i]["close_time"] / 1000,
-                tz=timezone.utc,
+                tz=dt.UTC,
             ).isoformat(),
-            "entry_time_utc": datetime.fromtimestamp(
+            "entry_time_utc": dt.datetime.fromtimestamp(
                 entry["open_time"] / 1000,
-                tz=timezone.utc,
+                tz=dt.UTC,
             ).isoformat(),
             "entry_open_time": entry["open_time"],
             "momentum_5m_pct": mom5,
@@ -2637,7 +2637,7 @@ def enrich_h6_with_regime_v8(events, alt_candles, btc_candles):
     for e in events:
         # Signal close time from ISO.
         signal_ms = int(
-            datetime.fromisoformat(
+            dt.datetime.fromisoformat(
                 e["signal_time_utc"].replace("Z", "+00:00")
             ).timestamp() * 1000
         )
@@ -3002,13 +3002,13 @@ def h6_trailing_events_v9(candles, symbol):
 
         row = {
             "symbol": symbol,
-            "signal_time_utc": datetime.fromtimestamp(
+            "signal_time_utc": dt.datetime.fromtimestamp(
                 candles[i]["close_time"] / 1000,
-                tz=timezone.utc,
+                tz=dt.UTC,
             ).isoformat(),
-            "entry_time_utc": datetime.fromtimestamp(
+            "entry_time_utc": dt.datetime.fromtimestamp(
                 entry["open_time"] / 1000,
-                tz=timezone.utc,
+                tz=dt.UTC,
             ).isoformat(),
             "entry_open_time": entry["open_time"],
             "momentum_5m_pct": mom5,
@@ -3324,9 +3324,9 @@ def pattern_events_v10(candles, symbol):
 
         rows.append({
             "symbol": symbol,
-            "signal_time_utc": datetime.fromtimestamp(
+            "signal_time_utc": dt.datetime.fromtimestamp(
                 candles[i]["close_time"] / 1000,
-                tz=timezone.utc,
+                tz=dt.UTC,
             ).isoformat(),
             "entry_open_time": candles[i + 1]["open_time"],
             "momentum_30m_pct": mom30,
@@ -3659,20 +3659,20 @@ def pullback_reentry_events_v11(candles, symbol, pullback_pct):
         rows.append({
             "symbol": symbol,
             "pullback_level_pct": pullback_pct,
-            "initial_signal_time_utc": datetime.fromtimestamp(
-                signal_time / 1000, tz=timezone.utc
+            "initial_signal_time_utc": dt.datetime.fromtimestamp(
+                signal_time / 1000, tz=dt.UTC
             ).isoformat(),
-            "pullback_first_seen_time_utc": datetime.fromtimestamp(
+            "pullback_first_seen_time_utc": dt.datetime.fromtimestamp(
                 candles[pullback_first_seen_idx]["close_time"] / 1000,
-                tz=timezone.utc
+                tz=dt.UTC
             ).isoformat(),
-            "reentry_confirmation_time_utc": datetime.fromtimestamp(
+            "reentry_confirmation_time_utc": dt.datetime.fromtimestamp(
                 candles[reentry_signal_idx]["close_time"] / 1000,
-                tz=timezone.utc
+                tz=dt.UTC
             ).isoformat(),
-            "entry_time_utc": datetime.fromtimestamp(
+            "entry_time_utc": dt.datetime.fromtimestamp(
                 candles[entry_idx]["open_time"] / 1000,
-                tz=timezone.utc
+                tz=dt.UTC
             ).isoformat(),
             "entry_open_time": candles[entry_idx]["open_time"],
             "initial_momentum_30m_pct": mom30,
@@ -3944,8 +3944,8 @@ def relative_candidates_v12(candles, symbol):
         rows.append({
             "symbol": symbol,
             "signal_time_ms": candles[i]["close_time"],
-            "signal_time_utc": datetime.fromtimestamp(
-                candles[i]["close_time"] / 1000, tz=timezone.utc
+            "signal_time_utc": dt.datetime.fromtimestamp(
+                candles[i]["close_time"] / 1000, tz=dt.UTC
             ).isoformat(),
             "entry_open_time": candles[i + 1]["open_time"],
             "momentum_30m_pct": mom30,
@@ -6709,7 +6709,7 @@ async def v27_daily_gainers(days: int = 30, top_n: int = 5):
                 quote_volume = float(k[7])  # quote asset volume = USDT for USDT pairs
                 if o <= 0:
                     continue
-                day = datetime.fromtimestamp(open_ms / 1000, tz=timezone.utc).date().isoformat()
+                day = dt.datetime.fromtimestamp(open_ms / 1000, tz=dt.UTC).date().isoformat()
                 pct = (c / o - 1.0) * 100.0
                 by_day.setdefault(day, []).append({
                     "symbol": symbol,
@@ -6722,7 +6722,7 @@ async def v27_daily_gainers(days: int = 30, top_n: int = 5):
 
     dates = sorted(by_day.keys())
     # Exclude the current UTC day because its daily candle may be incomplete.
-    today_utc = datetime.now(timezone.utc).date().isoformat()
+    today_utc = dt.datetime.now(dt.UTC).date().isoformat()
     dates = [d for d in dates if d != today_utc][-days:]
 
     result = []
@@ -6838,7 +6838,7 @@ async def v27_gainer_volume_anatomy(days: int = 30, top_n: int = 5):
             *(get_klines(s, "1d", days + 2) for s in symbols)
         )
 
-        today_utc = datetime.now(timezone.utc).date().isoformat()
+        today_utc = dt.datetime.now(dt.UTC).date().isoformat()
         by_day = {}
         errors = []
 
@@ -6848,8 +6848,8 @@ async def v27_gainer_volume_anatomy(days: int = 30, top_n: int = 5):
                 continue
             for k in rows:
                 try:
-                    day = datetime.fromtimestamp(
-                        int(k[0]) / 1000, tz=timezone.utc
+                    day = dt.datetime.fromtimestamp(
+                        int(k[0]) / 1000, tz=dt.UTC
                     ).date().isoformat()
                     if day == today_utc:
                         continue
@@ -6971,8 +6971,8 @@ async def v27_gainer_volume_anatomy(days: int = 30, top_n: int = 5):
             "symbol": lead["symbol"],
             "daily_return_pct": round(lead["day_return_pct"], 4),
             "daily_quote_volume_usdt": round(lead["day_quote_volume_usdt"], 2),
-            "first_plus_1pct_event_utc": datetime.fromtimestamp(
-                event_open_ms/1000, tz=timezone.utc
+            "first_plus_1pct_event_utc": dt.datetime.fromtimestamp(
+                event_open_ms/1000, tz=dt.UTC
             ).isoformat(),
             "event_return_from_day_open_pct": round(event_ret, 4),
             "pre_30m_quote_volume_usdt": round(pre30_v, 2),
@@ -7056,8 +7056,8 @@ async def v27_volume_test_day(days_ago: int = 1, offset: int = 0, count: int = 4
     offset = max(0, int(offset))
     count = max(10, min(int(count), 50))
 
-    now = datetime.now(timezone.utc)
-    today0 = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
+    now = dt.datetime.now(dt.UTC)
+    today0 = datetime(now.year, now.month, now.day, tzinfo=dt.UTC)
     day0 = today0 - timedelta(days=days_ago)
     start_ms = int(day0.timestamp() * 1000)
     end_ms = int((day0 + timedelta(days=1)).timestamp() * 1000) - 1
@@ -7142,8 +7142,8 @@ async def v27_volume_test_day(days_ago: int = 1, offset: int = 0, count: int = 4
 
         events.append({
             "symbol": symbol,
-            "event_utc": datetime.fromtimestamp(
-                int(rows[event_i][0]) / 1000, tz=timezone.utc
+            "event_utc": dt.datetime.fromtimestamp(
+                int(rows[event_i][0]) / 1000, tz=dt.UTC
             ).isoformat(),
             "event_return_from_day_open_pct": round(
                 (event_close / day_open - 1.0) * 100.0, 4
@@ -7251,8 +7251,8 @@ async def v27_causal_volume_day(days_ago: int = 1, offset: int = 0, count: int =
     offset = max(0, int(offset))
     count = max(10, min(int(count), 50))
 
-    now = datetime.now(timezone.utc)
-    today0 = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
+    now = dt.datetime.now(dt.UTC)
+    today0 = datetime(now.year, now.month, now.day, tzinfo=dt.UTC)
     day0 = today0 - timedelta(days=days_ago)
     start_ms = int(day0.timestamp() * 1000)
     end_ms = int((day0 + timedelta(days=1)).timestamp() * 1000) - 1
@@ -7340,10 +7340,10 @@ async def v27_causal_volume_day(days_ago: int = 1, offset: int = 0, count: int =
 
         events.append({
             "symbol": symbol,
-            "event_utc": datetime.fromtimestamp(int(rows[event_i][0]) / 1000, tz=timezone.utc).isoformat(),
+            "event_utc": dt.datetime.fromtimestamp(int(rows[event_i][0]) / 1000, tz=dt.UTC).isoformat(),
             "event_return_from_day_open_pct": round((event_close / day_open - 1.0) * 100.0, 4),
             "observed_volume_ratio_next30_vs_pre30": round(ratio, 4),
-            "entry_utc": datetime.fromtimestamp(int(rows[entry_i][0]) / 1000, tz=timezone.utc).isoformat(),
+            "entry_utc": dt.datetime.fromtimestamp(int(rows[entry_i][0]) / 1000, tz=dt.UTC).isoformat(),
             "entry_open": entry_open,
             "gross_30m_pct": round(r30, 4),
             "gross_60m_pct": round(r60, 4),
@@ -7581,7 +7581,7 @@ async def v27_causal_volume_all(days_ago: int = 1):
 
 @app.get("/v27-candidate-b-volume")
 async def v27_candidate_b_volume(days_ago: int = Query(default=1, ge=1, le=30)):
-    target_day = (datetime.now(timezone.utc) - timedelta(days=days_ago)).date()
+    target_day = (dt.datetime.now(dt.UTC) - timedelta(days=days_ago)).date()
     # Need >=24h history before the signal plus the target day and 120m after entry.
     fetch_days = max(3, days_ago + 2)
 
@@ -7656,7 +7656,7 @@ async def v27_candidate_b_volume(days_ago: int = Query(default=1, ge=1, le=30)):
         if alt_mean >= 0.5:
             continue
 
-        entry_dt = datetime.fromtimestamp(e["entry_open_time"] / 1000, tz=timezone.utc)
+        entry_dt = dt.datetime.fromtimestamp(e["entry_open_time"] / 1000, tz=dt.UTC)
         if entry_dt.date() != target_day:
             continue
 
@@ -7699,8 +7699,8 @@ async def v27_candidate_b_volume(days_ago: int = Query(default=1, ge=1, le=30)):
         gross60 = net60 + 0.15
         events.append({
             "symbol": e["symbol"],
-            "signal_utc": datetime.fromtimestamp(e["signal_time_ms"] / 1000, tz=timezone.utc).isoformat(),
-            "entry_utc": datetime.fromtimestamp(e["entry_open_time"] / 1000, tz=timezone.utc).isoformat(),
+            "signal_utc": dt.datetime.fromtimestamp(e["signal_time_ms"] / 1000, tz=dt.UTC).isoformat(),
+            "entry_utc": dt.datetime.fromtimestamp(e["entry_open_time"] / 1000, tz=dt.UTC).isoformat(),
             "relative_momentum_z": round(e["relative_momentum_z"], 4),
             "cross_section_percentile": round(e["cross_section_percentile"], 4),
             "wait_end_change_pct": round(e["wait_end_change_pct"], 4),
@@ -7792,7 +7792,7 @@ async def v27_candidate_b_volume_safe(
     days_ago: int = Query(default=1, ge=1, le=30),
     batch_size: int = Query(default=30, ge=10, le=50),
 ):
-    target_day = (datetime.now(timezone.utc) - timedelta(days=days_ago)).date()
+    target_day = (dt.datetime.now(dt.UTC) - timedelta(days=days_ago)).date()
     fetch_days = max(3, days_ago + 2)
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
@@ -7865,7 +7865,7 @@ async def v27_candidate_b_volume_safe(
             alt_mean = snap_sum[e["signal_time_ms"]] / n
             if alt_mean >= 0.5:
                 continue
-            entry_dt = datetime.fromtimestamp(e["entry_open_time"] / 1000, tz=timezone.utc)
+            entry_dt = dt.datetime.fromtimestamp(e["entry_open_time"] / 1000, tz=dt.UTC)
             if entry_dt.date() != target_day:
                 continue
             row = dict(e)
@@ -7920,8 +7920,8 @@ async def v27_candidate_b_volume_safe(
                     net30, net60, net120 = net_after(6), net_after(12), net_after(24)
                     events.append({
                         "symbol": sym,
-                        "signal_utc": datetime.fromtimestamp(e["signal_time_ms"] / 1000, tz=timezone.utc).isoformat(),
-                        "entry_utc": datetime.fromtimestamp(e["entry_open_time"] / 1000, tz=timezone.utc).isoformat(),
+                        "signal_utc": dt.datetime.fromtimestamp(e["signal_time_ms"] / 1000, tz=dt.UTC).isoformat(),
+                        "entry_utc": dt.datetime.fromtimestamp(e["entry_open_time"] / 1000, tz=dt.UTC).isoformat(),
                         "relative_momentum_z": round(e["relative_momentum_z"], 4),
                         "cross_section_percentile": round(e["cross_section_percentile"], 4),
                         "wait_end_change_pct": round(e["wait_end_change_pct"], 4),
