@@ -5833,3 +5833,260 @@ async def v19_frozen_blocks(
             "generated_utc": utc_now(),
         }
 
+# =========================
+# V20 FROZEN FORWARD PAPER
+# =========================
+# Research/paper only. No exchange order endpoint exists here.
+# State is in-memory for this first forward-paper version; Render restart
+# resets it. We will add persistent DB only after endpoint behavior is verified.
+
+V20_STATE = {
+    "open": {},
+    "closed": [],
+    "seen_signal_keys": set(),
+    "started_utc": utc_now(),
+}
+
+V20_COST_PCT = 0.15
+V20_HOLD_MS = 120 * 60 * 1000
+
+
+def v20_public_state():
+    closed = V20_STATE["closed"]
+    vals = [x["net_pct"] for x in closed]
+    equity = 100.0
+    peak = 100.0
+    max_dd = 0.0
+    for x in closed:
+        equity *= (1.0 + x["net_pct"] / 100.0)
+        peak = max(peak, equity)
+        dd = (equity / peak - 1.0) * 100.0
+        max_dd = min(max_dd, dd)
+
+    return {
+        "model": MODEL,
+        "mode": "RESEARCH_PAPER_ONLY",
+        "trading": False,
+        "orders": False,
+        "strategy": "V20_FROZEN_CANDIDATE_B_FORWARD_PAPER",
+        "started_utc": V20_STATE["started_utc"],
+        "open_count": len(V20_STATE["open"]),
+        "closed_count": len(closed),
+        "closed_summary": summarize_v17([
+            {"net_120m_pct": v} for v in vals
+        ]) if vals else summarize_v17([]),
+        "paper_equity_start": 100.0,
+        "paper_equity": round(equity, 4),
+        "paper_return_pct": round(equity - 100.0, 4),
+        "max_drawdown_pct": round(max_dd, 4),
+        "open_positions": list(V20_STATE["open"].values()),
+        "recent_closed": closed[-20:][::-1],
+    }
+
+
+async def v20_scan_once():
+    """
+    Scan current completed candles for the exact frozen Candidate B.
+    A signal is entered only once, at the current/next available 5m OPEN
+    after the completed 60m continuation observation.
+    """
+    async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
+        universe = (await build_universe(client))[:10]
+
+        semaphore = asyncio.Semaphore(2)
+
+        async def fetch(item):
+            async with semaphore:
+                try:
+                    # Need enough history for 24h z-score + post-signal observation.
+                    candles = await get_5m_candles_days(client, item["symbol"], 3)
+                    return item["symbol"], candles, None
+                except Exception as e:
+                    return item["symbol"], None, str(e)
+
+        fetched = await asyncio.gather(*[fetch(x) for x in universe])
+        good = {sym: c for sym, c, err in fetched if c}
+        errors = [{"symbol": sym, "error": err} for sym, c, err in fetched if err]
+
+        btc = good.get("BTCUSDT")
+        if btc is None:
+            try:
+                btc = await get_5m_candles_days(client, "BTCUSDT", 3)
+            except Exception as e:
+                return {"status": "ERROR", "error": f"BTC fetch failed: {e}"}
+
+        # Generate candidate observations for all selected alts.
+        raw = []
+        for sym, candles in good.items():
+            if sym == "BTCUSDT":
+                continue
+            rows = relative_candidates_v15(candles, sym)
+            if rows:
+                raw.extend(rows)
+
+        # Rank by same signal timestamp.
+        by_time = {}
+        for e in raw:
+            by_time.setdefault(e["signal_time_ms"], []).append(e)
+
+        ranked = []
+        for group in by_time.values():
+            if len(group) < 5:
+                continue
+            ordered = sorted(group, key=lambda x: x["relative_momentum_z"])
+            n = len(ordered)
+            for idx, e in enumerate(ordered):
+                row = dict(e)
+                row["cross_section_percentile"] = idx / (n - 1) if n > 1 else 1.0
+                ranked.append(row)
+
+        # True selected-alt market mean at signal timestamp.
+        snapshots = {}
+        for sym, candles in good.items():
+            if sym == "BTCUSDT":
+                continue
+            for i in range(6, len(candles)):
+                t = candles[i]["close_time"]
+                r30 = pct_change(candles[i - 6]["close"], candles[i]["close"])
+                snapshots.setdefault(t, []).append(r30)
+
+        now_candidates = []
+        for e in ranked:
+            if e["relative_momentum_z"] < 1.0:
+                continue
+            if e["cross_section_percentile"] < 0.80:
+                continue
+            if e["behavior"] != "CONTINUED_UP":
+                continue
+
+            reg = btc_regime_at_v17(btc, e["signal_time_ms"])
+            if not reg or reg["btc_trend"] != "BTC_BULL":
+                continue
+
+            vals = snapshots.get(e["signal_time_ms"], [])
+            if not vals:
+                continue
+            alt_mean = mean(vals)
+            if alt_mean >= 0.5:
+                continue
+
+            row = dict(e)
+            row["btc_4h_pct"] = reg["btc_4h_pct"]
+            row["btc_24h_pct"] = reg["btc_24h_pct"]
+            row["alt_market_mean_30m_pct"] = alt_mean
+            now_candidates.append(row)
+
+        # Only signals whose paper entry is very recent are eligible for forward entry.
+        # This prevents historical rows from being inserted as if they were live.
+        newest_open_ms = max(
+            (c[-1]["open_time"] for c in good.values() if c), default=0
+        )
+        freshness_ms = 10 * 60 * 1000
+
+        new_entries = []
+        for e in now_candidates:
+            if newest_open_ms - e["entry_open_time"] > freshness_ms:
+                continue
+
+            key = f'{e["symbol"]}:{e["entry_open_time"]}'
+            if key in V20_STATE["seen_signal_keys"]:
+                continue
+            if e["symbol"] in V20_STATE["open"]:
+                continue
+
+            pos = {
+                "key": key,
+                "symbol": e["symbol"],
+                "signal_time_ms": e["signal_time_ms"],
+                "entry_open_time": e["entry_open_time"],
+                "entry_price": None,
+                "exit_due_time": e["entry_open_time"] + V20_HOLD_MS,
+                "relative_momentum_z": round(e["relative_momentum_z"], 4),
+                "cross_section_percentile": round(e["cross_section_percentile"], 4),
+                "wait_end_change_pct": round(e["wait_end_change_pct"], 4),
+                "btc_4h_pct": round(e["btc_4h_pct"], 4),
+                "btc_24h_pct": round(e["btc_24h_pct"], 4),
+                "alt_market_mean_30m_pct": round(e["alt_market_mean_30m_pct"], 4),
+                "status": "OPEN_PAPER",
+            }
+
+            candles = good.get(e["symbol"], [])
+            price = next(
+                (c["open"] for c in candles if c["open_time"] == e["entry_open_time"]),
+                None
+            )
+            if price is None:
+                continue
+            pos["entry_price"] = price
+
+            V20_STATE["seen_signal_keys"].add(key)
+            V20_STATE["open"][e["symbol"]] = pos
+            new_entries.append(pos)
+
+        # Close due paper positions using the first available 5m OPEN at/after due time.
+        newly_closed = []
+        for sym, pos in list(V20_STATE["open"].items()):
+            candles = good.get(sym)
+            if not candles:
+                continue
+            exit_candle = next(
+                (c for c in candles if c["open_time"] >= pos["exit_due_time"]),
+                None
+            )
+            if exit_candle is None:
+                continue
+
+            exit_price = exit_candle["open"]
+            gross = pct_change(pos["entry_price"], exit_price)
+            net = gross - V20_COST_PCT
+            closed = {
+                **pos,
+                "status": "CLOSED_PAPER",
+                "exit_open_time": exit_candle["open_time"],
+                "exit_price": exit_price,
+                "gross_pct": round(gross, 4),
+                "cost_pct": V20_COST_PCT,
+                "net_pct": round(net, 4),
+            }
+            V20_STATE["closed"].append(closed)
+            del V20_STATE["open"][sym]
+            newly_closed.append(closed)
+
+        return {
+            "status": "OK",
+            "selected_symbols": list(good.keys()),
+            "new_entries": new_entries,
+            "newly_closed": newly_closed,
+            "eligible_candidate_rows_seen": len(now_candidates),
+            "fetch_errors": errors,
+        }
+
+
+@app.get("/v20-forward-scan")
+async def v20_forward_scan():
+    result = await v20_scan_once()
+    return {
+        "model": MODEL,
+        "mode": "RESEARCH_PAPER_ONLY",
+        "trading": False,
+        "orders": False,
+        "signal": bool(result.get("new_entries")),
+        "scan": result,
+        "paper": v20_public_state(),
+        "generated_utc": utc_now(),
+    }
+
+
+@app.get("/v20-forward-status")
+async def v20_forward_status():
+    return {
+        "status": "OK",
+        "signal": False,
+        "paper": v20_public_state(),
+        "note": (
+            "In-memory forward-paper state. Render restart resets this first "
+            "verification version. No exchange orders are sent."
+        ),
+        "generated_utc": utc_now(),
+    }
+
