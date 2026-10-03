@@ -6794,3 +6794,251 @@ async def v27_daily_gainers(days: int = 30, top_n: int = 5):
         "fetch_errors": errors[:20],
         "generated_utc": utc_now(),
     }
+
+
+# ---------------------------------------------------------------------------
+# V27 RESEARCH ONLY: intraday volume anatomy of daily top gainers
+# No change to Candidate B / forward-paper logic.
+#
+# For each completed UTC day:
+# 1) rank top daily gainers from V27 universe,
+# 2) fetch 5m candles for each leader,
+# 3) find FIRST completed 5m candle whose close is >= +1% vs UTC-day open,
+# 4) measure quote-volume before and after that first +1% event.
+# ---------------------------------------------------------------------------
+
+@app.get("/v27-gainer-volume-anatomy")
+async def v27_gainer_volume_anatomy(days: int = 30, top_n: int = 5):
+    days = max(1, min(int(days), 30))
+    top_n = max(1, min(int(top_n), 10))
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        universe_rows = await build_universe(client)
+        symbols = [
+            x["symbol"] if isinstance(x, dict) else str(x)
+            for x in universe_rows
+        ]
+
+        sem = asyncio.Semaphore(10)
+
+        async def get_klines(symbol, interval, limit):
+            async with sem:
+                try:
+                    r = await client.get(
+                        f"{BINANCE}/api/v3/klines",
+                        params={"symbol": symbol, "interval": interval, "limit": limit},
+                    )
+                    r.raise_for_status()
+                    return symbol, r.json(), None
+                except Exception as e:
+                    return symbol, [], str(e)
+
+        # Daily candles first, enough to identify leaders.
+        daily = await asyncio.gather(
+            *(get_klines(s, "1d", days + 2) for s in symbols)
+        )
+
+        today_utc = datetime.now(timezone.utc).date().isoformat()
+        by_day = {}
+        errors = []
+
+        for symbol, rows, err in daily:
+            if err:
+                errors.append({"symbol": symbol, "stage": "1d", "error": err})
+                continue
+            for k in rows:
+                try:
+                    day = datetime.fromtimestamp(
+                        int(k[0]) / 1000, tz=timezone.utc
+                    ).date().isoformat()
+                    if day == today_utc:
+                        continue
+                    o = float(k[1]); c = float(k[4])
+                    if o <= 0:
+                        continue
+                    by_day.setdefault(day, []).append({
+                        "symbol": symbol,
+                        "day_open_ms": int(k[0]),
+                        "day_open": o,
+                        "day_close": c,
+                        "day_return_pct": (c / o - 1.0) * 100.0,
+                        "day_quote_volume_usdt": float(k[7]),
+                    })
+                except Exception:
+                    continue
+
+        selected_dates = sorted(by_day.keys())[-days:]
+        leaders = []
+        for d in selected_dates:
+            ranked = sorted(
+                by_day[d],
+                key=lambda x: x["day_return_pct"],
+                reverse=True
+            )[:top_n]
+            for rank, row in enumerate(ranked, 1):
+                row = dict(row)
+                row["date_utc"] = d
+                row["rank"] = rank
+                leaders.append(row)
+
+        # Fetch enough 5m history to cover requested days.
+        unique_leader_symbols = sorted({x["symbol"] for x in leaders})
+        limit_5m = min(1000, days * 288 + 10)
+
+        # Binance limit=1000 cannot cover 30d, so fetch day-by-day for leaders.
+        async def get_day_5m(symbol, day_open_ms):
+            async with sem:
+                try:
+                    end_ms = day_open_ms + 24*60*60*1000 - 1
+                    r = await client.get(
+                        f"{BINANCE}/api/v3/klines",
+                        params={
+                            "symbol": symbol,
+                            "interval": "5m",
+                            "startTime": day_open_ms,
+                            "endTime": end_ms,
+                            "limit": 300,
+                        },
+                    )
+                    r.raise_for_status()
+                    return symbol, day_open_ms, r.json(), None
+                except Exception as e:
+                    return symbol, day_open_ms, [], str(e)
+
+        fetched5 = await asyncio.gather(
+            *(get_day_5m(x["symbol"], x["day_open_ms"]) for x in leaders)
+        )
+        five_map = {}
+        for symbol, day_ms, rows, err in fetched5:
+            if err:
+                errors.append({
+                    "symbol": symbol, "day_open_ms": day_ms,
+                    "stage": "5m", "error": err
+                })
+            else:
+                five_map[(symbol, day_ms)] = rows
+
+    results = []
+
+    def qvol(rows):
+        return sum(float(x[7]) for x in rows)
+
+    for lead in leaders:
+        rows = five_map.get((lead["symbol"], lead["day_open_ms"]), [])
+        if not rows:
+            continue
+
+        day_open = lead["day_open"]
+        event_i = None
+        for i, k in enumerate(rows):
+            close = float(k[4])
+            if day_open > 0 and (close / day_open - 1.0) * 100.0 >= 1.0:
+                event_i = i
+                break
+
+        if event_i is None:
+            continue
+
+        event = rows[event_i]
+        event_open_ms = int(event[0])
+        event_close = float(event[4])
+        event_ret = (event_close / day_open - 1.0) * 100.0
+
+        # 30m immediately BEFORE event = six 5m candles.
+        pre30 = rows[max(0, event_i-6):event_i]
+
+        # First 30m after event, then next 30m (30-60m after event).
+        post30 = rows[event_i+1:event_i+7]
+        post30_60 = rows[event_i+7:event_i+13]
+        post60 = rows[event_i+1:event_i+13]
+
+        pre30_v = qvol(pre30)
+        post30_v = qvol(post30)
+        post60_v = qvol(post60)
+
+        # Price continuation from event close.
+        close_30 = float(post30[-1][4]) if post30 else None
+        close_60 = float(post60[-1][4]) if post60 else None
+        cont30 = ((close_30 / event_close - 1.0) * 100.0) if close_30 else None
+        cont60 = ((close_60 / event_close - 1.0) * 100.0) if close_60 else None
+
+        ratio30 = (post30_v / pre30_v) if pre30_v > 0 else None
+        ratio60_halfhour_equiv = ((post60_v / 2.0) / pre30_v) if pre30_v > 0 else None
+
+        results.append({
+            "date_utc": lead["date_utc"],
+            "rank": lead["rank"],
+            "symbol": lead["symbol"],
+            "daily_return_pct": round(lead["day_return_pct"], 4),
+            "daily_quote_volume_usdt": round(lead["day_quote_volume_usdt"], 2),
+            "first_plus_1pct_event_utc": datetime.fromtimestamp(
+                event_open_ms/1000, tz=timezone.utc
+            ).isoformat(),
+            "event_return_from_day_open_pct": round(event_ret, 4),
+            "pre_30m_quote_volume_usdt": round(pre30_v, 2),
+            "post_30m_quote_volume_usdt": round(post30_v, 2),
+            "post_60m_quote_volume_usdt": round(post60_v, 2),
+            "post30_vs_pre30_volume_ratio": round(ratio30, 4) if ratio30 is not None else None,
+            "post60_halfhour_equiv_vs_pre30_volume_ratio": (
+                round(ratio60_halfhour_equiv, 4)
+                if ratio60_halfhour_equiv is not None else None
+            ),
+            "price_continuation_30m_pct": round(cont30, 4) if cont30 is not None else None,
+            "price_continuation_60m_pct": round(cont60, 4) if cont60 is not None else None,
+            "continued_up_60m_ge_0_75": (
+                bool(cont60 is not None and cont60 >= 0.75)
+            ),
+        })
+
+    ratios = [
+        x["post30_vs_pre30_volume_ratio"]
+        for x in results
+        if x["post30_vs_pre30_volume_ratio"] is not None
+    ]
+    cont = [x for x in results if x["continued_up_60m_ge_0_75"]]
+    no_cont = [x for x in results if not x["continued_up_60m_ge_0_75"]]
+
+    def avg(vals):
+        return sum(vals)/len(vals) if vals else None
+
+    summary = {
+        "days_requested": days,
+        "top_n_per_day": top_n,
+        "leader_rows": len(leaders),
+        "analyzed_rows": len(results),
+        "first_plus_1pct_definition": "first 5m close >= +1.0% vs UTC-day open",
+        "pre_volume_window": "30m immediately before first +1% event",
+        "post_volume_window": "first 30m and first 60m after event",
+        "continuation_definition": "price change from +1% event close to +60m close >= +0.75%",
+        "continued_rows": len(cont),
+        "not_continued_rows": len(no_cont),
+        "continued_rate_pct": round(100*len(cont)/len(results), 2) if results else None,
+        "mean_post30_pre30_volume_ratio_all": round(avg(ratios), 4) if ratios else None,
+        "mean_post30_pre30_volume_ratio_continued": (
+            round(avg([x["post30_vs_pre30_volume_ratio"] for x in cont
+                       if x["post30_vs_pre30_volume_ratio"] is not None]), 4)
+            if cont else None
+        ),
+        "mean_post30_pre30_volume_ratio_not_continued": (
+            round(avg([x["post30_vs_pre30_volume_ratio"] for x in no_cont
+                       if x["post30_vs_pre30_volume_ratio"] is not None]), 4)
+            if no_cont else None
+        ),
+    }
+
+    return {
+        "model": MODEL,
+        "mode": "RESEARCH_ONLY",
+        "trading": False,
+        "orders": False,
+        "strategy_changed": False,
+        "note": (
+            "Descriptive post-hoc study of daily top gainers. "
+            "No V27 signal threshold or forward-paper rule is changed."
+        ),
+        "summary": summary,
+        "rows": results,
+        "fetch_error_count": len(errors),
+        "fetch_errors": errors[:30],
+        "generated_utc": utc_now(),
+    }
