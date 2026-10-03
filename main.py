@@ -7042,3 +7042,265 @@ async def v27_gainer_volume_anatomy(days: int = 30, top_n: int = 5):
         "fetch_errors": errors[:30],
         "generated_utc": utc_now(),
     }
+
+
+# ---------------------------------------------------------------------------
+# V27 RESEARCH ONLY: unbiased all-universe +1% event / volume continuation test
+# IMPORTANT:
+# - Does NOT alter Candidate B.
+# - Does NOT alter forward-paper state.
+# - Uses current V27 universe (250k USDT 24h floor).
+# - Each symbol/day contributes only its FIRST +1% event vs UTC day open.
+# - Volume ratio uses PREVIOUS 30m vs NEXT 30m after event.
+# - Future returns: +30m, +60m, +120m from event close.
+# ---------------------------------------------------------------------------
+
+@app.get("/v27-all-volume-continuation")
+async def v27_all_volume_continuation(days: int = 30):
+    days = max(1, min(int(days), 30))
+    now = datetime.now(timezone.utc)
+    today0 = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
+    start0 = today0 - timedelta(days=days)
+
+    async with httpx.AsyncClient(timeout=35.0) as client:
+        universe_rows = await build_universe(client)
+        symbols = [
+            x["symbol"] if isinstance(x, dict) else str(x)
+            for x in universe_rows
+        ]
+
+        sem = asyncio.Semaphore(10)
+        errors = []
+
+        async def fetch_symbol(symbol):
+            all_rows = []
+            # Fetch each UTC day separately: 288 x 5m candles/day.
+            for d in range(days):
+                day0 = start0 + timedelta(days=d)
+                start_ms = int(day0.timestamp() * 1000)
+                end_ms = int((day0 + timedelta(days=1)).timestamp() * 1000) - 1
+                async with sem:
+                    try:
+                        r = await client.get(
+                            f"{BINANCE}/api/v3/klines",
+                            params={
+                                "symbol": symbol,
+                                "interval": "5m",
+                                "startTime": start_ms,
+                                "endTime": end_ms,
+                                "limit": 300,
+                            },
+                        )
+                        r.raise_for_status()
+                        rows = r.json()
+                        if rows:
+                            all_rows.append((day0.date().isoformat(), rows))
+                    except Exception as e:
+                        errors.append({
+                            "symbol": symbol,
+                            "date_utc": day0.date().isoformat(),
+                            "error": str(e),
+                        })
+            return symbol, all_rows
+
+        fetched = await asyncio.gather(*(fetch_symbol(s) for s in symbols))
+
+    events = []
+
+    def qvol(rows):
+        return sum(float(k[7]) for k in rows)
+
+    for symbol, day_sets in fetched:
+        for date_utc, rows in day_sets:
+            if len(rows) < 26:
+                continue
+
+            day_open = float(rows[0][1])
+            if day_open <= 0:
+                continue
+
+            # Require a full prior 30m so volume ratio is truly backward-looking.
+            event_i = None
+            for i in range(6, len(rows)):
+                close = float(rows[i][4])
+                ret = (close / day_open - 1.0) * 100.0
+                if ret >= 1.0:
+                    event_i = i
+                    break
+
+            if event_i is None:
+                continue
+
+            # Need full 120m future window (24 x 5m candles).
+            if event_i + 24 >= len(rows):
+                continue
+
+            event = rows[event_i]
+            event_close = float(event[4])
+            if event_close <= 0:
+                continue
+
+            pre30 = rows[event_i-6:event_i]
+            post30 = rows[event_i+1:event_i+7]
+            post60 = rows[event_i+1:event_i+13]
+            post120 = rows[event_i+1:event_i+25]
+
+            if len(pre30) < 6 or len(post30) < 6 or len(post60) < 12 or len(post120) < 24:
+                continue
+
+            pre_v = qvol(pre30)
+            post30_v = qvol(post30)
+            ratio = (post30_v / pre_v) if pre_v > 0 else None
+
+            c30 = float(post30[-1][4])
+            c60 = float(post60[-1][4])
+            c120 = float(post120[-1][4])
+
+            r30 = (c30 / event_close - 1.0) * 100.0
+            r60 = (c60 / event_close - 1.0) * 100.0
+            r120 = (c120 / event_close - 1.0) * 100.0
+
+            events.append({
+                "date_utc": date_utc,
+                "symbol": symbol,
+                "event_utc": datetime.fromtimestamp(
+                    int(event[0]) / 1000, tz=timezone.utc
+                ).isoformat(),
+                "event_return_from_day_open_pct": round(
+                    (event_close / day_open - 1.0) * 100.0, 4
+                ),
+                "pre30_quote_volume_usdt": round(pre_v, 2),
+                "post30_quote_volume_usdt": round(post30_v, 2),
+                "post30_pre30_volume_ratio": round(ratio, 4) if ratio is not None else None,
+                "future_30m_pct": round(r30, 4),
+                "future_60m_pct": round(r60, 4),
+                "future_120m_pct": round(r120, 4),
+                "continued_60m_ge_0_75": bool(r60 >= 0.75),
+            })
+
+    thresholds = [0, 1, 1.5, 2, 3, 5, 10]
+
+    def median(vals):
+        vals = sorted(vals)
+        n = len(vals)
+        if not n:
+            return None
+        m = n // 2
+        return vals[m] if n % 2 else (vals[m-1] + vals[m]) / 2
+
+    def stats(rows):
+        if not rows:
+            return {
+                "n": 0,
+                "continuation_rate_60m_pct": None,
+                "mean_future_30m_pct": None,
+                "median_future_30m_pct": None,
+                "mean_future_60m_pct": None,
+                "median_future_60m_pct": None,
+                "mean_future_120m_pct": None,
+                "median_future_120m_pct": None,
+            }
+
+        def mean(key):
+            return sum(x[key] for x in rows) / len(rows)
+
+        return {
+            "n": len(rows),
+            "continuation_rate_60m_pct": round(
+                100.0 * sum(x["continued_60m_ge_0_75"] for x in rows) / len(rows), 2
+            ),
+            "mean_future_30m_pct": round(mean("future_30m_pct"), 4),
+            "median_future_30m_pct": round(median([x["future_30m_pct"] for x in rows]), 4),
+            "mean_future_60m_pct": round(mean("future_60m_pct"), 4),
+            "median_future_60m_pct": round(median([x["future_60m_pct"] for x in rows]), 4),
+            "mean_future_120m_pct": round(mean("future_120m_pct"), 4),
+            "median_future_120m_pct": round(median([x["future_120m_pct"] for x in rows]), 4),
+        }
+
+    valid = [x for x in events if x["post30_pre30_volume_ratio"] is not None]
+
+    threshold_results = []
+    for t in thresholds:
+        if t == 0:
+            group = valid
+            label = "ALL_VALID"
+        else:
+            group = [x for x in valid if x["post30_pre30_volume_ratio"] >= t]
+            label = f"VOLUME_RATIO_GE_{t}X"
+        threshold_results.append({
+            "threshold": t,
+            "label": label,
+            **stats(group),
+        })
+
+    # Mutually exclusive buckets are useful to avoid cumulative-threshold illusion.
+    bucket_defs = [
+        ("LT_1X", lambda r: r < 1),
+        ("1_TO_1_5X", lambda r: 1 <= r < 1.5),
+        ("1_5_TO_2X", lambda r: 1.5 <= r < 2),
+        ("2_TO_3X", lambda r: 2 <= r < 3),
+        ("3_TO_5X", lambda r: 3 <= r < 5),
+        ("5_TO_10X", lambda r: 5 <= r < 10),
+        ("GE_10X", lambda r: r >= 10),
+    ]
+    bucket_results = []
+    for label, fn in bucket_defs:
+        group = [x for x in valid if fn(x["post30_pre30_volume_ratio"])]
+        bucket_results.append({"bucket": label, **stats(group)})
+
+    # Three chronological blocks for a basic stability check.
+    dates = sorted({x["date_utc"] for x in valid})
+    block_results = []
+    if dates:
+        n = len(dates)
+        cuts = [dates[:n//3], dates[n//3:2*n//3], dates[2*n//3:]]
+        for bi, ds in enumerate(cuts, 1):
+            ds_set = set(ds)
+            rows_b = [x for x in valid if x["date_utc"] in ds_set]
+            block_results.append({
+                "block": bi,
+                "date_start": ds[0] if ds else None,
+                "date_end": ds[-1] if ds else None,
+                "all": stats(rows_b),
+                "ratio_ge_3x": stats([
+                    x for x in rows_b if x["post30_pre30_volume_ratio"] >= 3
+                ]),
+                "ratio_ge_5x": stats([
+                    x for x in rows_b if x["post30_pre30_volume_ratio"] >= 5
+                ]),
+                "ratio_ge_10x": stats([
+                    x for x in rows_b if x["post30_pre30_volume_ratio"] >= 10
+                ]),
+            })
+
+    return {
+        "model": MODEL,
+        "mode": "RESEARCH_ONLY",
+        "trading": False,
+        "orders": False,
+        "strategy_changed": False,
+        "universe": {
+            "name": "CURRENT_V27_UNIVERSE",
+            "symbols": len(symbols),
+            "current_24h_volume_floor_usdt": 250000,
+        },
+        "method": {
+            "days": days,
+            "event": "first 5m close >= +1.0% vs that UTC day's open, with full prior 30m",
+            "volume_ratio": "next 30m quote volume / previous 30m quote volume",
+            "future_windows": ["30m", "60m", "120m"],
+            "continuation": "future 60m return >= +0.75%",
+            "selection": "all qualifying symbol-days in current V27 universe; NOT post-selected daily winners",
+        },
+        "summary": {
+            "events_total": len(events),
+            "events_with_valid_volume_ratio": len(valid),
+            "fetch_error_count": len(errors),
+        },
+        "cumulative_thresholds": threshold_results,
+        "exclusive_buckets": bucket_results,
+        "chronological_blocks": block_results,
+        "sample_rows": valid[:30],
+        "fetch_errors": errors[:30],
+        "generated_utc": utc_now(),
+    }
