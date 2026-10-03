@@ -1,7 +1,7 @@
 import json
 import os
 import asyncio
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from statistics import mean, median
 
 import httpx
@@ -7228,6 +7228,198 @@ async def v27_volume_test_day(days_ago: int = 1, offset: int = 0, count: int = 4
             "future": ["30m", "60m", "120m"],
             "continuation": "60m return >= +0.75%",
             "selection": "all qualifying V27-universe symbols for this day; no daily-winner post-selection"
+        },
+        "events": len(events),
+        "cumulative_thresholds": cumulative,
+        "exclusive_buckets": buckets,
+        "rows": events,
+        "fetch_error_count": len(errors),
+        "fetch_errors": errors[:20],
+        "generated_utc": utc_now(),
+    }
+
+# ---------------------------------------------------------------------------
+# V27 RESEARCH ONLY - CAUSAL volume test (no look-ahead at entry)
+# Event: first completed 5m close >= +1% vs UTC-day open.
+# Observe the NEXT 30m volume completely, then enter at the NEXT 5m candle OPEN.
+# Forward returns are measured from that entry OPEN. V27 itself is unchanged.
+# ---------------------------------------------------------------------------
+
+@app.get("/v27-causal-volume-day")
+async def v27_causal_volume_day(days_ago: int = 1, offset: int = 0, count: int = 40):
+    days_ago = max(1, min(int(days_ago), 30))
+    offset = max(0, int(offset))
+    count = max(10, min(int(count), 50))
+
+    now = datetime.now(timezone.utc)
+    today0 = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
+    day0 = today0 - timedelta(days=days_ago)
+    start_ms = int(day0.timestamp() * 1000)
+    end_ms = int((day0 + timedelta(days=1)).timestamp() * 1000) - 1
+
+    async with httpx.AsyncClient(timeout=25.0) as client:
+        universe_rows = await build_universe(client)
+        all_symbols = [x["symbol"] if isinstance(x, dict) else str(x) for x in universe_rows]
+        total_universe_symbols = len(all_symbols)
+        symbols = all_symbols[offset:offset + count]
+        sem = asyncio.Semaphore(2)
+
+        async def fetch_one(symbol):
+            async with sem:
+                try:
+                    r = await client.get(
+                        f"{BINANCE}/api/v3/klines",
+                        params={"symbol": symbol, "interval": "5m", "startTime": start_ms,
+                                "endTime": end_ms, "limit": 300},
+                    )
+                    r.raise_for_status()
+                    return symbol, r.json(), None
+                except Exception as e:
+                    return symbol, [], str(e)
+
+        fetched = await asyncio.gather(*(fetch_one(s) for s in symbols))
+
+    events, errors = [], []
+
+    def qvol(rows):
+        return sum(float(k[7]) for k in rows)
+
+    for symbol, rows, err in fetched:
+        if err:
+            errors.append({"symbol": symbol, "error": err})
+            continue
+        if len(rows) < 38:
+            continue
+
+        day_open = float(rows[0][1])
+        if day_open <= 0:
+            continue
+
+        event_i = None
+        for i in range(6, len(rows)):
+            close = float(rows[i][4])
+            if (close / day_open - 1.0) * 100.0 >= 1.0:
+                event_i = i
+                break
+
+        if event_i is None:
+            continue
+
+        # Six completed 5m candles AFTER the event = full 30m observation.
+        obs_start = event_i + 1
+        obs_end_exclusive = event_i + 7
+        entry_i = event_i + 7  # next candle OPEN after observation is complete
+
+        # Need OPENs 30/60/120m after entry.
+        if entry_i + 24 >= len(rows):
+            continue
+
+        pre30 = rows[event_i-6:event_i]
+        observed30 = rows[obs_start:obs_end_exclusive]
+        if len(pre30) < 6 or len(observed30) < 6:
+            continue
+
+        pre_v = qvol(pre30)
+        obs_v = qvol(observed30)
+        if pre_v <= 0:
+            continue
+
+        ratio = obs_v / pre_v
+        event_close = float(rows[event_i][4])
+        entry_open = float(rows[entry_i][1])
+        if entry_open <= 0:
+            continue
+
+        exit30 = float(rows[entry_i + 6][1])
+        exit60 = float(rows[entry_i + 12][1])
+        exit120 = float(rows[entry_i + 24][1])
+        r30 = (exit30 / entry_open - 1.0) * 100.0
+        r60 = (exit60 / entry_open - 1.0) * 100.0
+        r120 = (exit120 / entry_open - 1.0) * 100.0
+        cost = 0.15
+
+        events.append({
+            "symbol": symbol,
+            "event_utc": datetime.fromtimestamp(int(rows[event_i][0]) / 1000, tz=timezone.utc).isoformat(),
+            "event_return_from_day_open_pct": round((event_close / day_open - 1.0) * 100.0, 4),
+            "observed_volume_ratio_next30_vs_pre30": round(ratio, 4),
+            "entry_utc": datetime.fromtimestamp(int(rows[entry_i][0]) / 1000, tz=timezone.utc).isoformat(),
+            "entry_open": entry_open,
+            "gross_30m_pct": round(r30, 4),
+            "gross_60m_pct": round(r60, 4),
+            "gross_120m_pct": round(r120, 4),
+            "net_30m_pct_after_0_15_cost": round(r30 - cost, 4),
+            "net_60m_pct_after_0_15_cost": round(r60 - cost, 4),
+            "net_120m_pct_after_0_15_cost": round(r120 - cost, 4),
+            "continued_60m_ge_0_75_from_entry": bool(r60 >= 0.75),
+        })
+
+    def median(vals):
+        vals = sorted(vals)
+        n = len(vals)
+        if not n:
+            return None
+        m = n // 2
+        return vals[m] if n % 2 else (vals[m-1] + vals[m]) / 2
+
+    def stats(group):
+        if not group:
+            return {"n": 0}
+        n = len(group)
+        c = sum(x["continued_60m_ge_0_75_from_entry"] for x in group)
+        return {
+            "n": n,
+            "continued_n": c,
+            "continuation_rate_pct": round(100 * c / n, 2),
+            "mean_net_30m_pct": round(sum(x["net_30m_pct_after_0_15_cost"] for x in group) / n, 4),
+            "median_net_30m_pct": round(median([x["net_30m_pct_after_0_15_cost"] for x in group]), 4),
+            "mean_net_60m_pct": round(sum(x["net_60m_pct_after_0_15_cost"] for x in group) / n, 4),
+            "median_net_60m_pct": round(median([x["net_60m_pct_after_0_15_cost"] for x in group]), 4),
+            "mean_net_120m_pct": round(sum(x["net_120m_pct_after_0_15_cost"] for x in group) / n, 4),
+            "median_net_120m_pct": round(median([x["net_120m_pct_after_0_15_cost"] for x in group]), 4),
+        }
+
+    cumulative = []
+    for threshold in [0, 1, 1.5, 2, 3, 5, 10]:
+        group = events if threshold == 0 else [
+            x for x in events if x["observed_volume_ratio_next30_vs_pre30"] >= threshold
+        ]
+        cumulative.append({"threshold": "ALL" if threshold == 0 else f">={threshold}x", **stats(group)})
+
+    bucket_defs = [
+        ("<1x", 0, 1), ("1-1.5x", 1, 1.5), ("1.5-2x", 1.5, 2),
+        ("2-3x", 2, 3), ("3-5x", 3, 5), ("5-10x", 5, 10),
+        (">=10x", 10, float("inf")),
+    ]
+    buckets = []
+    for label, lo, hi in bucket_defs:
+        group = [x for x in events if lo <= x["observed_volume_ratio_next30_vs_pre30"] < hi]
+        buckets.append({"bucket": label, **stats(group)})
+
+    return {
+        "model": MODEL,
+        "mode": "RESEARCH_ONLY",
+        "trading": False,
+        "orders": False,
+        "strategy_changed": False,
+        "date_utc": day0.date().isoformat(),
+        "days_ago": days_ago,
+        "universe_symbols_total": total_universe_symbols,
+        "chunk_offset": offset,
+        "chunk_count_requested": count,
+        "chunk_symbols_processed": len(symbols),
+        "next_offset": (offset + len(symbols)) if (offset + len(symbols) < total_universe_symbols) else None,
+        "volume_floor_usdt": 250000,
+        "round_trip_cost_pct": 0.15,
+        "method": {
+            "event": "first completed 5m close >= +1% vs UTC-day open",
+            "observation": "wait for next 30m to complete; volume ratio = observed next30m / previous30m",
+            "decision_time": "only after the 30m observation is fully known",
+            "entry": "OPEN of the next 5m candle after observation",
+            "future": "30m/60m/120m measured from entry OPEN using later candle OPENs",
+            "continuation": "gross 60m return from causal entry >= +0.75%",
+            "selection": "all qualifying V27-universe symbols in this chunk; no daily-winner post-selection",
+            "lookahead_at_entry": False,
         },
         "events": len(events),
         "cumulative_thresholds": cumulative,
