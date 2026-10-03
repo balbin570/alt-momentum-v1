@@ -362,6 +362,7 @@ async def root():
             "/h6-trailing?count=30&days=365",
             "/pattern-discovery?count=30&days=365",
             "/pullback-reentry?count=30&days=365",
+            "/relative-momentum?count=30&days=365",
         ],
     }
 
@@ -3836,6 +3837,296 @@ async def pullback_reentry_v11(
                 "not optimized thresholds. Reference results must be read "
                 "together with discovery results; a single favorable level "
                 "should not be promoted automatically."
+            ),
+        }
+
+    except Exception as e:
+        return {
+            **MODE_INFO,
+            "status": "ERROR",
+            "signal": False,
+            "error": str(e),
+            "generated_utc": utc_now(),
+        }
+
+RELATIVE_Z_THRESHOLDS_V12 = (1.0, 1.5, 2.0)
+RELATIVE_RANK_BUCKETS_V12 = (
+    ("TOP_10_PCT", 0.90),
+    ("TOP_20_PCT", 0.80),
+    ("TOP_30_PCT", 0.70),
+)
+
+
+def rolling_volatility_30m_v12(candles, i, lookback_bars=288):
+    """
+    Historical volatility of 30m returns using only information available
+    up to signal candle i. Default lookback: 24h of 5m bars.
+    """
+    start = max(6, i - lookback_bars + 1)
+    vals = []
+    for j in range(start, i + 1):
+        vals.append(pct_change(candles[j - 6]["close"], candles[j]["close"]))
+
+    if len(vals) < 30:
+        return None, None
+
+    mu = mean(vals)
+    variance = sum((x - mu) ** 2 for x in vals) / len(vals)
+    sigma = variance ** 0.5
+    return mu, sigma
+
+
+def relative_candidates_v12(candles, symbol):
+    """
+    Build time-aligned observations.
+
+    Feature 1: 30m momentum z-score versus the coin's own trailing 24h
+               distribution of 30m returns.
+    Feature 2: cross-sectional percentile rank among the selected liquid
+               coins at the same completed 5m signal time.
+
+    Outcome: next 5m OPEN -> OPEN 60m later, minus 0.15% cost.
+    """
+    rows = []
+
+    for i in range(294, len(candles) - 13):
+        mom30 = pct_change(candles[i - 6]["close"], candles[i]["close"])
+
+        # We are still studying coins that have ALREADY risen.
+        if mom30 <= 0:
+            continue
+
+        mu, sigma = rolling_volatility_30m_v12(candles, i, 288)
+        if sigma is None or sigma <= 0:
+            continue
+
+        z = (mom30 - mu) / sigma
+
+        entry_price = candles[i + 1]["open"]
+        exit_price = candles[i + 13]["open"]
+        gross = pct_change(entry_price, exit_price)
+        net = gross - ROUND_TRIP_COST_PCT
+
+        rows.append({
+            "symbol": symbol,
+            "signal_time_ms": candles[i]["close_time"],
+            "signal_time_utc": datetime.fromtimestamp(
+                candles[i]["close_time"] / 1000, tz=timezone.utc
+            ).isoformat(),
+            "entry_open_time": candles[i + 1]["open_time"],
+            "momentum_30m_pct": mom30,
+            "own_24h_mean_30m_return_pct": mu,
+            "own_24h_sigma_30m_return_pct": sigma,
+            "relative_momentum_z": z,
+            "gross_60m_pct": gross,
+            "net_60m_pct": net,
+            "gross_pct": gross,
+            "net_pct": net,
+        })
+
+    return rows
+
+
+def add_cross_section_rank_v12(events):
+    by_time = {}
+    for e in events:
+        by_time.setdefault(e["signal_time_ms"], []).append(e)
+
+    ranked = []
+    for _, group in by_time.items():
+        if len(group) < 5:
+            continue
+
+        ordered = sorted(group, key=lambda x: x["relative_momentum_z"])
+        n = len(ordered)
+
+        for idx, e in enumerate(ordered):
+            row = dict(e)
+            # 0 = weakest, 1 = strongest.
+            row["cross_section_percentile"] = (
+                idx / (n - 1) if n > 1 else 1.0
+            )
+            row["cross_section_coin_count"] = n
+            ranked.append(row)
+
+    return ranked
+
+
+def summarize_relative_v12(events):
+    vals = [e["net_60m_pct"] for e in events]
+    if not vals:
+        return {
+            "n": 0,
+            "mean_net_60m_pct": None,
+            "median_net_60m_pct": None,
+            "win_rate_pct": None,
+            "profit_factor": None,
+        }
+
+    wins = [x for x in vals if x > 0]
+    losses = [x for x in vals if x < 0]
+    gp = sum(wins)
+    gl = abs(sum(losses))
+    pf = gp / gl if gl > 0 else None
+
+    return {
+        "n": len(vals),
+        "mean_net_60m_pct": round(mean(vals), 4),
+        "median_net_60m_pct": round(safe_median_v10(vals), 4),
+        "win_rate_pct": round(len(wins) / len(vals) * 100, 2),
+        "profit_factor": round(pf, 4) if pf is not None else None,
+        "best_net_pct": round(max(vals), 4),
+        "worst_net_pct": round(min(vals), 4),
+    }
+
+
+def split_chrono_v12(events):
+    ev = sorted(events, key=lambda e: e["entry_open_time"])
+    cut = int(len(ev) * 2 / 3)
+    return ev[:cut], ev[cut:]
+
+
+def relative_hypothesis_report_v12(events):
+    reports = {}
+
+    # Own-volatility normalized momentum only.
+    for zt in RELATIVE_Z_THRESHOLDS_V12:
+        subset = [e for e in events if e["relative_momentum_z"] >= zt]
+        dev, ref = split_chrono_v12(subset)
+        reports[f"Z_GE_{zt:.1f}"] = {
+            "definition": f"relative_momentum_z >= {zt:.1f}",
+            "all": summarize_relative_v12(subset),
+            "discovery_first_2_3": summarize_relative_v12(dev),
+            "reference_last_1_3": summarize_relative_v12(ref),
+        }
+
+    # Cross-sectional strength plus a fixed z floor.
+    for label, pct in RELATIVE_RANK_BUCKETS_V12:
+        subset = [
+            e for e in events
+            if e["relative_momentum_z"] >= 1.0
+            and e["cross_section_percentile"] >= pct
+        ]
+        dev, ref = split_chrono_v12(subset)
+        reports[f"Z_GE_1.0_AND_{label}"] = {
+            "definition": (
+                f"relative_momentum_z >= 1.0 and "
+                f"cross_section_percentile >= {pct:.2f}"
+            ),
+            "all": summarize_relative_v12(subset),
+            "discovery_first_2_3": summarize_relative_v12(dev),
+            "reference_last_1_3": summarize_relative_v12(ref),
+        }
+
+    return reports
+
+
+@app.get("/relative-momentum")
+async def relative_momentum_v12(
+    count: int = Query(default=30, ge=10, le=30),
+    days: int = Query(default=365, ge=90, le=365),
+):
+    """
+    V12: Relative momentum study.
+    Research/paper only. No orders.
+
+    It asks whether a coin that has ALREADY risen is more likely to continue
+    when that rise is unusually strong relative to:
+      (a) its own recent volatility, and
+      (b) other liquid altcoins at the same time.
+    """
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(180.0)
+        ) as client:
+            universe_data = await build_universe(client)
+            selected = universe_data[:count]
+            semaphore = asyncio.Semaphore(2)
+
+            async def worker(item):
+                async with semaphore:
+                    try:
+                        candles = await get_5m_candles_days(
+                            client, item["symbol"], days
+                        )
+                        events = relative_candidates_v12(
+                            candles, item["symbol"]
+                        )
+                        return {
+                            "ok": True,
+                            "symbol": item["symbol"],
+                            "events": events,
+                        }
+                    except Exception as e:
+                        return {
+                            "ok": False,
+                            "symbol": item["symbol"],
+                            "error": str(e),
+                        }
+
+            results = await asyncio.gather(
+                *[worker(x) for x in selected]
+            )
+
+        successful = [x for x in results if x.get("ok")]
+        failed = [x for x in results if not x.get("ok")]
+
+        raw = []
+        for item in successful:
+            raw.extend(item["events"])
+
+        ranked = add_cross_section_rank_v12(raw)
+
+        # Prevent repeated overlapping observations from the same coin.
+        ranked.sort(key=lambda e: (e["symbol"], e["entry_open_time"]))
+        cooled = []
+        last_by_symbol = {}
+        for e in ranked:
+            t = e["entry_open_time"]
+            last = last_by_symbol.get(e["symbol"])
+            if last is None or t - last >= 60 * 60 * 1000:
+                cooled.append(e)
+                last_by_symbol[e["symbol"]] = t
+
+        cooled.sort(key=lambda e: e["entry_open_time"])
+
+        return {
+            **MODE_INFO,
+            "status": "OK",
+            "signal": False,
+            "study": "RELATIVE_MOMENTUM_AFTER_RISE_ALREADY_STARTED",
+            "days": days,
+            "selected_coin_count": len(selected),
+            "successful_coin_count": len(successful),
+            "failed_coin_count": len(failed),
+            "concept": (
+                "No fixed +1% trigger. Candidate must already have a positive "
+                "30m return. Strength is normalized by its own trailing 24h "
+                "30m-return volatility and ranked against other selected "
+                "liquid coins at the same completed 5m timestamp."
+            ),
+            "own_history_lookback": "24h",
+            "outcome": "NEXT_5M_OPEN_TO_OPEN_60M_LATER_MINUS_0.15PCT_COST",
+            "same_symbol_observation_cooldown_minutes": 60,
+            "raw_positive_momentum_observations": len(raw),
+            "ranked_and_cooled_observations": len(cooled),
+            "predefined_hypotheses": {
+                "z_thresholds": list(RELATIVE_Z_THRESHOLDS_V12),
+                "cross_section_rank_buckets": [
+                    {"label": label, "minimum_percentile": pct}
+                    for label, pct in RELATIVE_RANK_BUCKETS_V12
+                ],
+            },
+            "results": relative_hypothesis_report_v12(cooled),
+            "failed": failed,
+            "generated_utc": utc_now(),
+            "interpretation_note": (
+                "V12 is a new hypothesis study, not a trading rule. "
+                "Thresholds are predefined before viewing V12 results. "
+                "A candidate should not be promoted unless discovery and "
+                "reference results point in the same direction with adequate "
+                "sample size and breadth. Current-universe survivorship bias "
+                "remains."
             ),
         }
 
