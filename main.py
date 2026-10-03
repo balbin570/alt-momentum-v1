@@ -360,6 +360,7 @@ async def root():
             "/h6-validate?count=30&days=365",
             "/h6-regime?count=30&days=365",
             "/h6-trailing?count=30&days=365",
+            "/pattern-discovery?count=30&days=365",
         ],
     }
 
@@ -3198,6 +3199,359 @@ async def h6_trailing_v9(
                 "management. Trailing levels are predefined at 0.5%, 1.0%, "
                 "and 1.5%, each with a 120-minute maximum holding time. "
                 "Results are descriptive research and do not place orders."
+            ),
+        }
+
+    except Exception as e:
+        return {
+            **MODE_INFO,
+            "status": "ERROR",
+            "signal": False,
+            "error": str(e),
+            "generated_utc": utc_now(),
+        }
+
+def safe_median_v10(values):
+    if not values:
+        return None
+    vals = sorted(values)
+    n = len(vals)
+    return vals[n // 2] if n % 2 else (vals[n // 2 - 1] + vals[n // 2]) / 2
+
+
+def pattern_events_v10(candles, symbol):
+    """
+    V10 descriptive pattern discovery.
+
+    Universe of observations:
+      An already-started rise: 30m return >= +1.0%.
+    No H6 pullback/volume/acceleration filters are used.
+
+    Outcome:
+      next 5m OPEN entry reference -> OPEN 60m later, net of 0.15% cost.
+
+    Features use only the six completed 5m candles available at signal time.
+    """
+    rows = []
+
+    for i in range(7, len(candles) - 13):
+        start_close = candles[i - 6]["close"]
+        signal_close = candles[i]["close"]
+        mom30 = pct_change(start_close, signal_close)
+
+        if mom30 < 1.0:
+            continue
+
+        six = candles[i - 5:i + 1]
+
+        # Close-to-close steps over the six 5m intervals.
+        step_returns = []
+        prev_close = candles[i - 6]["close"]
+        for c in six:
+            step_returns.append(pct_change(prev_close, c["close"]))
+            prev_close = c["close"]
+
+        positive_steps = sum(1 for x in step_returns if x > 0)
+        max_step = max(step_returns)
+        max_step_share = max_step / mom30 if mom30 > 0 else None
+
+        # Path efficiency: net move / total absolute close-to-close path.
+        total_path = sum(abs(x) for x in step_returns)
+        efficiency = mom30 / total_path if total_path > 0 else None
+
+        high30 = max(c["high"] for c in six)
+        low30 = min(c["low"] for c in six)
+        range30 = high30 - low30
+        close_location = (
+            (signal_close - low30) / range30
+            if range30 > 0 else None
+        )
+
+        body_sum = sum(abs(c["close"] - c["open"]) for c in six)
+        full_range_sum = sum(max(c["high"] - c["low"], 0) for c in six)
+        body_to_range = (
+            body_sum / full_range_sum
+            if full_range_sum > 0 else None
+        )
+
+        upper_wick_sum = sum(
+            max(c["high"] - max(c["open"], c["close"]), 0)
+            for c in six
+        )
+        upper_wick_ratio = (
+            upper_wick_sum / full_range_sum
+            if full_range_sum > 0 else None
+        )
+
+        up_volume = sum(
+            c["volume"] for c in six if c["close"] > c["open"]
+        )
+        down_volume = sum(
+            c["volume"] for c in six if c["close"] <= c["open"]
+        )
+        up_volume_share = (
+            up_volume / (up_volume + down_volume)
+            if (up_volume + down_volume) > 0 else None
+        )
+
+        first15 = pct_change(
+            candles[i - 6]["close"],
+            candles[i - 3]["close"],
+        )
+        last15 = pct_change(
+            candles[i - 3]["close"],
+            signal_close,
+        )
+        acceleration = last15 - first15
+
+        entry_price = candles[i + 1]["open"]
+        exit_price = candles[i + 13]["open"]
+        gross60 = pct_change(entry_price, exit_price)
+        net60 = gross60 - ROUND_TRIP_COST_PCT
+
+        rows.append({
+            "symbol": symbol,
+            "signal_time_utc": datetime.fromtimestamp(
+                candles[i]["close_time"] / 1000,
+                tz=timezone.utc,
+            ).isoformat(),
+            "entry_open_time": candles[i + 1]["open_time"],
+            "momentum_30m_pct": mom30,
+            "positive_5m_steps": positive_steps,
+            "path_efficiency": efficiency,
+            "max_single_5m_return_pct": max_step,
+            "max_single_candle_share_of_30m_move": max_step_share,
+            "close_location_in_30m_range": close_location,
+            "body_to_total_range_ratio": body_to_range,
+            "upper_wick_to_total_range_ratio": upper_wick_ratio,
+            "up_candle_volume_share": up_volume_share,
+            "acceleration_pct_points": acceleration,
+            "gross_60m_pct": gross60,
+            "net_60m_pct": net60,
+            # compatibility for existing cooldown/split helpers
+            "gross_pct": gross60,
+            "net_pct": net60,
+        })
+
+    return rows
+
+
+def summarize_outcome_v10(events):
+    vals = [e["net_60m_pct"] for e in events]
+    if not vals:
+        return {
+            "n": 0,
+            "mean_net_60m_pct": None,
+            "median_net_60m_pct": None,
+            "win_rate_pct": None,
+            "profit_factor": None,
+        }
+
+    wins = [x for x in vals if x > 0]
+    losses = [x for x in vals if x < 0]
+    gp = sum(wins)
+    gl = abs(sum(losses))
+    pf = gp / gl if gl > 0 else None
+
+    return {
+        "n": len(vals),
+        "mean_net_60m_pct": round(mean(vals), 4),
+        "median_net_60m_pct": round(safe_median_v10(vals), 4),
+        "win_rate_pct": round(len(wins) / len(vals) * 100, 2),
+        "profit_factor": round(pf, 4) if pf is not None else None,
+    }
+
+
+def feature_quantiles_v10(events, feature):
+    vals = sorted(
+        e[feature] for e in events
+        if e.get(feature) is not None
+    )
+    if len(vals) < 10:
+        return None
+
+    def q(p):
+        idx = int((len(vals) - 1) * p)
+        return vals[idx]
+
+    return {
+        "q20": q(0.20),
+        "q40": q(0.40),
+        "q60": q(0.60),
+        "q80": q(0.80),
+    }
+
+
+def feature_report_v10(reference_events, target_events, feature):
+    """
+    Bin edges are learned ONLY from the reference set.
+    The same fixed edges are then applied to target events.
+    """
+    qs = feature_quantiles_v10(reference_events, feature)
+    if qs is None:
+        return {"feature": feature, "bins": []}
+
+    edges = [
+        float("-inf"),
+        qs["q20"], qs["q40"], qs["q60"], qs["q80"],
+        float("inf"),
+    ]
+    labels = ["Q1_LOW", "Q2", "Q3", "Q4", "Q5_HIGH"]
+
+    bins = []
+    for k in range(5):
+        lo, hi = edges[k], edges[k + 1]
+        if k < 4:
+            subset = [
+                e for e in target_events
+                if e.get(feature) is not None
+                and lo <= e[feature] < hi
+            ]
+        else:
+            subset = [
+                e for e in target_events
+                if e.get(feature) is not None
+                and lo <= e[feature] <= hi
+            ]
+
+        bins.append({
+            "bin": labels[k],
+            "lower": None if lo == float("-inf") else round(lo, 6),
+            "upper": None if hi == float("inf") else round(hi, 6),
+            "outcome": summarize_outcome_v10(subset),
+        })
+
+    return {
+        "feature": feature,
+        "reference_quantiles": {
+            k: round(v, 6) for k, v in qs.items()
+        },
+        "bins": bins,
+    }
+
+
+def positive_step_report_v10(events):
+    return [
+        {
+            "positive_5m_steps": n,
+            "outcome": summarize_outcome_v10(
+                [e for e in events if e["positive_5m_steps"] == n]
+            ),
+        }
+        for n in range(0, 7)
+    ]
+
+
+@app.get("/pattern-discovery")
+async def pattern_discovery_v10(
+    count: int = Query(default=30, ge=5, le=30),
+    days: int = Query(default=365, ge=90, le=365),
+):
+    """
+    V10: descriptive pattern discovery after a rise has already started.
+    No live trading and no order placement.
+    """
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(180.0)
+        ) as client:
+            universe_data = await build_universe(client)
+            selected = universe_data[:count]
+            semaphore = asyncio.Semaphore(2)
+
+            async def worker(item):
+                async with semaphore:
+                    try:
+                        candles = await get_5m_candles_days(
+                            client, item["symbol"], days
+                        )
+                        events = pattern_events_v10(
+                            candles, item["symbol"]
+                        )
+                        # Reduce overlapping observations from the same coin.
+                        events = apply_symbol_cooldown_v4(events, 60)
+                        return {
+                            "ok": True,
+                            "symbol": item["symbol"],
+                            "events": events,
+                        }
+                    except Exception as e:
+                        return {
+                            "ok": False,
+                            "symbol": item["symbol"],
+                            "error": str(e),
+                        }
+
+            results = await asyncio.gather(
+                *[worker(x) for x in selected]
+            )
+
+        successful = [x for x in results if x.get("ok")]
+        failed = [x for x in results if not x.get("ok")]
+
+        all_events = []
+        for item in successful:
+            all_events.extend(item["events"])
+
+        # Chronological ordering before split.
+        all_events.sort(key=lambda e: e["entry_open_time"])
+        cut = int(len(all_events) * 2 / 3)
+        discovery = all_events[:cut]
+        reference = all_events[cut:]
+
+        features = [
+            "path_efficiency",
+            "max_single_candle_share_of_30m_move",
+            "close_location_in_30m_range",
+            "body_to_total_range_ratio",
+            "upper_wick_to_total_range_ratio",
+            "up_candle_volume_share",
+            "acceleration_pct_points",
+        ]
+
+        return {
+            **MODE_INFO,
+            "status": "OK",
+            "signal": False,
+            "study": "POST_RISE_PATTERN_DISCOVERY",
+            "days": days,
+            "selected_coin_count": len(selected),
+            "successful_coin_count": len(successful),
+            "failed_coin_count": len(failed),
+            "observation_definition": (
+                "30m price rise >=1.0%; no H6 pullback, volume-persistence "
+                "or acceleration entry filters"
+            ),
+            "outcome_definition": (
+                "next 5m OPEN to OPEN 60m later, minus 0.15% round-trip cost"
+            ),
+            "same_symbol_observation_cooldown_minutes": 60,
+            "event_count": len(all_events),
+            "all_outcome": summarize_outcome_v10(all_events),
+            "discovery_first_2_3_outcome": summarize_outcome_v10(discovery),
+            "reference_last_1_3_outcome": summarize_outcome_v10(reference),
+            "positive_step_counts": {
+                "discovery": positive_step_report_v10(discovery),
+                "reference": positive_step_report_v10(reference),
+            },
+            "feature_reports": {
+                feature: {
+                    "discovery": feature_report_v10(
+                        discovery, discovery, feature
+                    ),
+                    "reference_using_discovery_edges": feature_report_v10(
+                        discovery, reference, feature
+                    ),
+                }
+                for feature in features
+            },
+            "failed": failed,
+            "generated_utc": utc_now(),
+            "interpretation_note": (
+                "V10 is descriptive pattern discovery, not a trading rule. "
+                "Feature quintile edges are defined from the first 2/3 only "
+                "and then reused unchanged on the last 1/3. Do not select "
+                "a final entry rule from this endpoint alone."
             ),
         }
 
