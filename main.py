@@ -7051,8 +7051,10 @@ async def v27_gainer_volume_anatomy(days: int = 30, top_n: int = 5):
 # ---------------------------------------------------------------------------
 
 @app.get("/v27-volume-test-day")
-async def v27_volume_test_day(days_ago: int = 1):
+async def v27_volume_test_day(days_ago: int = 1, offset: int = 0, count: int = 40):
     days_ago = max(1, min(int(days_ago), 30))
+    offset = max(0, int(offset))
+    count = max(10, min(int(count), 50))
 
     now = datetime.now(timezone.utc)
     today0 = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
@@ -7062,12 +7064,14 @@ async def v27_volume_test_day(days_ago: int = 1):
 
     async with httpx.AsyncClient(timeout=25.0) as client:
         universe_rows = await build_universe(client)
-        symbols = [
+        all_symbols = [
             x["symbol"] if isinstance(x, dict) else str(x)
             for x in universe_rows
         ]
+        total_universe_symbols = len(all_symbols)
+        symbols = all_symbols[offset:offset + count]
 
-        sem = asyncio.Semaphore(12)
+        sem = asyncio.Semaphore(6)
 
         async def fetch_one(symbol):
             async with sem:
@@ -7212,7 +7216,11 @@ async def v27_volume_test_day(days_ago: int = 1):
         "strategy_changed": False,
         "date_utc": day0.date().isoformat(),
         "days_ago": days_ago,
-        "universe_symbols": len(symbols),
+        "universe_symbols_total": total_universe_symbols,
+        "chunk_offset": offset,
+        "chunk_count_requested": count,
+        "chunk_symbols_processed": len(symbols),
+        "next_offset": (offset + len(symbols)) if (offset + len(symbols) < total_universe_symbols) else None,
         "volume_floor_usdt": 250000,
         "method": {
             "event": "first completed 5m close >= +1% vs UTC-day open",
