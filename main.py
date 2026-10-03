@@ -366,6 +366,7 @@ async def root():
             "/relative-momentum-horizons?count=10&days=90",
             "/relative-momentum-entry-delay?count=10&days=90",
             "/post-rise-behavior?count=10&days=90",
+            "/v16-validate?count=30&days=365",
         ],
     }
 
@@ -4898,6 +4899,211 @@ async def post_rise_behavior_v15(
                 "A behavior is interesting only if discovery and reference "
                 "show similar direction with adequate sample size; isolated "
                 "positive cells should not be promoted."
+            ),
+        }
+
+    except Exception as e:
+        return {
+            **MODE_INFO,
+            "status": "ERROR",
+            "signal": False,
+            "error": str(e),
+            "generated_utc": utc_now(),
+        }
+
+V16_WAIT_MINUTES = 60
+V16_HOLD_MINUTES = 120
+
+
+def summarize_v16(events):
+    vals = [e["net_120m_pct"] for e in events]
+    if not vals:
+        return {
+            "n": 0, "mean_net_pct": None, "median_net_pct": None,
+            "win_rate_pct": None, "profit_factor": None
+        }
+    wins = [x for x in vals if x > 0]
+    losses = [x for x in vals if x < 0]
+    gp, gl = sum(wins), abs(sum(losses))
+    return {
+        "n": len(vals),
+        "mean_net_pct": round(mean(vals), 4),
+        "median_net_pct": round(safe_median_v10(vals), 4),
+        "win_rate_pct": round(100 * len(wins) / len(vals), 2),
+        "profit_factor": round(gp / gl, 4) if gl > 0 else None,
+        "best_net_pct": round(max(vals), 4),
+        "worst_net_pct": round(min(vals), 4),
+    }
+
+
+def chronological_blocks_v16(events):
+    ev = sorted(events, key=lambda e: e["entry_open_time"])
+    n = len(ev)
+    if n == 0:
+        return {}
+    q1 = n // 4
+    q2 = n // 2
+    q3 = (3 * n) // 4
+    return {
+        "Q1_OLDEST": summarize_v16(ev[:q1]),
+        "Q2": summarize_v16(ev[q1:q2]),
+        "Q3": summarize_v16(ev[q2:q3]),
+        "Q4_NEWEST": summarize_v16(ev[q3:]),
+    }
+
+
+def breadth_v16(events):
+    by_symbol = {}
+    for e in events:
+        by_symbol.setdefault(e["symbol"], []).append(e)
+
+    rows = []
+    for symbol, arr in by_symbol.items():
+        sm = summarize_v16(arr)
+        rows.append({"symbol": symbol, **sm})
+
+    rows.sort(key=lambda x: (-x["n"], x["symbol"]))
+    positive_mean = sum(1 for x in rows if x["mean_net_pct"] is not None and x["mean_net_pct"] > 0)
+    pf_above_1 = sum(1 for x in rows if x["profit_factor"] is not None and x["profit_factor"] > 1)
+
+    return {
+        "coin_count": len(rows),
+        "coins_positive_mean": positive_mean,
+        "coins_pf_above_1": pf_above_1,
+        "per_coin": rows,
+    }
+
+
+@app.get("/v16-validate")
+async def v16_validate(
+    count: int = Query(default=30, ge=10, le=30),
+    days: int = Query(default=365, ge=90, le=365),
+):
+    """
+    V16 long validation. No threshold optimization.
+
+    Frozen primary candidate:
+      Z >= 1
+      cross-sectional top 20%
+      observe 60m
+      behavior = CONTINUED_UP (wait end >= +0.75%)
+      enter at end-of-wait OPEN
+      hold 120m
+      cost 0.15%
+
+    PULLBACK_UNRECOVERED is retained as a secondary/control candidate.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(300.0)) as client:
+            universe_data = await build_universe(client)
+            selected = universe_data[:count]
+            semaphore = asyncio.Semaphore(2)
+
+            async def worker(item):
+                async with semaphore:
+                    try:
+                        candles = await get_5m_candles_days(client, item["symbol"], days)
+                        return {
+                            "ok": True,
+                            "symbol": item["symbol"],
+                            "events": relative_candidates_v15(candles, item["symbol"]),
+                        }
+                    except Exception as e:
+                        return {"ok": False, "symbol": item["symbol"], "error": str(e)}
+
+            results = await asyncio.gather(*[worker(x) for x in selected])
+
+        successful = [x for x in results if x.get("ok")]
+        failed = [x for x in results if not x.get("ok")]
+
+        raw = []
+        for item in successful:
+            raw.extend(item["events"])
+
+        # Cross-sectional percentile exactly as V15.
+        by_time = {}
+        for e in raw:
+            by_time.setdefault(e["signal_time_ms"], []).append(e)
+
+        ranked = []
+        for group in by_time.values():
+            if len(group) < 5:
+                continue
+            ordered = sorted(group, key=lambda x: x["relative_momentum_z"])
+            n = len(ordered)
+            for idx, e in enumerate(ordered):
+                row = dict(e)
+                row["cross_section_percentile"] = idx / (n - 1) if n > 1 else 1.0
+                ranked.append(row)
+
+        # Same frozen 60m signal cooldown.
+        ranked.sort(key=lambda e: (e["symbol"], e["entry_open_time"]))
+        cooled = []
+        last_by_symbol = {}
+        for e in ranked:
+            t = e["entry_open_time"]
+            last = last_by_symbol.get(e["symbol"])
+            if last is None or t - last >= 60 * 60 * 1000:
+                cooled.append(e)
+                last_by_symbol[e["symbol"]] = t
+
+        top20 = [
+            e for e in cooled
+            if e["relative_momentum_z"] >= 1.0
+            and e["cross_section_percentile"] >= 0.80
+        ]
+
+        continued = [e for e in top20 if e["behavior"] == "CONTINUED_UP"]
+        pullback_unrecovered = [
+            e for e in top20 if e["behavior"] == "PULLBACK_UNRECOVERED"
+        ]
+
+        def package(events):
+            ev = sorted(events, key=lambda e: e["entry_open_time"])
+            cut = int(len(ev) * 2 / 3)
+            return {
+                "all": summarize_v16(ev),
+                "older_first_2_3": summarize_v16(ev[:cut]),
+                "newest_last_1_3": summarize_v16(ev[cut:]),
+                "chronological_quarters": chronological_blocks_v16(ev),
+                "breadth": breadth_v16(ev),
+            }
+
+        return {
+            **MODE_INFO,
+            "status": "OK",
+            "signal": False,
+            "study": "V16_FROZEN_LONG_VALIDATION",
+            "days": days,
+            "selected_coin_count": len(selected),
+            "successful_coin_count": len(successful),
+            "failed_coin_count": len(failed),
+            "frozen_common_rule": {
+                "relative_momentum_z_min": 1.0,
+                "cross_section_percentile_min": 0.80,
+                "observation_wait_minutes": V16_WAIT_MINUTES,
+                "entry": "OPEN_AT_END_OF_60M_OBSERVATION_WINDOW",
+                "hold_minutes": V16_HOLD_MINUTES,
+                "round_trip_cost_pct": ROUND_TRIP_COST_PCT,
+                "same_symbol_signal_cooldown_minutes": 60,
+            },
+            "primary_candidate": {
+                "name": "CONTINUED_UP",
+                "definition": "wait_end_change >= +0.75%",
+                "validation": package(continued),
+            },
+            "secondary_control": {
+                "name": "PULLBACK_UNRECOVERED",
+                "definition": "same frozen V15 category; no retuning",
+                "validation": package(pullback_unrecovered),
+            },
+            "failed": failed,
+            "generated_utc": utc_now(),
+            "interpretation_note": (
+                "V16 is validation, not optimization. No V15 thresholds are changed. "
+                "Inspect full-period performance, oldest/newest consistency, four "
+                "chronological blocks, and coin breadth. A favorable aggregate driven "
+                "by a few coins or one period should not be promoted to forward paper."
             ),
         }
 
