@@ -356,6 +356,7 @@ async def root():
             "/backtest90?count=30&days=90",
             "/continuation90?count=30&days=90",
             "/continuation-quality90?count=30&days=90",
+            "/continuation-combo90?count=30&days=90",
         ],
     }
 
@@ -2120,6 +2121,203 @@ async def continuation_quality90(
                 "This endpoint studies the SHAPE of an already-started rise. "
                 "It does not predict which coin will rise. Quality buckets are "
                 "descriptive and are not yet live-entry rules."
+            ),
+        }
+
+    except Exception as e:
+        return {
+            **MODE_INFO,
+            "status": "ERROR",
+            "signal": False,
+            "error": str(e),
+            "generated_utc": utc_now(),
+        }
+
+def combo_hypotheses_v6():
+    """
+    Önceden tanımlı continuation hipotezleri.
+    Amaç OOS sonucuna göre eşik uydurmak değil; V4/V5'te gözlenen
+    yapıları ayrı, anlaşılır hipotezler olarak test etmektir.
+    """
+    return [
+        (
+            "H1_VOLUME_CONTINUATION",
+            lambda e:
+                1.0 <= e["momentum_30m_pct"] < 2.0
+                and e["volume_persistence_ratio"] >= 1.2
+        ),
+        (
+            "H2_VOLUME_PLUS_ACCELERATION",
+            lambda e:
+                1.0 <= e["momentum_30m_pct"] < 2.0
+                and e["volume_persistence_ratio"] >= 1.2
+                and e["acceleration_pct_points"] > 0.25
+        ),
+        (
+            "H3_ORDERLY_RISE",
+            lambda e:
+                1.0 <= e["momentum_30m_pct"] < 2.0
+                and e["volume_persistence_ratio"] >= 1.2
+                and e["positive_5m_candles_last_30m"] >= 5
+        ),
+        (
+            "H4_ACCELERATING_ORDERLY_RISE",
+            lambda e:
+                1.0 <= e["momentum_30m_pct"] < 2.0
+                and e["volume_persistence_ratio"] >= 1.2
+                and e["positive_5m_candles_last_30m"] >= 5
+                and e["acceleration_pct_points"] > 0.25
+        ),
+        (
+            "H5_PULLBACK_CONTINUATION",
+            lambda e:
+                1.0 <= e["momentum_30m_pct"] < 2.0
+                and e["volume_persistence_ratio"] >= 1.2
+                and e["pullback_from_30m_peak_pct"] < -0.75
+        ),
+        (
+            "H6_PULLBACK_REACCELERATION",
+            lambda e:
+                1.0 <= e["momentum_30m_pct"] < 2.0
+                and e["volume_persistence_ratio"] >= 1.2
+                and e["pullback_from_30m_peak_pct"] < -0.75
+                and e["momentum_5m_pct"] > 0
+                and e["acceleration_pct_points"] > 0.25
+        ),
+    ]
+
+
+def combo_report_v6(events):
+    report = []
+
+    for name, predicate in combo_hypotheses_v6():
+        subset = [e for e in events if predicate(e)]
+        report.append({
+            "hypothesis": name,
+            **summarize_trades_v2(subset),
+        })
+
+    return report
+
+
+@app.get("/continuation-combo90")
+async def continuation_combo90(
+    count: int = Query(default=30, ge=5, le=30),
+    days: int = Query(default=90, ge=30, le=90),
+):
+    """
+    V6: already-rising momentum continuation combination study.
+    Research only. No orders.
+    """
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(120.0)
+        ) as client:
+            universe_data = await build_universe(client)
+            selected = universe_data[:count]
+            semaphore = asyncio.Semaphore(3)
+
+            async def worker(item):
+                async with semaphore:
+                    try:
+                        candles = await get_5m_candles_days(
+                            client,
+                            item["symbol"],
+                            days,
+                        )
+                        events = continuation_quality_events_v5(
+                            candles,
+                            item["symbol"],
+                        )
+                        return {
+                            "ok": True,
+                            "symbol": item["symbol"],
+                            "events": events,
+                        }
+                    except Exception as e:
+                        return {
+                            "ok": False,
+                            "symbol": item["symbol"],
+                            "error": str(e),
+                        }
+
+            results = await asyncio.gather(
+                *[worker(x) for x in selected]
+            )
+
+        successful = [x for x in results if x.get("ok")]
+        failed = [x for x in results if not x.get("ok")]
+
+        raw = []
+        for item in successful:
+            raw.extend(item["events"])
+
+        cooled = apply_symbol_cooldown_v4(raw, 60)
+        dev, oos = split_dev_oos(cooled)
+
+        # Ayrı coin genişliği: sonuç tek/az sayıda coin tarafından mı taşınıyor?
+        breadth = {}
+        for name, predicate in combo_hypotheses_v6():
+            coin_rows = []
+            for item in successful:
+                coin_events = apply_symbol_cooldown_v4(
+                    item["events"], 60
+                )
+                subset = [e for e in coin_events if predicate(e)]
+                s = summarize_trades_v2(subset)
+                if s["trade_count"] > 0:
+                    coin_rows.append({
+                        "symbol": item["symbol"],
+                        "trade_count": s["trade_count"],
+                        "mean_net_pct": s["mean_net_pct"],
+                        "profit_factor": s["profit_factor"],
+                    })
+
+            positive = sum(
+                1 for x in coin_rows
+                if x["mean_net_pct"] > 0
+            )
+            breadth[name] = {
+                "coins_with_trades": len(coin_rows),
+                "coins_positive_mean": positive,
+                "positive_coin_pct": round(
+                    positive / len(coin_rows) * 100, 2
+                ) if coin_rows else 0,
+                "per_coin": coin_rows,
+            }
+
+        return {
+            **MODE_INFO,
+            "status": "OK",
+            "signal": False,
+            "study": "PREDEFINED_CONTINUATION_COMBINATION_HYPOTHESES",
+            "days": days,
+            "selected_coin_count": len(selected),
+            "successful_coin_count": len(successful),
+            "failed_coin_count": len(failed),
+            "entry_model": "NEXT_5M_CANDLE_OPEN_AFTER_OBSERVED_RISE",
+            "exit_model": "OPEN_60_MIN_AFTER_ENTRY",
+            "round_trip_cost_pct": ROUND_TRIP_COST_PCT,
+            "same_symbol_cooldown_minutes": 60,
+            "base_zone": "30m momentum >=1.0% and <2.0%",
+            "hypothesis_definitions": {
+                "H1_VOLUME_CONTINUATION": "base zone + volume persistence >=1.2x",
+                "H2_VOLUME_PLUS_ACCELERATION": "H1 + last15 minus first15 >0.25 percentage points",
+                "H3_ORDERLY_RISE": "H1 + at least 5 of last 6 five-minute candles positive",
+                "H4_ACCELERATING_ORDERLY_RISE": "H3 + acceleration >0.25 percentage points",
+                "H5_PULLBACK_CONTINUATION": "H1 + current close >0.75% below 30m peak",
+                "H6_PULLBACK_REACCELERATION": "H5 + positive last 5m + acceleration >0.25 percentage points",
+            },
+            "all": combo_report_v6(cooled),
+            "dev_first_2_3": combo_report_v6(dev),
+            "oos_last_1_3": combo_report_v6(oos),
+            "breadth_all_period": breadth,
+            "failed": failed,
+            "generated_utc": utc_now(),
+            "interpretation_note": (
+                "These are predefined research hypotheses based on earlier "
+                "continuation studies. OOS is reported separately. No result "
+                "is automatically promoted to a live trading rule."
             ),
         }
 
