@@ -357,6 +357,7 @@ async def root():
             "/continuation90?count=30&days=90",
             "/continuation-quality90?count=30&days=90",
             "/continuation-combo90?count=30&days=90",
+            "/h6-validate?count=30&days=365",
         ],
     }
 
@@ -2318,6 +2319,278 @@ async def continuation_combo90(
                 "These are predefined research hypotheses based on earlier "
                 "continuation studies. OOS is reported separately. No result "
                 "is automatically promoted to a live trading rule."
+            ),
+        }
+
+    except Exception as e:
+        return {
+            **MODE_INFO,
+            "status": "ERROR",
+            "signal": False,
+            "error": str(e),
+            "generated_utc": utc_now(),
+        }
+
+def h6_validation_events_v7(candles, symbol):
+    """
+    V7 VALIDATION ONLY.
+    H6 is frozen from V6:
+      - observed 30m rise >=1.0% and <2.0%
+      - volume persistence >=1.2x
+      - close is >0.75% below the last-30m peak
+      - latest 5m momentum >0
+      - last15 - first15 >0.25 percentage points
+
+    Entry = next 5m OPEN.
+    Reports 15/30/60/120 minute exits.
+    No optimization and no orders.
+    """
+    events = []
+
+    # Need 25 future 5m candles for the 120m OPEN exit.
+    for i in range(7, len(candles) - 25):
+        signal_close = candles[i]["close"]
+
+        mom5 = pct_change(candles[i - 1]["close"], signal_close)
+        mom30 = pct_change(candles[i - 6]["close"], signal_close)
+
+        if not (1.0 <= mom30 < 2.0):
+            continue
+
+        first15 = pct_change(
+            candles[i - 6]["close"],
+            candles[i - 3]["close"],
+        )
+        last15 = pct_change(
+            candles[i - 3]["close"],
+            signal_close,
+        )
+        acceleration = last15 - first15
+
+        window_high = max(
+            candles[j]["high"] for j in range(i - 5, i + 1)
+        )
+        pullback = pct_change(window_high, signal_close)
+
+        old_vol = mean(
+            candles[j]["volume"] for j in range(i - 5, i - 2)
+        )
+        recent_vol = mean(
+            candles[j]["volume"] for j in range(i - 2, i + 1)
+        )
+        vol_persistence = recent_vol / old_vol if old_vol > 0 else 0
+
+        # Frozen H6 rule. Do not tune here.
+        if vol_persistence < 1.2:
+            continue
+        if pullback >= -0.75:
+            continue
+        if mom5 <= 0:
+            continue
+        if acceleration <= 0.25:
+            continue
+
+        entry = candles[i + 1]
+        entry_price = entry["open"]
+
+        exits = {
+            "15m": candles[i + 4]["open"],
+            "30m": candles[i + 7]["open"],
+            "60m": candles[i + 13]["open"],
+            "120m": candles[i + 25]["open"],
+        }
+
+        row = {
+            "symbol": symbol,
+            "signal_time_utc": datetime.fromtimestamp(
+                candles[i]["close_time"] / 1000,
+                tz=timezone.utc,
+            ).isoformat(),
+            "entry_time_utc": datetime.fromtimestamp(
+                entry["open_time"] / 1000,
+                tz=timezone.utc,
+            ).isoformat(),
+            "entry_open_time": entry["open_time"],
+            "momentum_5m_pct": mom5,
+            "momentum_30m_pct": mom30,
+            "volume_persistence_ratio": vol_persistence,
+            "pullback_from_30m_peak_pct": pullback,
+            "acceleration_pct_points": acceleration,
+        }
+
+        for label, exit_price in exits.items():
+            gross = pct_change(entry_price, exit_price)
+            row[f"gross_{label}_pct"] = gross
+            row[f"net_{label}_pct"] = gross - ROUND_TRIP_COST_PCT
+
+        # Compatibility with existing cooldown/split helpers.
+        row["gross_pct"] = row["gross_60m_pct"]
+        row["net_pct"] = row["net_60m_pct"]
+        events.append(row)
+
+    return events
+
+
+def summarize_horizon_v7(events, horizon):
+    values = [e[f"net_{horizon}_pct"] for e in events]
+    if not values:
+        return {
+            "trade_count": 0,
+            "mean_net_pct": None,
+            "median_net_pct": None,
+            "win_rate_net_pct": None,
+            "profit_factor": None,
+            "best_net_pct": None,
+            "worst_net_pct": None,
+        }
+
+    vals = sorted(values)
+    n = len(vals)
+    if n % 2:
+        med = vals[n // 2]
+    else:
+        med = (vals[n // 2 - 1] + vals[n // 2]) / 2
+
+    wins = [x for x in values if x > 0]
+    losses = [x for x in values if x < 0]
+    gross_profit = sum(wins)
+    gross_loss = abs(sum(losses))
+
+    pf = None
+    if gross_loss > 0:
+        pf = gross_profit / gross_loss
+    elif gross_profit > 0:
+        pf = None
+
+    return {
+        "trade_count": n,
+        "mean_net_pct": round(mean(values), 4),
+        "median_net_pct": round(med, 4),
+        "win_rate_net_pct": round(len(wins) / n * 100, 2),
+        "profit_factor": round(pf, 4) if pf is not None else None,
+        "best_net_pct": round(max(values), 4),
+        "worst_net_pct": round(min(values), 4),
+    }
+
+
+def horizon_report_v7(events):
+    return {
+        h: summarize_horizon_v7(events, h)
+        for h in ("15m", "30m", "60m", "120m")
+    }
+
+
+@app.get("/h6-validate")
+async def h6_validate_v7(
+    count: int = Query(default=30, ge=5, le=30),
+    days: int = Query(default=365, ge=90, le=365),
+):
+    """
+    Frozen H6 long-window validation.
+    Research/paper only; no live trading or order execution.
+    """
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(180.0)
+        ) as client:
+            universe_data = await build_universe(client)
+            selected = universe_data[:count]
+            semaphore = asyncio.Semaphore(2)
+
+            async def worker(item):
+                async with semaphore:
+                    try:
+                        candles = await get_5m_candles_days(
+                            client, item["symbol"], days
+                        )
+                        events = h6_validation_events_v7(
+                            candles, item["symbol"]
+                        )
+                        cooled = apply_symbol_cooldown_v4(events, 60)
+                        return {
+                            "ok": True,
+                            "symbol": item["symbol"],
+                            "candle_count": len(candles),
+                            "events": cooled,
+                        }
+                    except Exception as e:
+                        return {
+                            "ok": False,
+                            "symbol": item["symbol"],
+                            "error": str(e),
+                        }
+
+            results = await asyncio.gather(
+                *[worker(x) for x in selected]
+            )
+
+        successful = [x for x in results if x.get("ok")]
+        failed = [x for x in results if not x.get("ok")]
+
+        all_events = []
+        for item in successful:
+            all_events.extend(item["events"])
+
+        # Existing chronological helper retained for consistency.
+        dev, oos = split_dev_oos(all_events)
+
+        per_coin = []
+        positive_60 = 0
+        coins_with_trades = 0
+
+        for item in successful:
+            ev = item["events"]
+            if ev:
+                coins_with_trades += 1
+                s60 = summarize_horizon_v7(ev, "60m")
+                if s60["mean_net_pct"] is not None and s60["mean_net_pct"] > 0:
+                    positive_60 += 1
+                per_coin.append({
+                    "symbol": item["symbol"],
+                    "trade_count": len(ev),
+                    "horizons": horizon_report_v7(ev),
+                })
+
+        return {
+            **MODE_INFO,
+            "status": "OK",
+            "signal": False,
+            "study": "FROZEN_H6_LONG_WINDOW_VALIDATION",
+            "days": days,
+            "selected_coin_count": len(selected),
+            "successful_coin_count": len(successful),
+            "failed_coin_count": len(failed),
+            "frozen_rule": {
+                "momentum_30m_pct": ">=1.0 and <2.0",
+                "volume_persistence_ratio": ">=1.2",
+                "pullback_from_30m_peak_pct": "<-0.75",
+                "momentum_5m_pct": ">0",
+                "acceleration_pct_points": ">0.25",
+            },
+            "entry_model": "NEXT_5M_CANDLE_OPEN",
+            "exit_horizons": ["15m", "30m", "60m", "120m"],
+            "round_trip_cost_pct": ROUND_TRIP_COST_PCT,
+            "same_symbol_cooldown_minutes": 60,
+            "combined": {
+                "all": horizon_report_v7(all_events),
+                "dev_first_2_3": horizon_report_v7(dev),
+                "oos_last_1_3": horizon_report_v7(oos),
+            },
+            "breadth_60m_all_period": {
+                "coins_with_trades": coins_with_trades,
+                "coins_positive_mean": positive_60,
+                "positive_coin_pct": round(
+                    positive_60 / coins_with_trades * 100, 2
+                ) if coins_with_trades else 0,
+            },
+            "per_coin": per_coin,
+            "failed": failed,
+            "generated_utc": utc_now(),
+            "interpretation_note": (
+                "H6 thresholds are frozen from the prior study. "
+                "This endpoint validates the same rule over a longer window "
+                "and reports multiple fixed exit horizons. It does not "
+                "optimize thresholds or place orders."
             ),
         }
 
