@@ -355,6 +355,7 @@ async def root():
             "/backtest30?count=30&days=30",
             "/backtest90?count=30&days=90",
             "/continuation90?count=30&days=90",
+            "/continuation-quality90?count=30&days=90",
         ],
     }
 
@@ -1849,6 +1850,276 @@ async def continuation90(
                 "buy thresholds. We will look for continuation patterns "
                 "that remain positive in OOS rather than choosing the "
                 "best in-sample bucket."
+            ),
+        }
+
+    except Exception as e:
+        return {
+            **MODE_INFO,
+            "status": "ERROR",
+            "signal": False,
+            "error": str(e),
+            "generated_utc": utc_now(),
+        }
+
+def continuation_quality_events_v5(candles, symbol):
+    """
+    V5: Coin zaten yükselmişken hareketin KALİTESİNİ ölçer.
+    Geleceği tahmin eden özellik kullanılmaz.
+
+    Sinyal anında bilinenler:
+    - son 30m yükseliş
+    - son altı 5m getirinin yapısı
+    - pozitif 5m mum sayısı
+    - son 15m / ilk 15m momentum karşılaştırması
+    - 30m içi peak'ten mevcut close'a geri çekilme
+    - son 3 mum hacminin önceki 3 muma göre devamlılığı
+
+    Giriş: sonraki 5m OPEN
+    Çıkış: girişten 60m sonraki OPEN
+    """
+    events = []
+
+    for i in range(7, len(candles) - 13):
+        signal_close = candles[i]["close"]
+
+        mom5 = pct_change(candles[i - 1]["close"], signal_close)
+        mom15 = pct_change(candles[i - 3]["close"], signal_close)
+        mom30 = pct_change(candles[i - 6]["close"], signal_close)
+
+        # Biz sadece zaten yükselmiş hareketleri inceliyoruz.
+        if mom5 <= 0 or mom15 <= 0 or mom30 < 0.50:
+            continue
+
+        five_min_returns = []
+        for j in range(i - 5, i + 1):
+            five_min_returns.append(
+                pct_change(candles[j]["open"], candles[j]["close"])
+            )
+
+        positive_candles = sum(1 for r in five_min_returns if r > 0)
+
+        first15 = pct_change(
+            candles[i - 6]["close"],
+            candles[i - 3]["close"],
+        )
+        last15 = pct_change(
+            candles[i - 3]["close"],
+            signal_close,
+        )
+
+        acceleration = last15 - first15
+
+        window_high = max(
+            candles[j]["high"] for j in range(i - 5, i + 1)
+        )
+        pullback_from_peak = pct_change(
+            window_high,
+            signal_close,
+        )
+
+        old_vol = mean(
+            candles[j]["volume"] for j in range(i - 5, i - 2)
+        )
+        recent_vol = mean(
+            candles[j]["volume"] for j in range(i - 2, i + 1)
+        )
+        volume_persistence = (
+            recent_vol / old_vol if old_vol > 0 else 0
+        )
+
+        prior6_vol = mean(
+            candles[j]["volume"] for j in range(i - 6, i)
+        )
+        signal_volume_ratio = (
+            candles[i]["volume"] / prior6_vol
+            if prior6_vol > 0 else 0
+        )
+
+        entry = candles[i + 1]
+        exit_60 = candles[i + 13]
+
+        gross = pct_change(entry["open"], exit_60["open"])
+        net = gross - ROUND_TRIP_COST_PCT
+
+        events.append({
+            "symbol": symbol,
+            "signal_time_utc": datetime.fromtimestamp(
+                candles[i]["close_time"] / 1000,
+                tz=timezone.utc,
+            ).isoformat(),
+            "entry_time_utc": datetime.fromtimestamp(
+                entry["open_time"] / 1000,
+                tz=timezone.utc,
+            ).isoformat(),
+            "entry_open_time": entry["open_time"],
+            "momentum_5m_pct": mom5,
+            "momentum_15m_pct": mom15,
+            "momentum_30m_pct": mom30,
+            "positive_5m_candles_last_30m": positive_candles,
+            "first_15m_pct": first15,
+            "last_15m_pct": last15,
+            "acceleration_pct_points": acceleration,
+            "pullback_from_30m_peak_pct": pullback_from_peak,
+            "volume_persistence_ratio": volume_persistence,
+            "signal_volume_ratio": signal_volume_ratio,
+            "gross_pct": gross,
+            "net_pct": net,
+        })
+
+    return events
+
+
+def quality_bucket_report_v5(events):
+    """
+    Tek değişkenli davranış raporu.
+    Amaç en iyi hücreyi seçmek değil, hangi hareket özelliklerinin
+    OOS'ta continuation ile ilişkili olduğunu görmek.
+    """
+    dimensions = {
+        "positive_candle_count": [
+            ("2_or_less", lambda e: e["positive_5m_candles_last_30m"] <= 2),
+            ("3", lambda e: e["positive_5m_candles_last_30m"] == 3),
+            ("4", lambda e: e["positive_5m_candles_last_30m"] == 4),
+            ("5", lambda e: e["positive_5m_candles_last_30m"] == 5),
+            ("6", lambda e: e["positive_5m_candles_last_30m"] == 6),
+        ],
+        "acceleration": [
+            ("decelerating", lambda e: e["acceleration_pct_points"] < -0.25),
+            ("roughly_steady", lambda e: -0.25 <= e["acceleration_pct_points"] <= 0.25),
+            ("accelerating", lambda e: e["acceleration_pct_points"] > 0.25),
+        ],
+        "pullback_from_peak": [
+            ("0_to_-0.25%", lambda e: e["pullback_from_30m_peak_pct"] >= -0.25),
+            ("-0.25_to_-0.75%", lambda e: -0.75 <= e["pullback_from_30m_peak_pct"] < -0.25),
+            ("below_-0.75%", lambda e: e["pullback_from_30m_peak_pct"] < -0.75),
+        ],
+        "volume_persistence": [
+            ("<0.8x", lambda e: e["volume_persistence_ratio"] < 0.8),
+            ("0.8-1.19x", lambda e: 0.8 <= e["volume_persistence_ratio"] < 1.2),
+            ("1.2-1.99x", lambda e: 1.2 <= e["volume_persistence_ratio"] < 2.0),
+            ("2.0x+", lambda e: e["volume_persistence_ratio"] >= 2.0),
+        ],
+    }
+
+    report = {}
+
+    for dimension, buckets in dimensions.items():
+        rows = []
+        for label, predicate in buckets:
+            subset = [e for e in events if predicate(e)]
+            rows.append({
+                "bucket": label,
+                **summarize_trades_v2(subset),
+            })
+        report[dimension] = rows
+
+    return report
+
+
+def focused_continuation_zone_v5(events):
+    """
+    V4'te keşfedilen genel bölgeyi ayrı raporlar:
+    30m momentum 1.0%-1.99%.
+    Burada yeni kalite özelliklerini inceliyoruz; yeni eşik optimize etmiyoruz.
+    """
+    return [
+        e for e in events
+        if 1.0 <= e["momentum_30m_pct"] < 2.0
+    ]
+
+
+@app.get("/continuation-quality90")
+async def continuation_quality90(
+    count: int = Query(default=30, ge=5, le=30),
+    days: int = Query(default=90, ge=30, le=90),
+):
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(120.0)
+        ) as client:
+            universe_data = await build_universe(client)
+            selected = universe_data[:count]
+            semaphore = asyncio.Semaphore(3)
+
+            async def worker(item):
+                async with semaphore:
+                    try:
+                        candles = await get_5m_candles_days(
+                            client, item["symbol"], days
+                        )
+                        events = continuation_quality_events_v5(
+                            candles, item["symbol"]
+                        )
+                        return {
+                            "ok": True,
+                            "symbol": item["symbol"],
+                            "candle_count": len(candles),
+                            "events": events,
+                        }
+                    except Exception as e:
+                        return {
+                            "ok": False,
+                            "symbol": item["symbol"],
+                            "error": str(e),
+                        }
+
+            results = await asyncio.gather(
+                *[worker(x) for x in selected]
+            )
+
+        successful = [x for x in results if x.get("ok")]
+        failed = [x for x in results if not x.get("ok")]
+
+        raw = []
+        for item in successful:
+            raw.extend(item["events"])
+
+        cooled = apply_symbol_cooldown_v4(raw, 60)
+        dev, oos = split_dev_oos(cooled)
+
+        focus_all = focused_continuation_zone_v5(cooled)
+        focus_dev = focused_continuation_zone_v5(dev)
+        focus_oos = focused_continuation_zone_v5(oos)
+
+        return {
+            **MODE_INFO,
+            "status": "OK",
+            "signal": False,
+            "study": "CONTINUATION_QUALITY_AFTER_RISE_ALREADY_STARTED",
+            "days": days,
+            "selected_coin_count": len(selected),
+            "successful_coin_count": len(successful),
+            "failed_coin_count": len(failed),
+            "entry_model": "NEXT_5M_CANDLE_OPEN_AFTER_OBSERVED_RISE",
+            "exit_model": "OPEN_60_MIN_AFTER_ENTRY",
+            "round_trip_cost_pct": ROUND_TRIP_COST_PCT,
+            "same_symbol_cooldown_minutes": 60,
+            "raw_event_count": len(raw),
+            "cooldown_event_count": len(cooled),
+            "combined": {
+                "all": summarize_trades_v2(cooled),
+                "dev_first_2_3": summarize_trades_v2(dev),
+                "oos_last_1_3": summarize_trades_v2(oos),
+            },
+            "quality_all": quality_bucket_report_v5(cooled),
+            "quality_dev": quality_bucket_report_v5(dev),
+            "quality_oos": quality_bucket_report_v5(oos),
+            "focus_zone": {
+                "definition": "30m momentum >=1.0% and <2.0%",
+                "all": summarize_trades_v2(focus_all),
+                "dev": summarize_trades_v2(focus_dev),
+                "oos": summarize_trades_v2(focus_oos),
+                "quality_all": quality_bucket_report_v5(focus_all),
+                "quality_dev": quality_bucket_report_v5(focus_dev),
+                "quality_oos": quality_bucket_report_v5(focus_oos),
+            },
+            "failed": failed,
+            "generated_utc": utc_now(),
+            "interpretation_note": (
+                "This endpoint studies the SHAPE of an already-started rise. "
+                "It does not predict which coin will rise. Quality buckets are "
+                "descriptive and are not yet live-entry rules."
             ),
         }
 
