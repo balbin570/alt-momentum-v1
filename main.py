@@ -5620,3 +5620,216 @@ async def v18_light():
     """
     return await v18_regime_validate(count=10, days=90)
 
+# =========================
+# V19 FROZEN REGIME BLOCK VALIDATION
+# =========================
+
+def block_summary_v19(events, block_days=30):
+    """
+    Calendar-style sequential blocks based on event timestamps.
+    No thresholds are learned from these blocks.
+    """
+    if not events:
+        return []
+
+    ev = sorted(events, key=lambda e: e["entry_open_time"])
+    start_ms = ev[0]["entry_open_time"]
+    block_ms = block_days * 24 * 60 * 60 * 1000
+    groups = {}
+
+    for e in ev:
+        k = int((e["entry_open_time"] - start_ms) // block_ms)
+        groups.setdefault(k, []).append(e)
+
+    rows = []
+    for k in sorted(groups):
+        arr = groups[k]
+        rows.append({
+            "block": k + 1,
+            "block_days": block_days,
+            "n": len(arr),
+            **summarize_v17(arr),
+        })
+    return rows
+
+
+@app.get("/v19-frozen-blocks")
+async def v19_frozen_blocks(
+    count: int = Query(default=10, ge=10, le=20),
+    days: int = Query(default=90, ge=90, le=180),
+):
+    """
+    V19: no optimization.
+
+    Frozen candidate A:
+      V16 CONTINUED_UP + BTC_BULL.
+
+    Frozen candidate B:
+      Candidate A + true selected-alt mean 30m return < +0.5%.
+
+    Reports sequential 30-day blocks so the 90-day Render-safe run
+    yields approximately three independent time blocks.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(300.0)) as client:
+            universe_data = await build_universe(client)
+            selected = universe_data[:count]
+            semaphore = asyncio.Semaphore(2)
+
+            async def worker(item):
+                async with semaphore:
+                    try:
+                        candles = await get_5m_candles_days(
+                            client, item["symbol"], days
+                        )
+                        return {
+                            "ok": True,
+                            "symbol": item["symbol"],
+                            "candles": candles,
+                            "events": relative_candidates_v15(
+                                candles, item["symbol"]
+                            ),
+                        }
+                    except Exception as e:
+                        return {
+                            "ok": False,
+                            "symbol": item["symbol"],
+                            "error": str(e),
+                        }
+
+            coin_results, btc = await asyncio.gather(
+                asyncio.gather(*[worker(x) for x in selected]),
+                fetch_btc_5m_for_v17(client, days),
+            )
+
+        successful = [x for x in coin_results if x.get("ok")]
+        failed = [x for x in coin_results if not x.get("ok")]
+
+        raw = []
+        for item in successful:
+            raw.extend(item["events"])
+
+        # Frozen relative-momentum ranking.
+        by_time = {}
+        for e in raw:
+            by_time.setdefault(e["signal_time_ms"], []).append(e)
+
+        ranked = []
+        for group in by_time.values():
+            if len(group) < 5:
+                continue
+            ordered = sorted(group, key=lambda x: x["relative_momentum_z"])
+            n = len(ordered)
+            for idx, e in enumerate(ordered):
+                row = dict(e)
+                row["cross_section_percentile"] = (
+                    idx / (n - 1) if n > 1 else 1.0
+                )
+                ranked.append(row)
+
+        # Frozen 60m same-symbol signal cooldown.
+        ranked.sort(key=lambda e: (e["symbol"], e["entry_open_time"]))
+        cooled = []
+        last_by_symbol = {}
+        for e in ranked:
+            t = e["entry_open_time"]
+            last = last_by_symbol.get(e["symbol"])
+            if last is None or t - last >= 60 * 60 * 1000:
+                cooled.append(e)
+                last_by_symbol[e["symbol"]] = t
+
+        base = [
+            dict(e) for e in cooled
+            if e["relative_momentum_z"] >= 1.0
+            and e["cross_section_percentile"] >= 0.80
+            and e["behavior"] == "CONTINUED_UP"
+        ]
+
+        # True market snapshot from all selected successfully fetched coins.
+        snapshots = {}
+        for item in successful:
+            candles = item["candles"]
+            for i in range(6, len(candles)):
+                t = candles[i]["close_time"]
+                mom30 = pct_change(
+                    candles[i - 6]["close"], candles[i]["close"]
+                )
+                snapshots.setdefault(t, []).append(mom30)
+
+        for e in base:
+            vals = snapshots.get(e["signal_time_ms"], [])
+            e["true_alt_market_mean_30m_pct"] = (
+                mean(vals) if vals else None
+            )
+            reg = btc_regime_at_v17(btc, e["signal_time_ms"])
+            if reg:
+                e.update(reg)
+            else:
+                e["btc_trend"] = "UNKNOWN"
+
+        candidate_a = [
+            e for e in base if e.get("btc_trend") == "BTC_BULL"
+        ]
+        candidate_b = [
+            e for e in candidate_a
+            if e.get("true_alt_market_mean_30m_pct") is not None
+            and e["true_alt_market_mean_30m_pct"] < 0.5
+        ]
+
+        def package(arr):
+            return {
+                "all": summarize_v17(arr),
+                "sequential_30d_blocks": block_summary_v19(arr, 30),
+            }
+
+        return {
+            **MODE_INFO,
+            "status": "OK",
+            "signal": False,
+            "study": "V19_FROZEN_REGIME_BLOCK_VALIDATION",
+            "days": days,
+            "selected_coin_count": len(selected),
+            "successful_coin_count": len(successful),
+            "failed_coin_count": len(failed),
+            "frozen_base_entry_rule": {
+                "relative_momentum_z_min": 1.0,
+                "cross_section_percentile_min": 0.80,
+                "behavior": "CONTINUED_UP",
+                "continued_up_definition": "wait_end_change >= +0.75%",
+                "observation_wait_minutes": 60,
+                "entry": "OPEN_AT_END_OF_60M_OBSERVATION_WINDOW",
+                "hold_minutes": 120,
+                "round_trip_cost_pct": ROUND_TRIP_COST_PCT,
+            },
+            "candidate_A_BTC_BULL": {
+                "definition": (
+                    "base rule + BTC 4h return > 0 and BTC 24h return > 0"
+                ),
+                "results": package(candidate_a),
+            },
+            "candidate_B_BTC_BULL_ALT_LT_0_5": {
+                "definition": (
+                    "candidate A + true selected-alt mean 30m return < +0.5%"
+                ),
+                "results": package(candidate_b),
+            },
+            "base_event_count_before_regime": len(base),
+            "failed": failed,
+            "generated_utc": utc_now(),
+            "interpretation_note": (
+                "V19 does not optimize thresholds. Candidate A and B are frozen "
+                "from V18. Evaluate whether PF/mean remain directionally stable "
+                "across sequential 30-day blocks. Small blocks should be treated "
+                "as descriptive, not as proof of an edge."
+            ),
+        }
+
+    except Exception as e:
+        return {
+            **MODE_INFO,
+            "status": "ERROR",
+            "signal": False,
+            "error": str(e),
+            "generated_utc": utc_now(),
+        }
+
