@@ -11,6 +11,7 @@ BINANCE = "https://data-api.binance.vision"
 MODEL = "ALT-MOMENTUM-V1"
 
 MIN_QUOTE_VOLUME_USDT = 5_000_000
+ROUND_TRIP_COST_PCT = 0.15
 
 # Altcoin araştırması için istemediğimiz baz varlıklar
 EXCLUDED_BASES = {
@@ -347,6 +348,7 @@ async def root():
             "/universe",
             "/scan?count=20",
             "/backtest/TIAUSDT?limit=1000",
+            "/backtest-all?count=30&limit=1000",
         ],
     }
 
@@ -528,3 +530,236 @@ async def backtest(
             "error": str(e),
             "generated_utc": utc_now(),
         }
+
+def apply_cooldown(events, cooldown_minutes):
+    """
+    Aynı coin için birbirine çok yakın eventleri bağımsız işlem gibi
+    saymamak amacıyla cooldown uygular.
+    """
+    if not events:
+        return []
+
+    kept = []
+    last_kept_time = None
+    cooldown_seconds = cooldown_minutes * 60
+
+    for event in events:
+        event_time = datetime.fromisoformat(event["time_utc"])
+
+        if last_kept_time is None:
+            kept.append(event)
+            last_kept_time = event_time
+            continue
+
+        if (event_time - last_kept_time).total_seconds() >= cooldown_seconds:
+            kept.append(event)
+            last_kept_time = event_time
+
+    return kept
+
+
+def summarize_events_with_cost(events, cost_pct=ROUND_TRIP_COST_PCT):
+    """
+    15/30/60 dk brüt sonuçları ve sabit round-trip maliyet sonrası
+    net sonuçları birlikte özetler.
+    """
+    if not events:
+        return {
+            "event_count": 0,
+            "cost_pct": cost_pct,
+            "return_15m": None,
+            "return_30m": None,
+            "return_60m": None,
+        }
+
+    def stats(field):
+        gross_values = [float(x[field]) for x in events]
+        net_values = [x - cost_pct for x in gross_values]
+
+        return {
+            "gross_mean_pct": round(mean(gross_values), 4),
+            "gross_win_rate_pct": round(
+                sum(1 for x in gross_values if x > 0)
+                / len(gross_values)
+                * 100,
+                2,
+            ),
+            "net_mean_pct": round(mean(net_values), 4),
+            "net_win_rate_pct": round(
+                sum(1 for x in net_values if x > 0)
+                / len(net_values)
+                * 100,
+                2,
+            ),
+            "best_gross_pct": round(max(gross_values), 4),
+            "worst_gross_pct": round(min(gross_values), 4),
+            "best_net_pct": round(max(net_values), 4),
+            "worst_net_pct": round(min(net_values), 4),
+        }
+
+    return {
+        "event_count": len(events),
+        "cost_pct": cost_pct,
+        "return_15m": stats("return_15m_pct"),
+        "return_30m": stats("return_30m_pct"),
+        "return_60m": stats("return_60m_pct"),
+    }
+
+
+def compact_coin_result(symbol, quote_volume, candle_count, raw_events):
+    events_30 = apply_cooldown(raw_events, 30)
+    events_60 = apply_cooldown(raw_events, 60)
+
+    return {
+        "symbol": symbol,
+        "quote_volume_24h": quote_volume,
+        "candle_count": candle_count,
+        "raw": summarize_events_with_cost(raw_events),
+        "cooldown_30m": summarize_events_with_cost(events_30),
+        "cooldown_60m": summarize_events_with_cost(events_60),
+    }
+
+
+@app.get("/backtest-all")
+async def backtest_all(
+    count: int = Query(
+        default=30,
+        ge=5,
+        le=50,
+    ),
+    limit: int = Query(
+        default=1000,
+        ge=100,
+        le=1000,
+    ),
+):
+    """
+    Çoklu altcoin research/event-study endpointi.
+
+    - Emir üretmez.
+    - Paper trade açmaz.
+    - Mevcut 24h likidite evreninden en yüksek hacimli coinleri seçer.
+    - Ham eventleri, 30 dk cooldown ve 60 dk cooldown sonuçlarını karşılaştırır.
+    - %0.15 round-trip araştırma maliyetini net sonuçlardan düşer.
+
+    Not:
+    Bu ilk geniş test current-universe yaklaşımı kullanır; dolayısıyla
+    survivorship / current-liquidity bias içerebilir.
+    """
+    try:
+        async with httpx.AsyncClient() as client:
+            universe_data = await build_universe(client)
+            selected = universe_data[:count]
+
+            semaphore = asyncio.Semaphore(8)
+
+            async def worker(item):
+                async with semaphore:
+                    try:
+                        candles = await get_completed_5m_candles(
+                            client,
+                            item["symbol"],
+                            limit,
+                        )
+
+                        raw_events = historical_events(candles)
+
+                        return {
+                            "ok": True,
+                            "symbol": item["symbol"],
+                            "quote_volume_24h": item["quote_volume_24h"],
+                            "candle_count": len(candles),
+                            "raw_events": raw_events,
+                        }
+
+                    except Exception as e:
+                        return {
+                            "ok": False,
+                            "symbol": item["symbol"],
+                            "error": str(e),
+                        }
+
+            results = await asyncio.gather(
+                *[worker(item) for item in selected]
+            )
+
+        successful = [x for x in results if x.get("ok")]
+        failed = [x for x in results if not x.get("ok")]
+
+        all_raw = []
+        all_cd30 = []
+        all_cd60 = []
+        per_coin = []
+
+        for item in successful:
+            raw_events = item["raw_events"]
+            cd30 = apply_cooldown(raw_events, 30)
+            cd60 = apply_cooldown(raw_events, 60)
+
+            all_raw.extend(raw_events)
+            all_cd30.extend(cd30)
+            all_cd60.extend(cd60)
+
+            per_coin.append(
+                compact_coin_result(
+                    item["symbol"],
+                    item["quote_volume_24h"],
+                    item["candle_count"],
+                    raw_events,
+                )
+            )
+
+        # Coin listesini hacme göre okunabilir sırada tut.
+        per_coin.sort(
+            key=lambda x: x["quote_volume_24h"],
+            reverse=True,
+        )
+
+        return {
+            **MODE_INFO,
+            "status": "OK",
+            "signal": False,
+            "note": (
+                "MULTI-COIN RESEARCH EVENT STUDY ONLY - "
+                "NOT A VALIDATED TRADING STRATEGY"
+            ),
+            "universe_size": len(universe_data),
+            "requested_coin_count": count,
+            "selected_coin_count": len(selected),
+            "successful_coin_count": len(successful),
+            "failed_coin_count": len(failed),
+            "candle_limit_per_coin": limit,
+            "round_trip_cost_pct": ROUND_TRIP_COST_PCT,
+            "research_conditions": {
+                "momentum_5m_min_pct": 0.30,
+                "momentum_15m_min_pct": 0.50,
+                "momentum_30m_min_pct": 0.50,
+                "volume_ratio_min": 1.20,
+                "momentum_5m_max_pct": 3.00,
+                "momentum_30m_max_pct": 6.00,
+            },
+            "combined": {
+                "raw": summarize_events_with_cost(all_raw),
+                "cooldown_30m": summarize_events_with_cost(all_cd30),
+                "cooldown_60m": summarize_events_with_cost(all_cd60),
+            },
+            "per_coin": per_coin,
+            "failed": failed,
+            "generated_utc": utc_now(),
+            "limitations": [
+                "Current liquid universe is used; historical survivorship bias is possible.",
+                "Entry reference is the event candle close, not a simulated next-candle fill.",
+                "Cost is a fixed research assumption and does not model variable slippage.",
+                "1000 x 5m candles is only about 3.5 days of data.",
+            ],
+        }
+
+    except Exception as e:
+        return {
+            **MODE_INFO,
+            "status": "ERROR",
+            "signal": False,
+            "error": str(e),
+            "generated_utc": utc_now(),
+        }
+
