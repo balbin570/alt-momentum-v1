@@ -5609,3 +5609,14 @@ async def v18_regime_validate(
             "generated_utc": utc_now(),
         }
 
+# =========================
+# V18 LIGHT — RENDER SAFE
+# =========================
+@app.get("/v18-light")
+async def v18_light():
+    """
+    Same frozen V18 logic, reduced workload for Render Free.
+    10 coins x 90 days. No strategy threshold changes.
+    """
+    return await v18_regime_validate(count=10, days=90)
+
