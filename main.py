@@ -7792,7 +7792,7 @@ async def v27_candidate_b_volume_safe(
     days_ago: int = Query(default=1, ge=1, le=30),
     batch_size: int = Query(default=30, ge=10, le=50),
 ):
-    target_day = (dt.datetime.now(dt.UTC) - timedelta(days=days_ago)).date()
+    target_day = (dt.datetime.now(dt.UTC) - dt.timedelta(days=days_ago)).date()
     fetch_days = max(3, days_ago + 2)
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
