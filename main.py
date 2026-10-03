@@ -78,7 +78,7 @@ async def get_json(client, path, params=None):
     return response.json()
 
 
-V26_NON_ALT_BASE_EXCLUSIONS = {'AVGO', 'SOXL', 'WDC', 'SKHY', 'GOOGL', 'AAPL', 'TSLA', 'NVDA', 'USTC', 'EURI', 'MSTR', 'QQQ', 'USDE', 'INTC', 'XUSD', 'SOXS'}
+V26_NON_ALT_BASE_EXCLUSIONS = {'AVGO', 'SKHYB', 'MSTRB', 'WDC', 'SOXL', 'AVGOB', 'SOXLB', 'SKHY', 'GOOGL', 'AAPL', 'TSLA', 'GOOGLB', 'NVDA', 'QQQB', 'USTC', 'EURI', 'AAPLB', 'MSTR', 'QQQ', 'USDE', 'SOXSB', 'WDCB', 'INTC', 'NVDAB', 'XUSD', 'TSLAB', 'INTCB', 'SOXS'}
 
 async def build_universe(client):
     exchange_info, tickers = await asyncio.gather(
@@ -5875,7 +5875,7 @@ def v20_public_state():
         "mode": "RESEARCH_PAPER_ONLY",
         "trading": False,
         "orders": False,
-        "strategy": "V26_CANDIDATE_B_MAX_BROAD_ALTCOIN_FORWARD_PAPER",
+        "strategy": "V27_CANDIDATE_B_CLEAN_BROAD_ALTCOIN_FORWARD_PAPER",
         "started_utc": V20_STATE["started_utc"],
         "open_count": len(V20_STATE["open"]),
         "closed_count": len(closed),
@@ -6255,7 +6255,7 @@ async def v21_status():
         "mode": "RESEARCH_PAPER_ONLY",
         "trading": False,
         "orders": False,
-        "strategy": "V26_CANDIDATE_B_MAX_BROAD_ALTCOIN_FORWARD_PAPER",
+        "strategy": "V27_CANDIDATE_B_CLEAN_BROAD_ALTCOIN_FORWARD_PAPER",
         "strategy_changed": True,
         "strategy_change": "Universe broadened further by lowering the 24h quote-volume floor from 5M USDT to 1M USDT; Candidate B signal thresholds unchanged.",
         "automation": {
@@ -6404,7 +6404,7 @@ async def v22_status():
         "mode": "RESEARCH_PAPER_ONLY",
         "trading": False,
         "orders": False,
-        "strategy": "V26_CANDIDATE_B_MAX_BROAD_ALTCOIN_FORWARD_PAPER",
+        "strategy": "V27_CANDIDATE_B_CLEAN_BROAD_ALTCOIN_FORWARD_PAPER",
         "strategy_changed": True,
         "strategy_change": "Universe broadened further by lowering the 24h quote-volume floor from 5M USDT to 1M USDT; Candidate B signal thresholds unchanged.",
         "automation": {
@@ -6464,7 +6464,7 @@ async def v23_status():
         "mode": "RESEARCH_PAPER_ONLY",
         "trading": False,
         "orders": False,
-        "strategy": "V26_CANDIDATE_B_MAX_BROAD_ALTCOIN_FORWARD_PAPER",
+        "strategy": "V27_CANDIDATE_B_CLEAN_BROAD_ALTCOIN_FORWARD_PAPER",
         "strategy_changed": True,
         "strategy_change": (
             "Universe expanded from 10 coins to all eligible dynamic Binance "
@@ -6507,7 +6507,7 @@ async def v24_status():
         "mode": "RESEARCH_PAPER_ONLY",
         "trading": False,
         "orders": False,
-        "strategy": "V26_CANDIDATE_B_MAX_BROAD_ALTCOIN_FORWARD_PAPER",
+        "strategy": "V27_CANDIDATE_B_CLEAN_BROAD_ALTCOIN_FORWARD_PAPER",
         "strategy_changed": True,
         "strategy_change": (
             "24h quote-volume floor lowered from 5M to 1M USDT. "
@@ -6548,7 +6548,7 @@ async def v25_status():
         "mode": "RESEARCH_PAPER_ONLY",
         "trading": False,
         "orders": False,
-        "strategy": "V26_CANDIDATE_B_MAX_BROAD_ALTCOIN_FORWARD_PAPER",
+        "strategy": "V27_CANDIDATE_B_CLEAN_BROAD_ALTCOIN_FORWARD_PAPER",
         "strategy_changed": True,
         "strategy_change": (
             "24h quote-volume floor lowered from 1M to 250k USDT. "
@@ -6590,7 +6590,7 @@ async def v26_status():
         "mode": "RESEARCH_PAPER_ONLY",
         "trading": False,
         "orders": False,
-        "strategy": "V26_CANDIDATE_B_MAX_BROAD_ALTCOIN_FORWARD_PAPER",
+        "strategy": "V27_CANDIDATE_B_CLEAN_BROAD_ALTCOIN_FORWARD_PAPER",
         "strategy_changed": True,
         "strategy_change": (
             "250k USDT 24h liquidity floor retained. Clearly non-altcoin "
@@ -6599,6 +6599,45 @@ async def v26_status():
         ),
         "universe": {
             "mode": "MAX_BROAD_ALTCOIN_DYNAMIC",
+            "min_quote_volume_usdt_24h": MIN_QUOTE_VOLUME_USDT,
+            "fixed_coin_count": False,
+            "extra_non_alt_base_exclusions": sorted(V26_NON_ALT_BASE_EXCLUSIONS),
+        },
+        "automation": {
+            "enabled": True,
+            "scan_interval_seconds": V21_SCAN_INTERVAL_SECONDS,
+            "last_scan": V21_LAST_SCAN,
+        },
+        "persistence": {
+            "database_configured": bool(V21_DB_URL),
+            "backend": "POSTGRESQL" if V21_DB_URL else "MEMORY_ONLY",
+        },
+        "telegram": {
+            "configured": bool(V22_TG_TOKEN and V22_TG_CHAT_ID),
+            "entry_notifications": True,
+            "exit_notifications": True,
+        },
+        "paper": v20_public_state(),
+        "generated_utc": utc_now(),
+    }
+
+
+@app.get("/v27-status")
+async def v27_status():
+    return {
+        "model": MODEL,
+        "mode": "RESEARCH_PAPER_ONLY",
+        "trading": False,
+        "orders": False,
+        "strategy": "V27_CANDIDATE_B_CLEAN_BROAD_ALTCOIN_FORWARD_PAPER",
+        "strategy_changed": True,
+        "strategy_change": (
+            "Corrected Binance tokenized equity/index base exclusions (e.g. "
+            "TSLAB, AAPLB, NVDAB, GOOGLB, QQQB). 250k USDT liquidity floor "
+            "and Candidate B signal thresholds are unchanged."
+        ),
+        "universe": {
+            "mode": "CLEAN_BROAD_ALTCOIN_DYNAMIC",
             "min_quote_volume_usdt_24h": MIN_QUOTE_VOLUME_USDT,
             "fixed_coin_count": False,
             "extra_non_alt_base_exclusions": sorted(V26_NON_ALT_BASE_EXCLUSIONS),
