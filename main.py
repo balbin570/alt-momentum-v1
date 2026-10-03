@@ -1,7 +1,7 @@
 import json
 import os
 import asyncio
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from statistics import mean, median
 
 import httpx
@@ -7427,5 +7427,138 @@ async def v27_causal_volume_day(days_ago: int = 1, offset: int = 0, count: int =
         "rows": events,
         "fetch_error_count": len(errors),
         "fetch_errors": errors[:20],
+        "generated_utc": utc_now(),
+    }
+
+# ---------------------------------------------------------------------------
+# V27 RESEARCH ONLY - ONE URL / FULL UNIVERSE CAUSAL VOLUME AGGREGATOR
+# Internally calls the causal endpoint in chunks of 50 and aggregates rows.
+# Does NOT alter V27 forward-paper rules, DB state, Telegram, trading or orders.
+# ---------------------------------------------------------------------------
+
+@app.get("/v27-causal-volume-all")
+async def v27_causal_volume_all(days_ago: int = 1):
+    days_ago = max(1, min(int(days_ago), 30))
+    chunk_size = 50
+    offset = 0
+    all_rows = []
+    all_errors = []
+    chunks = []
+    universe_total = None
+    date_utc = None
+
+    # Safety cap prevents an accidental endless loop if the dynamic universe changes mid-run.
+    for _ in range(20):
+        part = await v27_causal_volume_day(days_ago=days_ago, offset=offset, count=chunk_size)
+        if universe_total is None:
+            universe_total = part.get("universe_symbols_total", 0)
+            date_utc = part.get("date_utc")
+
+        rows = part.get("rows", []) or []
+        errs = part.get("fetch_errors", []) or []
+        processed = int(part.get("chunk_symbols_processed", 0) or 0)
+        next_offset = part.get("next_offset")
+
+        all_rows.extend(rows)
+        all_errors.extend(errs)
+        chunks.append({
+            "offset": offset,
+            "symbols_processed": processed,
+            "events": len(rows),
+            "fetch_errors": int(part.get("fetch_error_count", len(errs)) or 0),
+        })
+
+        if next_offset is None or processed <= 0:
+            break
+        offset = int(next_offset)
+
+    # Dynamic-universe rebuilds across chunks can theoretically create duplicates.
+    # Keep one event per symbol/event timestamp in the aggregate.
+    dedup = {}
+    for row in all_rows:
+        key = (row.get("symbol"), row.get("event_utc"))
+        dedup[key] = row
+    events = list(dedup.values())
+
+    def _median(vals):
+        vals = sorted(vals)
+        n = len(vals)
+        if not n:
+            return None
+        m = n // 2
+        return vals[m] if n % 2 else (vals[m - 1] + vals[m]) / 2
+
+    def _stats(group):
+        if not group:
+            return {"n": 0}
+        n = len(group)
+        c = sum(bool(x.get("continued_60m_ge_0_75_from_entry")) for x in group)
+        return {
+            "n": n,
+            "continued_n": c,
+            "continuation_rate_pct": round(100 * c / n, 2),
+            "mean_net_30m_pct": round(sum(x["net_30m_pct_after_0_15_cost"] for x in group) / n, 4),
+            "median_net_30m_pct": round(_median([x["net_30m_pct_after_0_15_cost"] for x in group]), 4),
+            "mean_net_60m_pct": round(sum(x["net_60m_pct_after_0_15_cost"] for x in group) / n, 4),
+            "median_net_60m_pct": round(_median([x["net_60m_pct_after_0_15_cost"] for x in group]), 4),
+            "mean_net_120m_pct": round(sum(x["net_120m_pct_after_0_15_cost"] for x in group) / n, 4),
+            "median_net_120m_pct": round(_median([x["net_120m_pct_after_0_15_cost"] for x in group]), 4),
+        }
+
+    cumulative = []
+    for threshold in [0, 1, 1.5, 2, 3, 5, 10]:
+        group = events if threshold == 0 else [
+            x for x in events if x["observed_volume_ratio_next30_vs_pre30"] >= threshold
+        ]
+        cumulative.append({
+            "threshold": "ALL" if threshold == 0 else f">={threshold}x",
+            **_stats(group),
+        })
+
+    bucket_defs = [
+        ("<1x", 0, 1), ("1-1.5x", 1, 1.5), ("1.5-2x", 1.5, 2),
+        ("2-3x", 2, 3), ("3-5x", 3, 5), ("5-10x", 5, 10),
+        (">=10x", 10, float("inf")),
+    ]
+    buckets = []
+    for label, lo, hi in bucket_defs:
+        group = [
+            x for x in events
+            if lo <= x["observed_volume_ratio_next30_vs_pre30"] < hi
+        ]
+        buckets.append({"bucket": label, **_stats(group)})
+
+    return {
+        "model": MODEL,
+        "mode": "RESEARCH_ONLY",
+        "trading": False,
+        "orders": False,
+        "strategy_changed": False,
+        "date_utc": date_utc,
+        "days_ago": days_ago,
+        "scan_mode": "FULL_UNIVERSE_INTERNAL_CHUNKS",
+        "internal_chunk_size": chunk_size,
+        "universe_symbols_total_at_start": universe_total,
+        "symbols_processed_total": sum(x["symbols_processed"] for x in chunks),
+        "chunks_completed": len(chunks),
+        "chunk_summary": chunks,
+        "volume_floor_usdt": 250000,
+        "round_trip_cost_pct": 0.15,
+        "method": {
+            "event": "first completed 5m close >= +1% vs UTC-day open",
+            "observation": "wait for next 30m to complete; volume ratio = observed next30m / previous30m",
+            "decision_time": "only after the 30m observation is fully known",
+            "entry": "OPEN of the next 5m candle after observation",
+            "future": "30m/60m/120m measured from entry OPEN using later candle OPENs",
+            "continuation": "gross 60m return from causal entry >= +0.75%",
+            "selection": "all qualifying V27-universe symbols; internally processed in chunks",
+            "lookahead_at_entry": False,
+        },
+        "events": len(events),
+        "cumulative_thresholds": cumulative,
+        "exclusive_buckets": buckets,
+        "rows": events,
+        "fetch_error_count": len(all_errors),
+        "fetch_errors": all_errors[:50],
         "generated_utc": utc_now(),
     }
