@@ -2506,7 +2506,7 @@ async def h6_validate_v7(
         ) as client:
             universe_data = await build_universe(client)
             selected = universe_data[:count]
-            semaphore = asyncio.Semaphore(2)
+            semaphore = asyncio.Semaphore(8)
 
             async def worker(item):
                 async with semaphore:
@@ -5870,7 +5870,7 @@ def v20_public_state():
         "mode": "RESEARCH_PAPER_ONLY",
         "trading": False,
         "orders": False,
-        "strategy": "V20_FROZEN_CANDIDATE_B_FORWARD_PAPER",
+        "strategy": "V23_CANDIDATE_B_ALL_ELIGIBLE_UNIVERSE_FORWARD_PAPER",
         "started_utc": V20_STATE["started_utc"],
         "open_count": len(V20_STATE["open"]),
         "closed_count": len(closed),
@@ -5893,7 +5893,10 @@ async def v20_scan_once():
     after the completed 60m continuation observation.
     """
     async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
-        universe = (await build_universe(client))[:10]
+        universe = await build_universe(client)
+        # V23: scan the entire eligible dynamic Binance USDT spot universe.
+        # build_universe() keeps the existing liquidity/safety exclusions;
+        # there is no longer a top-10 cap.
 
         semaphore = asyncio.Semaphore(2)
 
@@ -6247,8 +6250,9 @@ async def v21_status():
         "mode": "RESEARCH_PAPER_ONLY",
         "trading": False,
         "orders": False,
-        "strategy": "V20_FROZEN_CANDIDATE_B_FORWARD_PAPER",
-        "strategy_changed": False,
+        "strategy": "V23_CANDIDATE_B_ALL_ELIGIBLE_UNIVERSE_FORWARD_PAPER",
+        "strategy_changed": True,
+        "strategy_change": "Universe expanded from 10 coins to all eligible dynamic Binance USDT spot coins; signal thresholds unchanged.",
         "automation": {
             "enabled": True,
             "scan_interval_seconds": V21_SCAN_INTERVAL_SECONDS,
@@ -6395,8 +6399,9 @@ async def v22_status():
         "mode": "RESEARCH_PAPER_ONLY",
         "trading": False,
         "orders": False,
-        "strategy": "V20_FROZEN_CANDIDATE_B_FORWARD_PAPER",
-        "strategy_changed": False,
+        "strategy": "V23_CANDIDATE_B_ALL_ELIGIBLE_UNIVERSE_FORWARD_PAPER",
+        "strategy_changed": True,
+        "strategy_change": "Universe expanded from 10 coins to all eligible dynamic Binance USDT spot coins; signal thresholds unchanged.",
         "automation": {
             "enabled": True,
             "scan_interval_seconds": V21_SCAN_INTERVAL_SECONDS,
@@ -6442,6 +6447,48 @@ async def v22_scan_now():
         "orders": False,
         "signal": bool(result.get("new_entries")),
         "scan": result,
+        "paper": v20_public_state(),
+        "generated_utc": utc_now(),
+    }
+
+
+@app.get("/v23-status")
+async def v23_status():
+    return {
+        "model": MODEL,
+        "mode": "RESEARCH_PAPER_ONLY",
+        "trading": False,
+        "orders": False,
+        "strategy": "V23_CANDIDATE_B_ALL_ELIGIBLE_UNIVERSE_FORWARD_PAPER",
+        "strategy_changed": True,
+        "strategy_change": (
+            "Universe expanded from 10 coins to all eligible dynamic Binance "
+            "USDT spot coins. Candidate B thresholds are unchanged, but "
+            "cross-sectional Top 20% ranking and ALT market mean are now "
+            "computed over the expanded universe."
+        ),
+        "universe": {
+            "mode": "ALL_ELIGIBLE_DYNAMIC",
+            "fixed_coin_count": False,
+            "note": (
+                "Existing build_universe liquidity/safety exclusions remain; "
+                "there is no top-10 cap."
+            ),
+        },
+        "automation": {
+            "enabled": True,
+            "scan_interval_seconds": V21_SCAN_INTERVAL_SECONDS,
+            "last_scan": V21_LAST_SCAN,
+        },
+        "persistence": {
+            "database_configured": bool(V21_DB_URL),
+            "backend": "POSTGRESQL" if V21_DB_URL else "MEMORY_ONLY",
+        },
+        "telegram": {
+            "configured": bool(V22_TG_TOKEN and V22_TG_CHAT_ID),
+            "entry_notifications": True,
+            "exit_notifications": True,
+        },
         "paper": v20_public_state(),
         "generated_utc": utc_now(),
     }
