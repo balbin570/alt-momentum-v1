@@ -7925,7 +7925,7 @@ V32_SCAN_INTERVAL_SECONDS = 300
 def v32_db_init():
     if not V21_DB_URL:
         return
-    with psycopg.connect(V21_DB_URL) as conn:
+    with v21_db_connect() as conn:
         with conn.cursor() as cur:
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS alt_v32_paper_state (
@@ -7948,7 +7948,7 @@ def v32_save_state():
     if not V21_DB_URL:
         return
     payload = json.dumps(v32_serializable_state())
-    with psycopg.connect(V21_DB_URL) as conn:
+    with v21_db_connect() as conn:
         with conn.cursor() as cur:
             cur.execute("""
                 INSERT INTO alt_v32_paper_state (id, payload, updated_at)
@@ -7961,7 +7961,7 @@ def v32_save_state():
 def v32_load_state():
     if not V21_DB_URL:
         return
-    with psycopg.connect(V21_DB_URL) as conn:
+    with v21_db_connect() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT payload FROM alt_v32_paper_state WHERE id = 1")
             row = cur.fetchone()
