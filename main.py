@@ -7496,3 +7496,173 @@ async def v29_topn_block(
             "error": str(e),
             "generated_utc": utc_now(),
         }
+
+
+
+# ============================================================
+# V30 TOP-1 CONFIRMATION WINDOW CHALLENGER: 30 / 45 / 60 MIN
+# Research only. V27 forward paper remains untouched.
+# Threshold stays +0.75% for every window; exit stays +120m.
+# ============================================================
+
+def v30_build_window_rows(base_ranked, candles_by_symbol, snapshots, btc_full, confirm_minutes):
+    steps = confirm_minutes // 5
+    out = []
+    for e in base_ranked:
+        if e["relative_momentum_z"] < 1.0:
+            continue
+        if e["cross_section_percentile"] < 0.80:
+            continue
+
+        candles = candles_by_symbol.get(e["symbol"])
+        if not candles:
+            continue
+
+        # Find the candle whose close_time equals the original signal timestamp.
+        idx = None
+        for j, c in enumerate(candles):
+            if c["close_time"] == e["signal_time_ms"]:
+                idx = j
+                break
+        if idx is None or idx + steps + 24 >= len(candles):
+            continue
+
+        signal_close = candles[idx]["close"]
+        checkpoint_open = candles[idx + steps + 1]["open"]
+        cont_pct = pct_change(signal_close, checkpoint_open)
+        if cont_pct < 0.75:
+            continue
+
+        vals = snapshots.get(e["signal_time_ms"], [])
+        if not vals:
+            continue
+        alt_mean = mean(vals)
+        if alt_mean >= 0.5:
+            continue
+
+        # Fixed +120m exit from the chosen confirmation entry.
+        exit_open = candles[idx + steps + 1 + 24]["open"]
+        gross120 = pct_change(checkpoint_open, exit_open)
+        net120 = gross120 - V28_COST_PCT
+
+        x = dict(e)
+        x["confirmation_minutes"] = confirm_minutes
+        x["cont_60m_pct"] = cont_pct  # reused by V29 ranking helper; now means chosen window continuation
+        x["entry_open_time_ms"] = candles[idx + steps + 1]["open_time"]
+        x["entry_price"] = checkpoint_open
+        x["net60_entry_120m_pct"] = net120
+        x["alt_market_mean_30m_pct"] = alt_mean
+        reg = btc_regime_at_v17(btc_full, e["signal_time_ms"])
+        x["btc_trend"] = reg["btc_trend"] if reg else "UNKNOWN"
+        out.append(x)
+    return out
+
+
+@app.get("/v30-confirmation-top1")
+async def v30_confirmation_top1(
+    days_ago: int = Query(default=0, ge=0, le=27),
+    window_days: int = Query(default=3, ge=2, le=3),
+):
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(180.0)) as client:
+            universe = await build_universe(client)
+            semaphore = asyncio.Semaphore(10)
+
+            async def fetch(item):
+                async with semaphore:
+                    try:
+                        c = await v28_get_5m_candles_window(
+                            client, item["symbol"], days_ago, window_days
+                        )
+                        return item["symbol"], c, None
+                    except Exception as e:
+                        return item["symbol"], None, str(e)
+
+            fetched = await asyncio.gather(*[fetch(x) for x in universe])
+            good = {sym: c for sym, c, err in fetched if c}
+            errors = [{"symbol": sym, "error": err} for sym, c, err in fetched if err]
+            btc_days = min(30, days_ago + window_days + 2)
+            btc_full = await get_5m_candles_days(client, "BTCUSDT", btc_days)
+
+        raw = []
+        for sym, candles in good.items():
+            raw.extend(v28_base_signals(candles, sym))
+
+        by_time = {}
+        for e in raw:
+            by_time.setdefault(e["signal_time_ms"], []).append(e)
+
+        ranked = []
+        for group in by_time.values():
+            if len(group) < 5:
+                continue
+            ordered = sorted(group, key=lambda x: x["relative_momentum_z"])
+            n = len(ordered)
+            for idx, e in enumerate(ordered):
+                x = dict(e)
+                x["cross_section_percentile"] = idx / (n - 1) if n > 1 else 1.0
+                ranked.append(x)
+
+        snapshots = {}
+        for sym, candles in good.items():
+            for i in range(6, len(candles)):
+                t = candles[i]["close_time"]
+                snapshots.setdefault(t, []).append(
+                    pct_change(candles[i-6]["close"], candles[i]["close"])
+                )
+
+        comparisons = {}
+        for mins in (30, 45, 60):
+            rows = v30_build_window_rows(ranked, good, snapshots, btc_full, mins)
+            top1 = v29_select_topn_with_cd60(rows, 1)
+            comparisons[f"TOP1_CONFIRM_{mins}M"] = {
+                "entry_count": len(top1),
+                "active_days": len({
+                    datetime.fromtimestamp(r["signal_time_ms"]/1000, tz=timezone.utc).date().isoformat()
+                    for r in top1
+                }),
+                "net_120m": v28_stats(top1, "net60_entry_120m_pct"),
+            }
+
+        return {
+            **MODE_INFO,
+            "status": "OK",
+            "diagnostic": "V30_TOP1_CONFIRMATION_30_45_60",
+            "v27_forward_untouched": True,
+            "v29_forward_untouched": True,
+            "strategy_changed": False,
+            "trading": False,
+            "orders": False,
+            "days_ago": days_ago,
+            "window_days": window_days,
+            "universe_size": len(universe),
+            "symbols_fetched": len(good),
+            "fetch_errors": errors,
+            "frozen_rules": {
+                "relative_momentum_z_min": 1.0,
+                "cross_section_percentile_min": 0.80,
+                "continuation_threshold_pct": 0.75,
+                "alt_market_mean_30m_max_pct": 0.5,
+                "btc_filter": "NONE",
+                "selection": "TOP1 by observed continuation at decision time",
+                "same_symbol_cooldown_minutes": 60,
+                "round_trip_cost_pct": V28_COST_PCT,
+                "exit_after_entry_minutes": 120,
+                "lookahead_used_for_selection": False,
+            },
+            "comparison": comparisons,
+            "important_note": (
+                "Only confirmation duration changes: 30m vs 45m vs 60m. "
+                "The +0.75% threshold and 120m post-entry exit are identical."
+            ),
+            "generated_utc": utc_now(),
+        }
+    except Exception as e:
+        return {
+            **MODE_INFO,
+            "status": "ERROR",
+            "diagnostic": "V30_TOP1_CONFIRMATION_30_45_60",
+            "v27_forward_untouched": True,
+            "error": str(e),
+            "generated_utc": utc_now(),
+        }
