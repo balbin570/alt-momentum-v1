@@ -7255,3 +7255,244 @@ async def v28_btc_block(
             "error": str(e),
             "generated_utc": utc_now(),
         }
+
+
+
+# ============================================================
+# V29 TOP-N CONTINUATION RANKING — LIGHT 3-DAY BLOCK
+# Research only. V27 forward paper remains untouched.
+# Ranking uses information already known at the 60m decision point.
+# ============================================================
+
+def v29_select_topn_with_cd60(rows, top_n=None):
+    """
+    Chronological paper selection.
+    At each signal timestamp:
+      1) remove symbols still inside their 60m cooldown,
+      2) rank remaining candidates by observed 60m continuation,
+         then z-score, then cross-sectional percentile,
+      3) keep ALL or Top-N.
+    No future-return field is used in ranking.
+    """
+    by_time = {}
+    for r in rows:
+        by_time.setdefault(r["signal_time_ms"], []).append(r)
+
+    last_selected = {}
+    gap = 60 * 60 * 1000
+    selected = []
+
+    for t in sorted(by_time):
+        available = []
+        for r in by_time[t]:
+            last = last_selected.get(r["symbol"])
+            if last is None or t - last >= gap:
+                available.append(r)
+
+        ordered = sorted(
+            available,
+            key=lambda r: (
+                float(r.get("cont_60m_pct", 0.0)),
+                float(r.get("relative_momentum_z", 0.0)),
+                float(r.get("cross_section_percentile", 0.0)),
+            ),
+            reverse=True,
+        )
+
+        chosen = ordered if top_n is None else ordered[:top_n]
+        for r in chosen:
+            selected.append(r)
+            last_selected[r["symbol"]] = t
+
+    return selected
+
+
+def v29_selected_summary(rows):
+    days_seen = len({
+        datetime.fromtimestamp(r["signal_time_ms"] / 1000, tz=timezone.utc).date().isoformat()
+        for r in rows
+    })
+    return {
+        "entry_count": len(rows),
+        "active_days": days_seen,
+        "entries_per_active_day": round(len(rows) / days_seen, 2) if days_seen else 0,
+        "net_60m": v28_stats(rows, "net60_entry_60m_pct"),
+        "net_120m": v28_stats(rows, "net60_entry_120m_pct"),
+    }
+
+
+@app.get("/v29-topn-block")
+async def v29_topn_block(
+    days_ago: int = Query(default=0, ge=0, le=27),
+    window_days: int = Query(default=3, ge=2, le=3),
+):
+    """
+    Render-Free friendly V29 challenger.
+
+    Frozen Candidate-B core:
+      z >= 1
+      cross-sectional percentile >= 0.80
+      observed 60m continuation >= +0.75%
+      selected-alt mean 30m < +0.5%
+      entry = 60m checkpoint OPEN
+      fixed cost = 0.15%
+      same-symbol cooldown = 60m
+
+    Main challenger has NO BTC filter.
+    Compare ALL vs Top1 vs Top3 vs Top5 at each timestamp.
+    BTC_BULL ALL is retained only as the V27-style control.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(180.0)) as client:
+            universe = await build_universe(client)
+            semaphore = asyncio.Semaphore(10)
+
+            async def fetch(item):
+                async with semaphore:
+                    try:
+                        c = await v28_get_5m_candles_window(
+                            client, item["symbol"], days_ago, window_days
+                        )
+                        return item["symbol"], c, None
+                    except Exception as e:
+                        return item["symbol"], None, str(e)
+
+            fetched = await asyncio.gather(*[fetch(x) for x in universe])
+            good = {s: c for s, c, err in fetched if c}
+            errors = [{"symbol": s, "error": err} for s, c, err in fetched if err]
+
+            btc_days = min(30, days_ago + window_days + 2)
+            btc_full = await get_5m_candles_days(client, "BTCUSDT", btc_days)
+
+        raw = []
+        for sym, candles in good.items():
+            raw.extend(v28_base_signals(candles, sym))
+
+        # Cross-sectional z rank at each signal timestamp.
+        by_time = {}
+        for e in raw:
+            by_time.setdefault(e["signal_time_ms"], []).append(e)
+
+        ranked = []
+        for group in by_time.values():
+            if len(group) < 5:
+                continue
+            ordered = sorted(group, key=lambda x: x["relative_momentum_z"])
+            n = len(ordered)
+            for idx, e in enumerate(ordered):
+                x = dict(e)
+                x["cross_section_percentile"] = idx / (n - 1) if n > 1 else 1.0
+                ranked.append(x)
+
+        # True selected-alt 30m market mean at the same signal timestamp.
+        snapshots = {}
+        for sym, candles in good.items():
+            for i in range(6, len(candles)):
+                t = candles[i]["close_time"]
+                snapshots.setdefault(t, []).append(
+                    pct_change(candles[i-6]["close"], candles[i]["close"])
+                )
+
+        core = []
+        for e in ranked:
+            if e["relative_momentum_z"] < 1.0:
+                continue
+            if e["cross_section_percentile"] < 0.80:
+                continue
+            if e["cont_60m_pct"] < 0.75:
+                continue
+
+            vals = snapshots.get(e["signal_time_ms"], [])
+            if not vals:
+                continue
+            alt_mean = mean(vals)
+            if alt_mean >= 0.5:
+                continue
+
+            x = dict(e)
+            x["alt_market_mean_30m_pct"] = alt_mean
+            reg = btc_regime_at_v17(btc_full, e["signal_time_ms"])
+            x["btc_trend"] = reg["btc_trend"] if reg else "UNKNOWN"
+            core.append(x)
+
+        all_sel = v29_select_topn_with_cd60(core, None)
+        top1 = v29_select_topn_with_cd60(core, 1)
+        top3 = v29_select_topn_with_cd60(core, 3)
+        top5 = v29_select_topn_with_cd60(core, 5)
+
+        bull_core = [r for r in core if r.get("btc_trend") == "BTC_BULL"]
+        bull_all = v29_select_topn_with_cd60(bull_core, None)
+
+        # Concentration before Top-N selection.
+        candidate_counts = {}
+        for r in core:
+            candidate_counts[r["signal_time_ms"]] = candidate_counts.get(r["signal_time_ms"], 0) + 1
+        cc = list(candidate_counts.values())
+
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        day_ms = 24 * 60 * 60 * 1000
+        end_ms = now_ms - days_ago * day_ms
+        start_ms = end_ms - window_days * day_ms
+
+        return {
+            **MODE_INFO,
+            "status": "OK",
+            "diagnostic": "V29_TOPN_CONTINUATION_RANKING_LIGHT_BLOCK",
+            "v27_forward_untouched": True,
+            "strategy_changed": False,
+            "trading": False,
+            "orders": False,
+            "days_ago": days_ago,
+            "window_days": window_days,
+            "window_start_utc": datetime.fromtimestamp(start_ms/1000, tz=timezone.utc).isoformat(),
+            "window_end_utc": datetime.fromtimestamp(end_ms/1000, tz=timezone.utc).isoformat(),
+            "universe_size": len(universe),
+            "symbols_fetched": len(good),
+            "fetch_errors": errors,
+            "frozen_core": {
+                "relative_momentum_z_min": 1.0,
+                "cross_section_percentile_min": 0.80,
+                "continuation_60m_min_pct": 0.75,
+                "alt_market_mean_30m_max_pct": 0.5,
+                "btc_filter_for_v29": "NONE",
+                "entry": "60m checkpoint OPEN",
+                "round_trip_cost_pct": V28_COST_PCT,
+                "same_symbol_cooldown_minutes": 60,
+            },
+            "ranking_rule": {
+                "primary": "observed_continuation_60m_pct_DESC",
+                "tie_break_1": "relative_momentum_z_DESC",
+                "tie_break_2": "cross_section_percentile_DESC",
+                "lookahead_used": False,
+            },
+            "comparison": {
+                "V29_ALL_NO_BTC_FILTER": v29_selected_summary(all_sel),
+                "V29_TOP1": v29_selected_summary(top1),
+                "V29_TOP3": v29_selected_summary(top3),
+                "V29_TOP5": v29_selected_summary(top5),
+                "V27_STYLE_BTC_BULL_ALL_CONTROL": v29_selected_summary(bull_all),
+            },
+            "candidate_concentration": {
+                "distinct_signal_times": len(cc),
+                "max_candidates_same_timestamp": max(cc) if cc else 0,
+                "mean_candidates_same_timestamp": round(mean(cc), 2) if cc else 0,
+                "timestamps_with_ge_5_candidates": sum(1 for x in cc if x >= 5),
+                "timestamps_with_ge_10_candidates": sum(1 for x in cc if x >= 10),
+            },
+            "important_note": (
+                "Top-N ranking uses only data known by the 60m decision point. "
+                "This endpoint is diagnostic only and does not modify V27 forward state."
+            ),
+            "generated_utc": utc_now(),
+        }
+
+    except Exception as e:
+        return {
+            **MODE_INFO,
+            "status": "ERROR",
+            "diagnostic": "V29_TOPN_CONTINUATION_RANKING_LIGHT_BLOCK",
+            "v27_forward_untouched": True,
+            "days_ago": days_ago,
+            "error": str(e),
+            "generated_utc": utc_now(),
+        }
