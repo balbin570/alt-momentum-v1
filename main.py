@@ -7046,3 +7046,178 @@ async def v28_btc_independent(days: int = Query(default=3, ge=2, le=7)):
             "error": str(e),
             "generated_utc": utc_now(),
         }
+
+
+# ============================================================
+# V28 30-DAY BTC-INDEPENDENT BLOCK VALIDATION
+# Research only. V27 forward paper state/thresholds are untouched.
+# ============================================================
+
+def v28_block_stats(rows, start_ms, end_ms):
+    part = [r for r in rows if start_ms <= r["signal_time_ms"] < end_ms]
+    return v28_group_summary(part)
+
+
+@app.get("/v28-btc-validate30")
+async def v28_btc_validate30(days: int = Query(default=30, ge=10, le=30)):
+    """
+    Frozen comparison:
+      V27-style = core + BTC_BULL
+      V28 challenger = same core with NO BTC FILTER
+    Uses same-symbol 60m cooldown and reports sequential 5-day blocks.
+    No forward-paper state is modified.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(240.0)) as client:
+            universe = await build_universe(client)
+            semaphore = asyncio.Semaphore(10)
+
+            async def fetch(item):
+                async with semaphore:
+                    try:
+                        c = await get_5m_candles_days(client, item["symbol"], days)
+                        return item["symbol"], c, None
+                    except Exception as e:
+                        return item["symbol"], None, str(e)
+
+            fetched = await asyncio.gather(*[fetch(x) for x in universe])
+            good = {s: c for s, c, err in fetched if c}
+            errors = [{"symbol": s, "error": err} for s, c, err in fetched if err]
+            btc = await get_5m_candles_days(client, "BTCUSDT", days)
+
+        raw = []
+        for sym, candles in good.items():
+            raw.extend(v28_base_signals(candles, sym))
+
+        by_time = {}
+        for e in raw:
+            by_time.setdefault(e["signal_time_ms"], []).append(e)
+
+        ranked = []
+        for group in by_time.values():
+            if len(group) < 5:
+                continue
+            ordered = sorted(group, key=lambda x: x["relative_momentum_z"])
+            n = len(ordered)
+            for idx, e in enumerate(ordered):
+                x = dict(e)
+                x["cross_section_percentile"] = idx / (n - 1) if n > 1 else 1.0
+                ranked.append(x)
+
+        snapshots = {}
+        for sym, candles in good.items():
+            for i in range(6, len(candles)):
+                t = candles[i]["close_time"]
+                snapshots.setdefault(t, []).append(
+                    pct_change(candles[i-6]["close"], candles[i]["close"])
+                )
+
+        core = []
+        for e in ranked:
+            if e["relative_momentum_z"] < 1.0:
+                continue
+            if e["cross_section_percentile"] < 0.80:
+                continue
+            if e["cont_60m_pct"] < 0.75:
+                continue
+
+            vals = snapshots.get(e["signal_time_ms"], [])
+            if not vals:
+                continue
+            alt_mean = mean(vals)
+            if alt_mean >= 0.5:
+                continue
+
+            x = dict(e)
+            x["alt_market_mean_30m_pct"] = alt_mean
+            reg = btc_regime_at_v17(btc, e["signal_time_ms"])
+            if reg:
+                x["btc_trend"] = reg["btc_trend"]
+                x["btc_4h_pct"] = reg["btc_4h_pct"]
+                x["btc_24h_pct"] = reg["btc_24h_pct"]
+            else:
+                x["btc_trend"] = "UNKNOWN"
+            core.append(x)
+
+        no_btc = core
+        btc_bull = [x for x in core if x["btc_trend"] == "BTC_BULL"]
+
+        # Common chronological window from actual fetched candles.
+        all_times = sorted({r["signal_time_ms"] for r in core})
+        blocks = []
+        if all_times:
+            day_ms = 24 * 60 * 60 * 1000
+            first_day = (all_times[0] // day_ms) * day_ms
+            last_time = max(all_times)
+            block_start = first_day
+            block_no = 1
+            while block_start <= last_time:
+                block_end = block_start + 5 * day_ms
+                blocks.append({
+                    "block": block_no,
+                    "start_utc": datetime.fromtimestamp(block_start/1000, tz=timezone.utc).isoformat(),
+                    "end_utc_exclusive": datetime.fromtimestamp(block_end/1000, tz=timezone.utc).isoformat(),
+                    "NO_BTC_FILTER_V28": v28_block_stats(no_btc, block_start, block_end),
+                    "BTC_BULL_V27_STYLE": v28_block_stats(btc_bull, block_start, block_end),
+                })
+                block_no += 1
+                block_start = block_end
+
+        # Same-timestamp concentration after CD60, useful for future forward capacity decisions.
+        indep = v28_cd60(no_btc)
+        by_entry_time = {}
+        for r in indep:
+            by_entry_time[r["signal_time_ms"]] = by_entry_time.get(r["signal_time_ms"], 0) + 1
+        concurrency = sorted(by_entry_time.values()) if by_entry_time else []
+        concurrency_summary = {
+            "distinct_signal_times": len(concurrency),
+            "max_same_timestamp_entries": max(concurrency) if concurrency else 0,
+            "mean_same_timestamp_entries": round(mean(concurrency), 2) if concurrency else 0,
+            "timestamps_with_ge_5_entries": sum(1 for x in concurrency if x >= 5),
+            "timestamps_with_ge_10_entries": sum(1 for x in concurrency if x >= 10),
+        }
+
+        return {
+            **MODE_INFO,
+            "status": "OK",
+            "diagnostic": "V28_30D_BTC_INDEPENDENT_BLOCK_VALIDATION",
+            "v27_forward_untouched": True,
+            "strategy_changed": False,
+            "trading": False,
+            "orders": False,
+            "days": days,
+            "universe_size": len(universe),
+            "symbols_fetched": len(good),
+            "fetch_errors": errors,
+            "frozen_core": {
+                "relative_momentum_z_min": 1.0,
+                "cross_section_percentile_min": 0.80,
+                "continuation_60m_min_pct": 0.75,
+                "alt_market_mean_30m_max_pct": 0.5,
+                "entry": "60m checkpoint OPEN",
+                "round_trip_cost_pct": V28_COST_PCT,
+                "same_symbol_cooldown_minutes": 60,
+            },
+            "overall": {
+                "NO_BTC_FILTER_V28": v28_group_summary(no_btc),
+                "BTC_BULL_V27_STYLE": v28_group_summary(btc_bull),
+            },
+            "five_day_blocks": blocks,
+            "signal_concentration_no_btc": concurrency_summary,
+            "decision_rule": (
+                "BTC-independent challenger is favored only if the larger sample "
+                "materially increases independent entries without relying on one or two "
+                "5-day blocks, while net mean/median/PF remain acceptable versus BTC_BULL."
+            ),
+            "generated_utc": utc_now(),
+        }
+
+    except Exception as e:
+        return {
+            **MODE_INFO,
+            "status": "ERROR",
+            "diagnostic": "V28_30D_BTC_INDEPENDENT_BLOCK_VALIDATION",
+            "v27_forward_untouched": True,
+            "error": str(e),
+            "generated_utc": utc_now(),
+        }
