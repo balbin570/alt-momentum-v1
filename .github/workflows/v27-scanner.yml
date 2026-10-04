@@ -1,0 +1,20 @@
+name: V27 Forward Paper Scanner
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+
+    steps:
+      - name: Wake Render and run V27 paper scan
+        run: |
+          curl --fail --show-error --silent \
+            --max-time 180 \
+            --retry 2 \
+            --retry-delay 10 \
+            "https://alt-momentum-v1.onrender.com/v22-scan-now"
