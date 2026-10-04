@@ -8310,3 +8310,111 @@ async def v32_scan_now():
         "paper": v32_public_state(),
         "generated_utc": utc_now(),
     }
+
+
+
+# ============================================================
+# V33 READ-ONLY FORWARD COMPARISON PANEL
+# Reads V27 + V32 paper state only. Does not scan, trade, or mutate strategy state.
+# ============================================================
+
+def v33_stats_from_closed(closed):
+    vals = [float(x.get("net_pct", 0.0)) for x in closed]
+    n = len(vals)
+    if not n:
+        return {
+            "closed_count": 0, "wins": 0, "losses": 0, "win_rate_pct": None,
+            "mean_net_pct": None, "median_net_pct": None, "profit_factor": None,
+            "compound_return_pct": 0.0, "max_drawdown_pct": 0.0,
+        }
+    wins = sum(v > 0 for v in vals)
+    losses = sum(v <= 0 for v in vals)
+    gp = sum(v for v in vals if v > 0)
+    gl = -sum(v for v in vals if v < 0)
+    equity = 100.0
+    peak = 100.0
+    max_dd = 0.0
+    for v in vals:
+        equity *= 1.0 + v / 100.0
+        peak = max(peak, equity)
+        if peak > 0:
+            max_dd = min(max_dd, (equity / peak - 1.0) * 100.0)
+    ordered = sorted(vals)
+    mid = n // 2
+    med = ordered[mid] if n % 2 else (ordered[mid-1] + ordered[mid]) / 2.0
+    return {
+        "closed_count": n,
+        "wins": wins,
+        "losses": losses,
+        "win_rate_pct": round(100.0 * wins / n, 2),
+        "mean_net_pct": round(sum(vals) / n, 4),
+        "median_net_pct": round(med, 4),
+        "profit_factor": round(gp / gl, 4) if gl > 0 else (None if gp == 0 else "INF"),
+        "compound_return_pct": round(equity - 100.0, 4),
+        "max_drawdown_pct": round(max_dd, 4),
+    }
+
+def v33_v27_snapshot():
+    # Existing V27/V21 state is read only.
+    st = V21_PAPER_STATE
+    return {
+        "label": "V27_BTC_BULL_CANDIDATE_B",
+        "started_utc": st.get("started_utc"),
+        "open_count": len(st.get("open", {})),
+        "stats": v33_stats_from_closed(st.get("closed", [])),
+        "open_positions": list(st.get("open", {}).values()),
+        "recent_closed": st.get("closed", [])[-10:],
+    }
+
+def v33_v32_snapshot():
+    st = V32_STATE
+    return {
+        "label": "V32_NO_BTC_TOP1_60M",
+        "started_utc": st.get("started_utc"),
+        "open_count": len(st.get("open", {})),
+        "stats": v33_stats_from_closed(st.get("closed", [])),
+        "open_positions": list(st.get("open", {}).values()),
+        "recent_closed": st.get("closed", [])[-10:],
+    }
+
+@app.get("/v33-comparison")
+async def v33_comparison():
+    a = v33_v27_snapshot()
+    b = v33_v32_snapshot()
+    sa, sb = a["stats"], b["stats"]
+    return {
+        **MODE_INFO,
+        "status": "OK",
+        "panel": "V33_READ_ONLY_FORWARD_COMPARISON",
+        "research_only": True,
+        "trading": False,
+        "orders": False,
+        "mutates_v27": False,
+        "mutates_v32": False,
+        "v27": a,
+        "v32": b,
+        "difference_v32_minus_v27": {
+            "closed_count": sb["closed_count"] - sa["closed_count"],
+            "mean_net_pct": (
+                round(sb["mean_net_pct"] - sa["mean_net_pct"], 4)
+                if sb["mean_net_pct"] is not None and sa["mean_net_pct"] is not None else None
+            ),
+            "median_net_pct": (
+                round(sb["median_net_pct"] - sa["median_net_pct"], 4)
+                if sb["median_net_pct"] is not None and sa["median_net_pct"] is not None else None
+            ),
+            "win_rate_pct_points": (
+                round(sb["win_rate_pct"] - sa["win_rate_pct"], 2)
+                if sb["win_rate_pct"] is not None and sa["win_rate_pct"] is not None else None
+            ),
+            "compound_return_pct_points": round(
+                sb["compound_return_pct"] - sa["compound_return_pct"], 4
+            ),
+        },
+        "comparison_note": (
+            "Descriptive forward-paper comparison only. Do not rank strategies from a very small "
+            "number of closed trades. V27 and V32 have different selection rules and may have "
+            "different trade counts."
+        ),
+        "generated_utc": utc_now(),
+    }
