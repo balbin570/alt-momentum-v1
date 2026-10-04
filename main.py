@@ -8463,3 +8463,74 @@ async def v33_comparison():
         ),
         "generated_utc": utc_now(),
     }
+
+
+# ============================================================
+# V34 READ-ONLY WINNER / LOSER DIAGNOSTIC
+# No strategy mutation, no scans, no orders.
+# ============================================================
+
+def v34_num(x):
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return None
+
+def v34_group_stats(rows, fields):
+    out = {"n": len(rows)}
+    for field in fields:
+        vals = [v34_num(r.get(field)) for r in rows]
+        vals = [v for v in vals if v is not None]
+        if not vals:
+            out[field] = {"mean": None, "median": None}
+            continue
+        vals2 = sorted(vals)
+        n = len(vals2)
+        med = vals2[n//2] if n % 2 else (vals2[n//2-1] + vals2[n//2]) / 2
+        out[field] = {
+            "mean": round(sum(vals)/len(vals), 4),
+            "median": round(med, 4),
+        }
+    return out
+
+def v34_diag(rows, continuation_field):
+    closed = [r for r in rows if r.get("status") == "CLOSED_PAPER" and v34_num(r.get("net_pct")) is not None]
+    winners = [r for r in closed if float(r["net_pct"]) > 0]
+    losers = [r for r in closed if float(r["net_pct"]) <= 0]
+
+    fields = [
+        "relative_momentum_z",
+        "cross_section_percentile",
+        continuation_field,
+        "alt_market_mean_30m_pct",
+        "net_pct",
+    ]
+    # V27 has BTC fields; V32 intentionally does not use/store them.
+    if any("btc_4h_pct" in r for r in closed):
+        fields += ["btc_4h_pct", "btc_24h_pct"]
+
+    return {
+        "closed_count": len(closed),
+        "winner_count": len(winners),
+        "loser_or_flat_count": len(losers),
+        "winner_stats": v34_group_stats(winners, fields),
+        "loser_or_flat_stats": v34_group_stats(losers, fields),
+        "warning": "Descriptive only. Small samples and outliers can dominate means; do not change thresholds from this panel alone."
+    }
+
+@app.get("/v34-diagnostic")
+async def v34_diagnostic():
+    return {
+        "model": "ALT-MOMENTUM-V1",
+        "mode": "RESEARCH_PAPER_ONLY",
+        "status": "OK",
+        "panel": "V34_READ_ONLY_WINNER_LOSER_DIAGNOSTIC",
+        "trading": False,
+        "orders": False,
+        "mutates_v27": False,
+        "mutates_v32": False,
+        "runs_extra_market_scan": False,
+        "v27": v34_diag(V20_STATE.get("closed", []), "wait_end_change_pct"),
+        "v32": v34_diag(V32_STATE.get("closed", []), "continuation_60m_pct"),
+        "interpretation_note": "Compare winner vs loser distributions only after enough forward-paper trades accumulate. This endpoint reads existing paper state and does not alter frozen rules."
+    }
