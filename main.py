@@ -7049,33 +7049,80 @@ async def v28_btc_independent(days: int = Query(default=3, ge=2, le=7)):
 
 
 # ============================================================
-# V28 30-DAY BTC-INDEPENDENT BLOCK VALIDATION
-# Research only. V27 forward paper state/thresholds are untouched.
+# V28 LIGHT: 5-DAY BLOCK BTC-INDEPENDENT VALIDATION
+# Render-Free friendly. Research only. V27 forward untouched.
 # ============================================================
 
-def v28_block_stats(rows, start_ms, end_ms):
-    part = [r for r in rows if start_ms <= r["signal_time_ms"] < end_ms]
-    return v28_group_summary(part)
+async def v28_get_5m_candles_window(client, symbol, days_ago=0, window_days=5):
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    day_ms = 24 * 60 * 60 * 1000
+    end_ms = now_ms - (days_ago * day_ms)
+    start_ms = end_ms - (window_days * day_ms)
+
+    cursor_end = end_ms
+    by_open = {}
+    max_pages = max(3, int((window_days * 288) / 1000) + 3)
+
+    for _ in range(max_pages):
+        raw = await get_json(
+            client,
+            "/api/v3/klines",
+            params={
+                "symbol": symbol,
+                "interval": "5m",
+                "limit": 1000,
+                "endTime": cursor_end,
+            },
+        )
+        if not raw:
+            break
+
+        oldest = int(raw[0][0])
+        for k in raw:
+            ot = int(k[0])
+            ct = int(k[6])
+            if ct >= end_ms or ot < start_ms:
+                continue
+            by_open[ot] = {
+                "open_time": ot,
+                "open": float(k[1]),
+                "high": float(k[2]),
+                "low": float(k[3]),
+                "close": float(k[4]),
+                "volume": float(k[5]),
+                "close_time": ct,
+            }
+
+        if oldest <= start_ms:
+            break
+        cursor_end = oldest - 1
+        await asyncio.sleep(0.02)
+
+    return sorted(by_open.values(), key=lambda x: x["open_time"])
 
 
-@app.get("/v28-btc-validate30")
-async def v28_btc_validate30(days: int = Query(default=30, ge=10, le=30)):
+@app.get("/v28-btc-block")
+async def v28_btc_block(
+    days_ago: int = Query(default=0, ge=0, le=25),
+    window_days: int = Query(default=5, ge=3, le=5),
+):
     """
+    One lightweight historical block.
     Frozen comparison:
-      V27-style = core + BTC_BULL
-      V28 challenger = same core with NO BTC FILTER
-    Uses same-symbol 60m cooldown and reports sequential 5-day blocks.
-    No forward-paper state is modified.
+      - V27 style: core + BTC_BULL
+      - V28 challenger: same core, no BTC filter
     """
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(240.0)) as client:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(180.0)) as client:
             universe = await build_universe(client)
             semaphore = asyncio.Semaphore(10)
 
             async def fetch(item):
                 async with semaphore:
                     try:
-                        c = await get_5m_candles_days(client, item["symbol"], days)
+                        c = await v28_get_5m_candles_window(
+                            client, item["symbol"], days_ago, window_days
+                        )
                         return item["symbol"], c, None
                     except Exception as e:
                         return item["symbol"], None, str(e)
@@ -7083,7 +7130,10 @@ async def v28_btc_validate30(days: int = Query(default=30, ge=10, le=30)):
             fetched = await asyncio.gather(*[fetch(x) for x in universe])
             good = {s: c for s, c, err in fetched if c}
             errors = [{"symbol": s, "error": err} for s, c, err in fetched if err]
-            btc = await get_5m_candles_days(client, "BTCUSDT", days)
+
+            # BTC needs enough history before block start for 24h regime.
+            btc_days = min(30, days_ago + window_days + 2)
+            btc_full = await get_5m_candles_days(client, "BTCUSDT", btc_days)
 
         raw = []
         for sym, candles in good.items():
@@ -7130,7 +7180,7 @@ async def v28_btc_validate30(days: int = Query(default=30, ge=10, le=30)):
 
             x = dict(e)
             x["alt_market_mean_30m_pct"] = alt_mean
-            reg = btc_regime_at_v17(btc, e["signal_time_ms"])
+            reg = btc_regime_at_v17(btc_full, e["signal_time_ms"])
             if reg:
                 x["btc_trend"] = reg["btc_trend"]
                 x["btc_4h_pct"] = reg["btc_4h_pct"]
@@ -7140,52 +7190,33 @@ async def v28_btc_validate30(days: int = Query(default=30, ge=10, le=30)):
             core.append(x)
 
         no_btc = core
-        btc_bull = [x for x in core if x["btc_trend"] == "BTC_BULL"]
+        bull = [x for x in core if x["btc_trend"] == "BTC_BULL"]
+        mixed = [x for x in core if x["btc_trend"] == "BTC_MIXED"]
+        bear = [x for x in core if x["btc_trend"] == "BTC_BEAR"]
 
-        # Common chronological window from actual fetched candles.
-        all_times = sorted({r["signal_time_ms"] for r in core})
-        blocks = []
-        if all_times:
-            day_ms = 24 * 60 * 60 * 1000
-            first_day = (all_times[0] // day_ms) * day_ms
-            last_time = max(all_times)
-            block_start = first_day
-            block_no = 1
-            while block_start <= last_time:
-                block_end = block_start + 5 * day_ms
-                blocks.append({
-                    "block": block_no,
-                    "start_utc": datetime.fromtimestamp(block_start/1000, tz=timezone.utc).isoformat(),
-                    "end_utc_exclusive": datetime.fromtimestamp(block_end/1000, tz=timezone.utc).isoformat(),
-                    "NO_BTC_FILTER_V28": v28_block_stats(no_btc, block_start, block_end),
-                    "BTC_BULL_V27_STYLE": v28_block_stats(btc_bull, block_start, block_end),
-                })
-                block_no += 1
-                block_start = block_end
-
-        # Same-timestamp concentration after CD60, useful for future forward capacity decisions.
         indep = v28_cd60(no_btc)
-        by_entry_time = {}
+        by_t = {}
         for r in indep:
-            by_entry_time[r["signal_time_ms"]] = by_entry_time.get(r["signal_time_ms"], 0) + 1
-        concurrency = sorted(by_entry_time.values()) if by_entry_time else []
-        concurrency_summary = {
-            "distinct_signal_times": len(concurrency),
-            "max_same_timestamp_entries": max(concurrency) if concurrency else 0,
-            "mean_same_timestamp_entries": round(mean(concurrency), 2) if concurrency else 0,
-            "timestamps_with_ge_5_entries": sum(1 for x in concurrency if x >= 5),
-            "timestamps_with_ge_10_entries": sum(1 for x in concurrency if x >= 10),
-        }
+            by_t[r["signal_time_ms"]] = by_t.get(r["signal_time_ms"], 0) + 1
+        conc = list(by_t.values())
+
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        day_ms = 24 * 60 * 60 * 1000
+        end_ms = now_ms - days_ago * day_ms
+        start_ms = end_ms - window_days * day_ms
 
         return {
             **MODE_INFO,
             "status": "OK",
-            "diagnostic": "V28_30D_BTC_INDEPENDENT_BLOCK_VALIDATION",
+            "diagnostic": "V28_LIGHT_5D_BTC_INDEPENDENT_BLOCK",
             "v27_forward_untouched": True,
             "strategy_changed": False,
             "trading": False,
             "orders": False,
-            "days": days,
+            "days_ago": days_ago,
+            "window_days": window_days,
+            "window_start_utc": datetime.fromtimestamp(start_ms/1000, tz=timezone.utc).isoformat(),
+            "window_end_utc": datetime.fromtimestamp(end_ms/1000, tz=timezone.utc).isoformat(),
             "universe_size": len(universe),
             "symbols_fetched": len(good),
             "fetch_errors": errors,
@@ -7198,17 +7229,19 @@ async def v28_btc_validate30(days: int = Query(default=30, ge=10, le=30)):
                 "round_trip_cost_pct": V28_COST_PCT,
                 "same_symbol_cooldown_minutes": 60,
             },
-            "overall": {
+            "comparison": {
                 "NO_BTC_FILTER_V28": v28_group_summary(no_btc),
-                "BTC_BULL_V27_STYLE": v28_group_summary(btc_bull),
+                "BTC_BULL_V27_STYLE": v28_group_summary(bull),
+                "BTC_MIXED": v28_group_summary(mixed),
+                "BTC_BEAR": v28_group_summary(bear),
             },
-            "five_day_blocks": blocks,
-            "signal_concentration_no_btc": concurrency_summary,
-            "decision_rule": (
-                "BTC-independent challenger is favored only if the larger sample "
-                "materially increases independent entries without relying on one or two "
-                "5-day blocks, while net mean/median/PF remain acceptable versus BTC_BULL."
-            ),
+            "signal_concentration_no_btc": {
+                "distinct_signal_times": len(conc),
+                "max_same_timestamp_entries": max(conc) if conc else 0,
+                "mean_same_timestamp_entries": round(mean(conc), 2) if conc else 0,
+                "timestamps_with_ge_5_entries": sum(1 for x in conc if x >= 5),
+                "timestamps_with_ge_10_entries": sum(1 for x in conc if x >= 10),
+            },
             "generated_utc": utc_now(),
         }
 
@@ -7216,8 +7249,9 @@ async def v28_btc_validate30(days: int = Query(default=30, ge=10, le=30)):
         return {
             **MODE_INFO,
             "status": "ERROR",
-            "diagnostic": "V28_30D_BTC_INDEPENDENT_BLOCK_VALIDATION",
+            "diagnostic": "V28_LIGHT_5D_BTC_INDEPENDENT_BLOCK",
             "v27_forward_untouched": True,
+            "days_ago": days_ago,
             "error": str(e),
             "generated_utc": utc_now(),
         }
