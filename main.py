@@ -6131,7 +6131,7 @@ def v21_init_db():
     with v21_db_connect() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                CREATE TABLE IF NOT EXISTS alt_v21_paper_state (
+                CREATE TABLE IF NOT EXISTS alt_V20_STATE (
                     id INTEGER PRIMARY KEY,
                     payload JSONB NOT NULL,
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -6157,7 +6157,7 @@ def v21_save_state():
     with v21_db_connect() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                INSERT INTO alt_v21_paper_state (id, payload, updated_at)
+                INSERT INTO alt_V20_STATE (id, payload, updated_at)
                 VALUES (1, %s::jsonb, NOW())
                 ON CONFLICT (id) DO UPDATE
                 SET payload = EXCLUDED.payload,
@@ -6173,7 +6173,7 @@ def v21_load_state():
     with v21_db_connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT payload FROM alt_v21_paper_state WHERE id = 1"
+                "SELECT payload FROM alt_V20_STATE WHERE id = 1"
             )
             row = cur.fetchone()
     if not row:
@@ -8356,7 +8356,7 @@ def v33_stats_from_closed(closed):
 
 def v33_v27_snapshot():
     # Existing V27/V21 state is read only.
-    st = V21_PAPER_STATE
+    st = V20_STATE
     return {
         "label": "V27_BTC_BULL_CANDIDATE_B",
         "started_utc": st.get("started_utc"),
