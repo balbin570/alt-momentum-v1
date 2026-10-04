@@ -4728,6 +4728,51 @@ def relative_candidates_v15(candles, symbol):
     return rows
 
 
+
+def relative_candidates_forward_live(candles, symbol):
+    """
+    Forward-safe version of the frozen relative-momentum + 60m behavior observation.
+    IMPORTANT: does NOT require the future 120m exit candle to exist.
+    It uses only data known by the paper-entry OPEN.
+    """
+    rows = []
+    ret30, mus, sigmas = precompute_rolling_volatility_v12(candles, 288)
+    wait_bars = V15_WAIT_MINUTES // 5
+
+    # Need enough candles only through the 60m observation / entry checkpoint.
+    for i in range(294, len(candles) - wait_bars - 1):
+        mom30 = ret30[i]
+        if mom30 is None or mom30 <= 0:
+            continue
+
+        mu, sigma = mus[i], sigmas[i]
+        if mu is None or sigma is None or sigma <= 0:
+            continue
+
+        z = (mom30 - mu) / sigma
+        behavior = classify_post_rise_behavior_v15(candles, i)
+        if behavior is None:
+            continue
+
+        entry_idx = behavior["entry_idx"]
+        if entry_idx >= len(candles):
+            continue
+
+        rows.append({
+            "symbol": symbol,
+            "signal_time_ms": candles[i]["close_time"],
+            "entry_open_time": candles[entry_idx]["open_time"],
+            "momentum_30m_pct": mom30,
+            "relative_momentum_z": z,
+            "behavior": behavior["behavior"],
+            "wait_end_change_pct": behavior["wait_end_change_pct"],
+            "wait_max_up_pct": behavior["wait_max_up_pct"],
+            "wait_max_down_pct": behavior["wait_max_down_pct"],
+        })
+
+    return rows
+
+
 def summarize_behavior_v15(events):
     vals = [e["net_120m_pct"] for e in events]
     if not vals:
@@ -5930,7 +5975,7 @@ async def v20_scan_once():
         for sym, candles in good.items():
             if sym == "BTCUSDT":
                 continue
-            rows = relative_candidates_v15(candles, sym)
+            rows = relative_candidates_forward_live(candles, sym)
             if rows:
                 raw.extend(rows)
 
@@ -6131,7 +6176,7 @@ def v21_init_db():
     with v21_db_connect() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                CREATE TABLE IF NOT EXISTS alt_V20_STATE (
+                CREATE TABLE IF NOT EXISTS alt_v21_paper_state (
                     id INTEGER PRIMARY KEY,
                     payload JSONB NOT NULL,
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -6157,7 +6202,7 @@ def v21_save_state():
     with v21_db_connect() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                INSERT INTO alt_V20_STATE (id, payload, updated_at)
+                INSERT INTO alt_v21_paper_state (id, payload, updated_at)
                 VALUES (1, %s::jsonb, NOW())
                 ON CONFLICT (id) DO UPDATE
                 SET payload = EXCLUDED.payload,
@@ -6173,7 +6218,7 @@ def v21_load_state():
     with v21_db_connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT payload FROM alt_V20_STATE WHERE id = 1"
+                "SELECT payload FROM alt_v21_paper_state WHERE id = 1"
             )
             row = cur.fetchone()
     if not row:
@@ -8018,7 +8063,7 @@ async def v32_scan_once():
         for sym, candles in good.items():
             if sym == "BTCUSDT":
                 continue
-            rows = relative_candidates_v15(candles, sym)
+            rows = relative_candidates_forward_live(candles, sym)
             if rows:
                 raw.extend(rows)
 
