@@ -6890,3 +6890,159 @@ async def v28_funnel(days: int = Query(default=3, ge=2, le=7)):
             "error": str(e),
             "generated_utc": utc_now(),
         }
+
+# ============================================================
+# V28 BTC-INDEPENDENT CHALLENGER DIAGNOSTIC
+# V27 forward-paper logic/state is NOT changed by this endpoint.
+# ============================================================
+
+def v28_cd60(rows):
+    """Keep at most one event per symbol in any rolling 60-minute window."""
+    by_symbol = {}
+    for r in rows:
+        by_symbol.setdefault(r["symbol"], []).append(r)
+    kept = []
+    gap = 60 * 60 * 1000
+    for sym, items in by_symbol.items():
+        items = sorted(items, key=lambda x: x["signal_time_ms"])
+        last = None
+        for r in items:
+            t = r["signal_time_ms"]
+            if last is None or t - last >= gap:
+                kept.append(r)
+                last = t
+    return sorted(kept, key=lambda x: x["signal_time_ms"])
+
+
+def v28_group_summary(rows):
+    independent = v28_cd60(rows)
+    days_seen = len({datetime.fromtimestamp(r["signal_time_ms"] / 1000, tz=timezone.utc).date().isoformat() for r in independent})
+    return {
+        "raw_event_count": len(rows),
+        "independent_entry_count_cd60": len(independent),
+        "active_days": days_seen,
+        "entries_per_active_day": round(len(independent) / days_seen, 2) if days_seen else 0,
+        "net_60m": v28_stats(independent, "net60_entry_60m_pct"),
+        "net_120m": v28_stats(independent, "net60_entry_120m_pct"),
+    }
+
+
+@app.get("/v28-btc-independent")
+async def v28_btc_independent(days: int = Query(default=3, ge=2, le=7)):
+    """
+    Challenger diagnostic only.
+    Frozen core: positive 30m, z>=1, Top20, 60m continuation>=+0.75%,
+    entry at 60m checkpoint OPEN, 60/120m future net of 0.15% cost.
+    Compares NO BTC FILTER with BTC_BULL/MIXED/BEAR. V27 remains untouched.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(180.0)) as client:
+            universe = await build_universe(client)
+            semaphore = asyncio.Semaphore(8)
+
+            async def fetch(item):
+                async with semaphore:
+                    try:
+                        c = await get_5m_candles_days(client, item["symbol"], days)
+                        return item["symbol"], c, None
+                    except Exception as e:
+                        return item["symbol"], None, str(e)
+
+            fetched = await asyncio.gather(*[fetch(x) for x in universe])
+            good = {s: c for s, c, err in fetched if c}
+            errors = [{"symbol": s, "error": err} for s, c, err in fetched if err]
+            btc = await get_5m_candles_days(client, "BTCUSDT", days)
+
+        raw = []
+        for sym, candles in good.items():
+            raw.extend(v28_base_signals(candles, sym))
+
+        # Cross-sectional rank at each completed signal timestamp.
+        by_time = {}
+        for e in raw:
+            by_time.setdefault(e["signal_time_ms"], []).append(e)
+        ranked = []
+        for group in by_time.values():
+            if len(group) < 5:
+                continue
+            ordered = sorted(group, key=lambda x: x["relative_momentum_z"])
+            n = len(ordered)
+            for idx, e in enumerate(ordered):
+                x = dict(e)
+                x["cross_section_percentile"] = idx / (n - 1) if n > 1 else 1.0
+                ranked.append(x)
+
+        # True selected-alt 30m mean at signal time (same population concept as V27 diagnostics).
+        snapshots = {}
+        for sym, candles in good.items():
+            for i in range(6, len(candles)):
+                t = candles[i]["close_time"]
+                snapshots.setdefault(t, []).append(pct_change(candles[i-6]["close"], candles[i]["close"]))
+
+        core = []
+        for e in ranked:
+            if e["relative_momentum_z"] < 1.0:
+                continue
+            if e["cross_section_percentile"] < 0.80:
+                continue
+            if e["cont_60m_pct"] < 0.75:
+                continue
+            vals = snapshots.get(e["signal_time_ms"], [])
+            if not vals:
+                continue
+            alt_mean = mean(vals)
+            if alt_mean >= 0.5:
+                continue
+            x = dict(e)
+            x["alt_market_mean_30m_pct"] = alt_mean
+            reg = btc_regime_at_v17(btc, e["signal_time_ms"])
+            if reg:
+                x["btc_trend"] = reg["btc_trend"]
+                x["btc_4h_pct"] = reg["btc_4h_pct"]
+                x["btc_24h_pct"] = reg["btc_24h_pct"]
+            else:
+                x["btc_trend"] = "UNKNOWN"
+            core.append(x)
+
+        groups = {
+            "NO_BTC_FILTER_V28_CHALLENGER": core,
+            "BTC_BULL_V27_STYLE": [x for x in core if x["btc_trend"] == "BTC_BULL"],
+            "BTC_MIXED": [x for x in core if x["btc_trend"] == "BTC_MIXED"],
+            "BTC_BEAR": [x for x in core if x["btc_trend"] == "BTC_BEAR"],
+            "BTC_UNKNOWN": [x for x in core if x["btc_trend"] == "UNKNOWN"],
+        }
+
+        return {
+            **MODE_INFO,
+            "status": "OK",
+            "diagnostic": "V28_BTC_INDEPENDENT_CHALLENGER",
+            "v27_forward_untouched": True,
+            "strategy_changed": False,
+            "trading": False,
+            "orders": False,
+            "days": days,
+            "universe_size": len(universe),
+            "symbols_fetched": len(good),
+            "fetch_errors": errors,
+            "frozen_core": {
+                "relative_momentum_z_min": 1.0,
+                "cross_section_percentile_min": 0.80,
+                "continuation_60m_min_pct": 0.75,
+                "alt_market_mean_30m_max_pct": 0.5,
+                "entry": "60m checkpoint OPEN",
+                "round_trip_cost_pct": V28_COST_PCT,
+                "same_symbol_cooldown_minutes": 60,
+            },
+            "comparison": {k: v28_group_summary(v) for k, v in groups.items()},
+            "decision_rule": "Do not deploy from event count alone. Prefer BTC-independent only if independent CD60 sample preserves/improves net mean, median and PF across regimes while materially increasing entries.",
+            "generated_utc": utc_now(),
+        }
+    except Exception as e:
+        return {
+            **MODE_INFO,
+            "status": "ERROR",
+            "diagnostic": "V28_BTC_INDEPENDENT_CHALLENGER",
+            "v27_forward_untouched": True,
+            "error": str(e),
+            "generated_utc": utc_now(),
+        }
