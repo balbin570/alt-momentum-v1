@@ -7666,3 +7666,232 @@ async def v30_confirmation_top1(
             "error": str(e),
             "generated_utc": utc_now(),
         }
+
+
+
+# ============================================================
+# V31 REGIME DIAGNOSTIC — TOP1 / 60M FROZEN CHALLENGER
+# Research only. No V27/V29/V30 forward logic is changed.
+# All regime variables are known at the entry decision time.
+# ============================================================
+
+def v31_bucket(x, cuts, labels):
+    for cut, label in zip(cuts, labels):
+        if x < cut:
+            return label
+    return labels[-1]
+
+def v31_group_summary(rows):
+    return {
+        "n": len(rows),
+        "net_120m": v28_stats(rows, "net60_entry_120m_pct"),
+    }
+
+@app.get("/v31-regime-block")
+async def v31_regime_block(
+    days_ago: int = Query(default=0, ge=0, le=27),
+    window_days: int = Query(default=3, ge=2, le=3),
+):
+    """
+    Diagnostic only: explain why frozen V29 Top1/60m works in some blocks
+    and fails in others. No threshold is selected here.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(180.0)) as client:
+            universe = await build_universe(client)
+            semaphore = asyncio.Semaphore(10)
+
+            async def fetch(item):
+                async with semaphore:
+                    try:
+                        c = await v28_get_5m_candles_window(
+                            client, item["symbol"], days_ago, window_days
+                        )
+                        return item["symbol"], c, None
+                    except Exception as e:
+                        return item["symbol"], None, str(e)
+
+            fetched = await asyncio.gather(*[fetch(x) for x in universe])
+            good = {sym: c for sym, c, err in fetched if c}
+            errors = [{"symbol": sym, "error": err} for sym, c, err in fetched if err]
+
+            btc_days = min(30, days_ago + window_days + 2)
+            btc_full = await get_5m_candles_days(client, "BTCUSDT", btc_days)
+
+        raw = []
+        for sym, candles in good.items():
+            raw.extend(v28_base_signals(candles, sym))
+
+        # Cross-sectional z percentile exactly as in V29/V30.
+        by_time = {}
+        for e in raw:
+            by_time.setdefault(e["signal_time_ms"], []).append(e)
+
+        ranked = []
+        for group in by_time.values():
+            if len(group) < 5:
+                continue
+            ordered = sorted(group, key=lambda x: x["relative_momentum_z"])
+            n = len(ordered)
+            for idx, e in enumerate(ordered):
+                x = dict(e)
+                x["cross_section_percentile"] = idx / (n - 1) if n > 1 else 1.0
+                ranked.append(x)
+
+        # Market snapshot at original signal time: only contemporaneous/past info.
+        snapshots = {}
+        for sym, candles in good.items():
+            for i in range(6, len(candles)):
+                t = candles[i]["close_time"]
+                r30 = pct_change(candles[i-6]["close"], candles[i]["close"])
+                snapshots.setdefault(t, []).append(r30)
+
+        # Frozen 60m confirmation challenger.
+        rows = v30_build_window_rows(ranked, good, snapshots, btc_full, 60)
+
+        # Candidate concentration at each decision cohort, before Top1.
+        cohort = {}
+        for r in rows:
+            cohort.setdefault(r["signal_time_ms"], []).append(r)
+
+        # Add regime descriptors known by the 60m decision point.
+        enriched = []
+        for r in rows:
+            x = dict(r)
+            vals = snapshots.get(r["signal_time_ms"], [])
+            if vals:
+                pos = sum(1 for v in vals if v > 0)
+                x["breadth_positive30_pct"] = 100.0 * pos / len(vals)
+                x["alt_mean30_pct"] = mean(vals)
+                x["alt_abs_mean30_pct"] = mean([abs(v) for v in vals])
+            else:
+                x["breadth_positive30_pct"] = 0.0
+                x["alt_mean30_pct"] = 0.0
+                x["alt_abs_mean30_pct"] = 0.0
+
+            same = cohort.get(r["signal_time_ms"], [])
+            x["eligible_candidates_same_timestamp"] = len(same)
+            x["mean_candidate_continuation_pct"] = mean(
+                [q["cont_60m_pct"] for q in same]
+            ) if same else 0.0
+
+            reg = btc_regime_at_v17(btc_full, r["signal_time_ms"])
+            x["btc_trend"] = reg["btc_trend"] if reg else "UNKNOWN"
+            x["btc_4h_pct"] = reg.get("btc_4h_pct", 0.0) if reg else 0.0
+            x["btc_24h_pct"] = reg.get("btc_24h_pct", 0.0) if reg else 0.0
+            enriched.append(x)
+
+        top1 = v29_select_topn_with_cd60(enriched, 1)
+
+        # Predeclared coarse descriptive buckets; not strategy filters.
+        groups = {
+            "BTC_REGIME": {},
+            "ALT_BREADTH_POSITIVE30": {},
+            "ALT_MEAN30": {},
+            "SIGNAL_CONCENTRATION": {},
+            "TOP1_CONTINUATION_STRENGTH": {},
+        }
+
+        for r in top1:
+            groups["BTC_REGIME"].setdefault(r["btc_trend"], []).append(r)
+
+            b = v31_bucket(
+                r["breadth_positive30_pct"],
+                [40.0, 60.0, 101.0],
+                ["LT40", "40_TO_LT60", "GE60"],
+            )
+            groups["ALT_BREADTH_POSITIVE30"].setdefault(b, []).append(r)
+
+            a = v31_bucket(
+                r["alt_mean30_pct"],
+                [0.0, 0.25, 0.5, 999.0],
+                ["LT0", "0_TO_LT0_25", "0_25_TO_LT0_5", "GE0_5"],
+            )
+            groups["ALT_MEAN30"].setdefault(a, []).append(r)
+
+            c = v31_bucket(
+                r["eligible_candidates_same_timestamp"],
+                [2, 5, 10, 10**9],
+                ["1", "2_TO_4", "5_TO_9", "GE10"],
+            )
+            groups["SIGNAL_CONCENTRATION"].setdefault(c, []).append(r)
+
+            m = v31_bucket(
+                r["cont_60m_pct"],
+                [1.0, 1.5, 2.5, 10**9],
+                ["0_75_TO_LT1", "1_TO_LT1_5", "1_5_TO_LT2_5", "GE2_5"],
+            )
+            groups["TOP1_CONTINUATION_STRENGTH"].setdefault(m, []).append(r)
+
+        summarized = {
+            name: {k: v31_group_summary(v) for k, v in buckets.items()}
+            for name, buckets in groups.items()
+        }
+
+        # Whole-block descriptors, useful for comparing good vs bad 3-day blocks.
+        all_snap_vals = []
+        for vals in snapshots.values():
+            all_snap_vals.extend(vals)
+
+        return {
+            **MODE_INFO,
+            "status": "OK",
+            "diagnostic": "V31_REGIME_DIAGNOSTIC_TOP1_60M",
+            "v27_forward_untouched": True,
+            "v29_forward_untouched": True,
+            "v30_untouched": True,
+            "strategy_changed": False,
+            "trading": False,
+            "orders": False,
+            "days_ago": days_ago,
+            "window_days": window_days,
+            "universe_size": len(universe),
+            "symbols_fetched": len(good),
+            "fetch_errors": errors,
+            "frozen_challenger": {
+                "relative_momentum_z_min": 1.0,
+                "cross_section_percentile_min": 0.80,
+                "confirmation_minutes": 60,
+                "continuation_threshold_pct": 0.75,
+                "alt_market_mean_30m_max_pct": 0.5,
+                "btc_filter": "NONE",
+                "selection": "TOP1",
+                "same_symbol_cooldown_minutes": 60,
+                "round_trip_cost_pct": V28_COST_PCT,
+                "exit_after_entry_minutes": 120,
+            },
+            "top1_overall": v31_group_summary(top1),
+            "block_context": {
+                "top1_entries": len(top1),
+                "distinct_signal_timestamps": len({r["signal_time_ms"] for r in top1}),
+                "mean_breadth_positive30_pct_at_entries": round(
+                    mean([r["breadth_positive30_pct"] for r in top1]), 4
+                ) if top1 else None,
+                "mean_alt30_pct_at_entries": round(
+                    mean([r["alt_mean30_pct"] for r in top1]), 4
+                ) if top1 else None,
+                "mean_signal_concentration_at_entries": round(
+                    mean([r["eligible_candidates_same_timestamp"] for r in top1]), 4
+                ) if top1 else None,
+                "mean_top1_continuation_pct": round(
+                    mean([r["cont_60m_pct"] for r in top1]), 4
+                ) if top1 else None,
+            },
+            "regime_slices": summarized,
+            "interpretation_rule": (
+                "Diagnostic only. Do not choose a new filter from one block. "
+                "Compare the same predeclared slices across all 3-day blocks; "
+                "a useful regime variable must separate good/bad performance repeatedly."
+            ),
+            "lookahead_in_regime_variables": False,
+            "generated_utc": utc_now(),
+        }
+    except Exception as e:
+        return {
+            **MODE_INFO,
+            "status": "ERROR",
+            "diagnostic": "V31_REGIME_DIAGNOSTIC_TOP1_60M",
+            "v27_forward_untouched": True,
+            "error": str(e),
+            "generated_utc": utc_now(),
+        }
