@@ -8292,7 +8292,7 @@ async def v32_status():
             "table": "alt_v32_paper_state",
         },
         "telegram": {
-            "configured": bool(V22_TELEGRAM_BOT_TOKEN and V22_TELEGRAM_CHAT_ID),
+            "configured": bool(V22_TG_TOKEN and V22_TG_CHAT_ID),
             "entry_exit_notifications": True,
         },
         "paper": v32_public_state(),
