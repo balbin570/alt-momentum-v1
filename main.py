@@ -7895,3 +7895,418 @@ async def v31_regime_block(
             "error": str(e),
             "generated_utc": utc_now(),
         }
+
+
+
+# ============================================================
+# V32 FORWARD CHALLENGER — FROZEN AFTER V31
+# BTC-independent + Top1 + 60m confirmation + 120m hold
+# Separate PostgreSQL state/table. V27 state/rules untouched.
+# Research paper only; no trading/orders.
+# ============================================================
+
+V32_STATE = {
+    "open": {},
+    "closed": [],
+    "seen_signal_keys": set(),
+    "started_utc": utc_now(),
+}
+V32_LAST_SCAN = {
+    "status": "NOT_RUN",
+    "started_utc": None,
+    "finished_utc": None,
+    "error": None,
+}
+V32_AUTO_TASK = None
+V32_COST_PCT = 0.15
+V32_HOLD_MS = 120 * 60 * 1000
+V32_SCAN_INTERVAL_SECONDS = 300
+
+def v32_db_init():
+    if not V21_DB_URL:
+        return
+    with psycopg.connect(V21_DB_URL) as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS alt_v32_paper_state (
+                    id INTEGER PRIMARY KEY,
+                    payload JSONB NOT NULL,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+        conn.commit()
+
+def v32_serializable_state():
+    return {
+        "open": V32_STATE["open"],
+        "closed": V32_STATE["closed"],
+        "seen_signal_keys": sorted(V32_STATE["seen_signal_keys"]),
+        "started_utc": V32_STATE["started_utc"],
+    }
+
+def v32_save_state():
+    if not V21_DB_URL:
+        return
+    payload = json.dumps(v32_serializable_state())
+    with psycopg.connect(V21_DB_URL) as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO alt_v32_paper_state (id, payload, updated_at)
+                VALUES (1, %s::jsonb, NOW())
+                ON CONFLICT (id) DO UPDATE
+                SET payload = EXCLUDED.payload, updated_at = NOW()
+            """, (payload,))
+        conn.commit()
+
+def v32_load_state():
+    if not V21_DB_URL:
+        return
+    with psycopg.connect(V21_DB_URL) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT payload FROM alt_v32_paper_state WHERE id = 1")
+            row = cur.fetchone()
+    if not row:
+        v32_save_state()
+        return
+    payload = row[0] if isinstance(row[0], dict) else json.loads(row[0])
+    V32_STATE["open"] = payload.get("open", {})
+    V32_STATE["closed"] = payload.get("closed", [])
+    V32_STATE["seen_signal_keys"] = set(payload.get("seen_signal_keys", []))
+    V32_STATE["started_utc"] = payload.get("started_utc", V32_STATE["started_utc"])
+
+def v32_public_state():
+    closed = V32_STATE["closed"]
+    equity = 100.0
+    peak = 100.0
+    max_dd = 0.0
+    for x in closed:
+        equity *= (1.0 + float(x.get("net_pct", 0.0)) / 100.0)
+        peak = max(peak, equity)
+        if peak > 0:
+            max_dd = min(max_dd, (equity / peak - 1.0) * 100.0)
+    wins = sum(1 for x in closed if float(x.get("net_pct", 0.0)) > 0)
+    return {
+        "started_utc": V32_STATE["started_utc"],
+        "open_count": len(V32_STATE["open"]),
+        "closed_count": len(closed),
+        "wins": wins,
+        "win_rate_pct": round(100.0 * wins / len(closed), 2) if closed else None,
+        "paper_equity": round(equity, 4),
+        "max_drawdown_pct": round(max_dd, 4),
+        "open_positions": list(V32_STATE["open"].values()),
+        "recent_closed": closed[-20:],
+    }
+
+async def v32_scan_once():
+    async with httpx.AsyncClient(timeout=httpx.Timeout(180.0)) as client:
+        universe = await build_universe(client)
+        semaphore = asyncio.Semaphore(12)
+
+        async def fetch(item):
+            async with semaphore:
+                try:
+                    candles = await get_5m_candles_days(client, item["symbol"], 3)
+                    return item["symbol"], candles, None
+                except Exception as e:
+                    return item["symbol"], None, str(e)
+
+        fetched = await asyncio.gather(*[fetch(x) for x in universe])
+        good = {sym: c for sym, c, err in fetched if c}
+        errors = [{"symbol": sym, "error": err} for sym, c, err in fetched if err]
+
+        raw = []
+        for sym, candles in good.items():
+            if sym == "BTCUSDT":
+                continue
+            rows = relative_candidates_v15(candles, sym)
+            if rows:
+                raw.extend(rows)
+
+        # Cross-sectional percentile at the original signal timestamp.
+        by_time = {}
+        for e in raw:
+            by_time.setdefault(e["signal_time_ms"], []).append(e)
+
+        ranked = []
+        for group in by_time.values():
+            if len(group) < 5:
+                continue
+            ordered = sorted(group, key=lambda x: x["relative_momentum_z"])
+            n = len(ordered)
+            for idx, e in enumerate(ordered):
+                row = dict(e)
+                row["cross_section_percentile"] = idx / (n - 1) if n > 1 else 1.0
+                ranked.append(row)
+
+        # True selected-alt 30m market mean at signal timestamp.
+        snapshots = {}
+        for sym, candles in good.items():
+            if sym == "BTCUSDT":
+                continue
+            for i in range(6, len(candles)):
+                t = candles[i]["close_time"]
+                snapshots.setdefault(t, []).append(
+                    pct_change(candles[i - 6]["close"], candles[i]["close"])
+                )
+
+        eligible = []
+        for e in ranked:
+            if e["relative_momentum_z"] < 1.0:
+                continue
+            if e["cross_section_percentile"] < 0.80:
+                continue
+            if e["behavior"] != "CONTINUED_UP":
+                continue
+            vals = snapshots.get(e["signal_time_ms"], [])
+            if not vals:
+                continue
+            alt_mean = mean(vals)
+            if alt_mean >= 0.5:
+                continue
+            row = dict(e)
+            row["alt_market_mean_30m_pct"] = alt_mean
+            eligible.append(row)
+
+        # TOP1 per decision cohort using only already-observed 60m continuation.
+        cohort = {}
+        for e in eligible:
+            cohort.setdefault(e["signal_time_ms"], []).append(e)
+
+        top1_rows = []
+        for group in cohort.values():
+            group = sorted(
+                group,
+                key=lambda x: (
+                    x.get("wait_end_change_pct", 0.0),
+                    x.get("relative_momentum_z", 0.0),
+                    x.get("cross_section_percentile", 0.0),
+                ),
+                reverse=True,
+            )
+            if group:
+                top1_rows.append(group[0])
+
+        newest_open_ms = max(
+            (c[-1]["open_time"] for c in good.values() if c), default=0
+        )
+        freshness_ms = 10 * 60 * 1000
+
+        new_entries = []
+        for e in top1_rows:
+            if newest_open_ms - e["entry_open_time"] > freshness_ms:
+                continue
+
+            key = f'{e["symbol"]}:{e["entry_open_time"]}'
+            if key in V32_STATE["seen_signal_keys"]:
+                continue
+            if e["symbol"] in V32_STATE["open"]:
+                continue
+
+            # Same-symbol 60m cooldown from the last V32 entry.
+            prior_times = []
+            for x in V32_STATE["closed"]:
+                if x.get("symbol") == e["symbol"]:
+                    prior_times.append(int(x.get("entry_open_time", 0)))
+            if e["symbol"] in V32_STATE["open"]:
+                prior_times.append(int(V32_STATE["open"][e["symbol"]].get("entry_open_time", 0)))
+            if prior_times and e["entry_open_time"] - max(prior_times) < 60 * 60 * 1000:
+                continue
+
+            candles = good.get(e["symbol"], [])
+            price = next(
+                (c["open"] for c in candles if c["open_time"] == e["entry_open_time"]),
+                None
+            )
+            if price is None:
+                continue
+
+            pos = {
+                "key": key,
+                "strategy": "V32_TOP1_60M_NO_BTC_FORWARD_CHALLENGER",
+                "symbol": e["symbol"],
+                "signal_time_ms": e["signal_time_ms"],
+                "entry_open_time": e["entry_open_time"],
+                "entry_price": price,
+                "exit_due_time": e["entry_open_time"] + V32_HOLD_MS,
+                "relative_momentum_z": round(e["relative_momentum_z"], 4),
+                "cross_section_percentile": round(e["cross_section_percentile"], 4),
+                "continuation_60m_pct": round(e["wait_end_change_pct"], 4),
+                "alt_market_mean_30m_pct": round(e["alt_market_mean_30m_pct"], 4),
+                "status": "OPEN_PAPER",
+            }
+            V32_STATE["seen_signal_keys"].add(key)
+            V32_STATE["open"][e["symbol"]] = pos
+            new_entries.append(pos)
+
+        newly_closed = []
+        for sym, pos in list(V32_STATE["open"].items()):
+            candles = good.get(sym)
+            if not candles:
+                continue
+            exit_candle = next(
+                (c for c in candles if c["open_time"] >= pos["exit_due_time"]),
+                None
+            )
+            if exit_candle is None:
+                continue
+            exit_price = exit_candle["open"]
+            gross = pct_change(pos["entry_price"], exit_price)
+            net = gross - V32_COST_PCT
+            closed = {
+                **pos,
+                "status": "CLOSED_PAPER",
+                "exit_open_time": exit_candle["open_time"],
+                "exit_price": exit_price,
+                "gross_pct": round(gross, 4),
+                "cost_pct": V32_COST_PCT,
+                "net_pct": round(net, 4),
+            }
+            V32_STATE["closed"].append(closed)
+            del V32_STATE["open"][sym]
+            newly_closed.append(closed)
+
+        return {
+            "status": "OK",
+            "universe_size": len(universe),
+            "symbols_fetched": len(good),
+            "eligible_rows_seen": len(eligible),
+            "top1_rows_seen": len(top1_rows),
+            "new_entries": new_entries,
+            "newly_closed": newly_closed,
+            "fetch_errors": errors,
+        }
+
+async def v32_notify(result):
+    notes = []
+    for p in result.get("new_entries", []):
+        msg = (
+            "🧪 V32 PAPER ENTRY\n"
+            f"{p['symbol']}\n"
+            f"Entry: {p['entry_price']}\n"
+            f"Z: {p['relative_momentum_z']} | pctile: {p['cross_section_percentile']}\n"
+            f"60m continuation: {p['continuation_60m_pct']}%\n"
+            f"ALT mean30: {p['alt_market_mean_30m_pct']}%\n"
+            "BTC filter: NONE | Top1\n"
+            "Exit: +120m OPEN | trading=false | orders=false"
+        )
+        try:
+            await v22_telegram_send(msg)
+            notes.append({"type": "ENTRY", "symbol": p["symbol"], "sent": True})
+        except Exception as e:
+            notes.append({"type": "ENTRY", "symbol": p["symbol"], "sent": False, "error": str(e)})
+
+    for p in result.get("newly_closed", []):
+        msg = (
+            "🧪 V32 PAPER EXIT\n"
+            f"{p['symbol']}\n"
+            f"Entry: {p['entry_price']} | Exit: {p['exit_price']}\n"
+            f"Gross: {p['gross_pct']}% | Cost: {p['cost_pct']}%\n"
+            f"Net: {p['net_pct']}%\n"
+            "trading=false | orders=false"
+        )
+        try:
+            await v22_telegram_send(msg)
+            notes.append({"type": "EXIT", "symbol": p["symbol"], "sent": True})
+        except Exception as e:
+            notes.append({"type": "EXIT", "symbol": p["symbol"], "sent": False, "error": str(e)})
+    return notes
+
+async def v32_run_once():
+    V32_LAST_SCAN["status"] = "RUNNING"
+    V32_LAST_SCAN["started_utc"] = utc_now()
+    V32_LAST_SCAN["finished_utc"] = None
+    V32_LAST_SCAN["error"] = None
+    try:
+        result = await v32_scan_once()
+        notes = await v32_notify(result)
+        result["telegram_notifications"] = notes
+        if V21_DB_URL:
+            v32_save_state()
+        V32_LAST_SCAN["status"] = result.get("status", "OK")
+        return result
+    except Exception as e:
+        V32_LAST_SCAN["status"] = "ERROR"
+        V32_LAST_SCAN["error"] = str(e)
+        return {"status": "ERROR", "error": str(e)}
+    finally:
+        V32_LAST_SCAN["finished_utc"] = utc_now()
+
+async def v32_auto_loop():
+    # Offset from V27 loop so the two broad-universe scans do not start together.
+    await asyncio.sleep(120)
+    while True:
+        await v32_run_once()
+        await asyncio.sleep(V32_SCAN_INTERVAL_SECONDS)
+
+@app.on_event("startup")
+async def v32_startup():
+    global V32_AUTO_TASK
+    try:
+        if V21_DB_URL:
+            v32_db_init()
+            v32_load_state()
+    except Exception as e:
+        V32_LAST_SCAN["status"] = "DB_STARTUP_ERROR"
+        V32_LAST_SCAN["error"] = str(e)
+    V32_AUTO_TASK = asyncio.create_task(v32_auto_loop())
+
+@app.on_event("shutdown")
+async def v32_shutdown():
+    try:
+        if V21_DB_URL:
+            v32_save_state()
+    except Exception:
+        pass
+
+@app.get("/v32-status")
+async def v32_status():
+    return {
+        **MODE_INFO,
+        "status": "OK",
+        "strategy": "V32_TOP1_60M_NO_BTC_FORWARD_CHALLENGER",
+        "research_only": True,
+        "trading": False,
+        "orders": False,
+        "v27_forward_untouched": True,
+        "frozen_rules": {
+            "relative_momentum_z_min": 1.0,
+            "cross_section_percentile_min": 0.80,
+            "confirmation_minutes": 60,
+            "continuation_threshold_pct": 0.75,
+            "alt_market_mean_30m_max_pct": 0.5,
+            "btc_filter": "NONE",
+            "selection": "TOP1 by observed 60m continuation",
+            "same_symbol_cooldown_minutes": 60,
+            "round_trip_cost_pct": V32_COST_PCT,
+            "exit_after_entry_minutes": 120,
+        },
+        "automation": {
+            "enabled": True,
+            "interval_seconds": V32_SCAN_INTERVAL_SECONDS,
+            "startup_offset_seconds": 120,
+            "last_scan": V32_LAST_SCAN,
+        },
+        "database": {
+            "configured": bool(V21_DB_URL),
+            "backend": "POSTGRESQL" if V21_DB_URL else "MEMORY_ONLY",
+            "table": "alt_v32_paper_state",
+        },
+        "telegram": {
+            "configured": bool(V22_TELEGRAM_BOT_TOKEN and V22_TELEGRAM_CHAT_ID),
+            "entry_exit_notifications": True,
+        },
+        "paper": v32_public_state(),
+        "generated_utc": utc_now(),
+    }
+
+@app.get("/v32-scan-now")
+async def v32_scan_now():
+    result = await v32_run_once()
+    return {
+        **MODE_INFO,
+        "strategy": "V32_TOP1_60M_NO_BTC_FORWARD_CHALLENGER",
+        "v27_forward_untouched": True,
+        **result,
+        "paper": v32_public_state(),
+        "generated_utc": utc_now(),
+    }
