@@ -15,7 +15,7 @@ MODEL = "ALT-MOMENTUM-V1"
 MIN_QUOTE_VOLUME_USDT = 250_000
 ROUND_TRIP_COST_PCT = 0.15
 
-# Altcoin araştırması için istemediğimiz baz varlıklar
+# Altcoin araÅŸtÄ±rmasÄ± iÃ§in istemediÄŸimiz baz varlÄ±klar
 EXCLUDED_BASES = {
     "BTC",
     "ETH",
@@ -225,16 +225,16 @@ def analyze_latest(symbol, candles, quote_volume):
 
 def historical_events(candles):
     """
-    Burada AL sinyali üretmiyoruz.
+    Burada AL sinyali Ã¼retmiyoruz.
 
-    Amaç:
-    Geçmişte belirli momentum + hacim koşulları oluştuğunda
-    fiyatın 15/30/60 dakika sonra ne yaptığını ölçmek.
+    AmaÃ§:
+    GeÃ§miÅŸte belirli momentum + hacim koÅŸullarÄ± oluÅŸtuÄŸunda
+    fiyatÄ±n 15/30/60 dakika sonra ne yaptÄ±ÄŸÄ±nÄ± Ã¶lÃ§mek.
     """
 
     events = []
 
-    # İleri ölçüm için 12 mum = 60 dakika gerekir.
+    # Ä°leri Ã¶lÃ§Ã¼m iÃ§in 12 mum = 60 dakika gerekir.
     for i in range(7, len(candles) - 12):
 
         current = candles[i]["close"]
@@ -267,8 +267,8 @@ def historical_events(candles):
             else 0
         )
 
-        # İlk araştırma koşulu.
-        # Bunlar nihai parametre değildir.
+        # Ä°lk araÅŸtÄ±rma koÅŸulu.
+        # Bunlar nihai parametre deÄŸildir.
         if mom5 < 0.30:
             continue
 
@@ -281,7 +281,7 @@ def historical_events(candles):
         if volume_ratio < 1.20:
             continue
 
-        # Çoktan aşırı koşmuş hareketleri ilk aşamada ayır.
+        # Ã‡oktan aÅŸÄ±rÄ± koÅŸmuÅŸ hareketleri ilk aÅŸamada ayÄ±r.
         if mom5 > 3.00:
             continue
 
@@ -507,8 +507,8 @@ async def backtest(
 ):
     """
     Research endpoint.
-    Emir üretmez.
-    Paper trade açmaz.
+    Emir Ã¼retmez.
+    Paper trade aÃ§maz.
     """
 
     symbol = symbol.upper().strip()
@@ -558,8 +558,8 @@ async def backtest(
 
 def apply_cooldown(events, cooldown_minutes):
     """
-    Aynı coin için birbirine çok yakın eventleri bağımsız işlem gibi
-    saymamak amacıyla cooldown uygular.
+    AynÄ± coin iÃ§in birbirine Ã§ok yakÄ±n eventleri baÄŸÄ±msÄ±z iÅŸlem gibi
+    saymamak amacÄ±yla cooldown uygular.
     """
     if not events:
         return []
@@ -585,8 +585,8 @@ def apply_cooldown(events, cooldown_minutes):
 
 def summarize_events_with_cost(events, cost_pct=ROUND_TRIP_COST_PCT):
     """
-    15/30/60 dk brüt sonuçları ve sabit round-trip maliyet sonrası
-    net sonuçları birlikte özetler.
+    15/30/60 dk brÃ¼t sonuÃ§larÄ± ve sabit round-trip maliyet sonrasÄ±
+    net sonuÃ§larÄ± birlikte Ã¶zetler.
     """
     if not events:
         return {
@@ -659,17 +659,17 @@ async def backtest_all(
     ),
 ):
     """
-    Çoklu altcoin research/event-study endpointi.
+    Ã‡oklu altcoin research/event-study endpointi.
 
-    - Emir üretmez.
-    - Paper trade açmaz.
-    - Mevcut 24h likidite evreninden en yüksek hacimli coinleri seçer.
-    - Ham eventleri, 30 dk cooldown ve 60 dk cooldown sonuçlarını karşılaştırır.
-    - %0.15 round-trip araştırma maliyetini net sonuçlardan düşer.
+    - Emir Ã¼retmez.
+    - Paper trade aÃ§maz.
+    - Mevcut 24h likidite evreninden en yÃ¼ksek hacimli coinleri seÃ§er.
+    - Ham eventleri, 30 dk cooldown ve 60 dk cooldown sonuÃ§larÄ±nÄ± karÅŸÄ±laÅŸtÄ±rÄ±r.
+    - %0.15 round-trip araÅŸtÄ±rma maliyetini net sonuÃ§lardan dÃ¼ÅŸer.
 
     Not:
-    Bu ilk geniş test current-universe yaklaşımı kullanır; dolayısıyla
-    survivorship / current-liquidity bias içerebilir.
+    Bu ilk geniÅŸ test current-universe yaklaÅŸÄ±mÄ± kullanÄ±r; dolayÄ±sÄ±yla
+    survivorship / current-liquidity bias iÃ§erebilir.
     """
     try:
         async with httpx.AsyncClient() as client:
@@ -734,7 +734,7 @@ async def backtest_all(
                 )
             )
 
-        # Coin listesini hacme göre okunabilir sırada tut.
+        # Coin listesini hacme gÃ¶re okunabilir sÄ±rada tut.
         per_coin.sort(
             key=lambda x: x["quote_volume_24h"],
             reverse=True,
@@ -790,15 +790,15 @@ async def backtest_all(
 
 async def get_5m_candles_days(client, symbol, days=30):
     """
-    Binance 1000-kline limitini geriye doğru sayfalayarak tamamlanmış
-    5m mumları toplar. Varsayılan 30 gün ~= 8640 mum.
+    Binance 1000-kline limitini geriye doÄŸru sayfalayarak tamamlanmÄ±ÅŸ
+    5m mumlarÄ± toplar. VarsayÄ±lan 30 gÃ¼n ~= 8640 mum.
     """
     now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
     start_ms = now_ms - (days * 24 * 60 * 60 * 1000)
     end_time = now_ms
     by_open_time = {}
 
-    # 30 gün için yaklaşık 9 istek gerekir. Güvenli üst sınır bırakıyoruz.
+    # 30 gÃ¼n iÃ§in yaklaÅŸÄ±k 9 istek gerekir. GÃ¼venli Ã¼st sÄ±nÄ±r bÄ±rakÄ±yoruz.
     max_pages = max(2, int((days * 288) / 1000) + 3)
 
     for _ in range(max_pages):
@@ -841,10 +841,10 @@ async def get_5m_candles_days(client, symbol, days=30):
         if oldest_open <= start_ms:
             break
 
-        # Bir önceki sayfanın sonundan daha eski veriye git.
+        # Bir Ã¶nceki sayfanÄ±n sonundan daha eski veriye git.
         end_time = oldest_open - 1
 
-        # Binance'a gereksiz burst yapmamak için küçük bir ara.
+        # Binance'a gereksiz burst yapmamak iÃ§in kÃ¼Ã§Ã¼k bir ara.
         await asyncio.sleep(0.03)
 
     candles = sorted(
@@ -858,17 +858,17 @@ async def get_5m_candles_days(client, symbol, days=30):
 def historical_trades_v2(candles, symbol):
     """
     V2 research trade modeli:
-    - Sinyal tamamlanmış 5m mum kapanışında hesaplanır.
-    - Giriş bir sonraki 5m mumun OPEN fiyatıdır.
-    - Çıkış girişten tam 60 dakika sonraki mumun OPEN fiyatıdır.
-    - Aynı coin için girişler arasında en az 60 dakika cooldown.
-    - Sabit %0.15 round-trip araştırma maliyeti.
+    - Sinyal tamamlanmÄ±ÅŸ 5m mum kapanÄ±ÅŸÄ±nda hesaplanÄ±r.
+    - GiriÅŸ bir sonraki 5m mumun OPEN fiyatÄ±dÄ±r.
+    - Ã‡Ä±kÄ±ÅŸ giriÅŸten tam 60 dakika sonraki mumun OPEN fiyatÄ±dÄ±r.
+    - AynÄ± coin iÃ§in giriÅŸler arasÄ±nda en az 60 dakika cooldown.
+    - Sabit %0.15 round-trip araÅŸtÄ±rma maliyeti.
     """
     trades = []
     last_entry_open_time = None
     cooldown_ms = 60 * 60 * 1000
 
-    # i sinyal mumu; i+1 giriş; i+13 = girişten 60 dk sonraki open.
+    # i sinyal mumu; i+1 giriÅŸ; i+13 = giriÅŸten 60 dk sonraki open.
     for i in range(7, len(candles) - 13):
         signal_close = candles[i]["close"]
 
@@ -1039,7 +1039,7 @@ def split_dev_oos(trades):
 
     split_index = int(len(ordered) * 2 / 3)
 
-    # Çok küçük örneklerde yine kronolojik bir ayrım yap.
+    # Ã‡ok kÃ¼Ã§Ã¼k Ã¶rneklerde yine kronolojik bir ayrÄ±m yap.
     if len(ordered) >= 2:
         split_index = min(
             max(split_index, 1),
@@ -1063,15 +1063,15 @@ async def backtest30(
     ),
 ):
     """
-    30 günlük çoklu-altcoin V2 araştırma backtesti.
+    30 gÃ¼nlÃ¼k Ã§oklu-altcoin V2 araÅŸtÄ±rma backtesti.
 
     Bu endpoint:
-    - gerçek emir üretmez,
-    - paper trade açmaz,
-    - next-candle-open giriş kullanır,
-    - 60 dk hold + 60 dk same-symbol cooldown kullanır,
-    - %0.15 maliyet düşer,
-    - kronolojik DEV/OOS raporu üretir.
+    - gerÃ§ek emir Ã¼retmez,
+    - paper trade aÃ§maz,
+    - next-candle-open giriÅŸ kullanÄ±r,
+    - 60 dk hold + 60 dk same-symbol cooldown kullanÄ±r,
+    - %0.15 maliyet dÃ¼ÅŸer,
+    - kronolojik DEV/OOS raporu Ã¼retir.
     """
     try:
         async with httpx.AsyncClient(
@@ -1080,7 +1080,7 @@ async def backtest30(
             universe_data = await build_universe(client)
             selected = universe_data[:count]
 
-            # 30 coin x ~9 Binance sayfası. Render/Binance için kontrollü eşzamanlılık.
+            # 30 coin x ~9 Binance sayfasÄ±. Render/Binance iÃ§in kontrollÃ¼ eÅŸzamanlÄ±lÄ±k.
             semaphore = asyncio.Semaphore(3)
 
             async def worker(item):
@@ -1140,8 +1140,8 @@ async def backtest30(
                 }
             )
 
-        # Birleşik DEV/OOS coin başına değil, tüm işlemlerin kronolojik
-        # ilk 2/3 ve son 1/3'ü olarak da raporlanır.
+        # BirleÅŸik DEV/OOS coin baÅŸÄ±na deÄŸil, tÃ¼m iÅŸlemlerin kronolojik
+        # ilk 2/3 ve son 1/3'Ã¼ olarak da raporlanÄ±r.
         combined_dev, combined_oos = split_dev_oos(all_trades)
 
         return {
@@ -1213,12 +1213,12 @@ def ema_series(values, period):
 
 def btc_regime_map_from_5m(candles):
     """
-    BTC 5m verisini 1 saatlik kapanışlara indirger.
+    BTC 5m verisini 1 saatlik kapanÄ±ÅŸlara indirger.
     Rejim:
       BULL    = close > EMA50 > EMA200
       BEAR    = close < EMA50 < EMA200
-      NEUTRAL = diğer durumlar
-    Her 5m zaman damgası için yalnızca o ana kadar tamamlanmış 1H bilgi kullanılır.
+      NEUTRAL = diÄŸer durumlar
+    Her 5m zaman damgasÄ± iÃ§in yalnÄ±zca o ana kadar tamamlanmÄ±ÅŸ 1H bilgi kullanÄ±lÄ±r.
     """
     if not candles:
         return {}
@@ -1294,15 +1294,15 @@ def simulate_portfolio_v3(
     allocation_per_trade_pct=20.0,
 ):
     """
-    Daha gerçekçi ortak-portföy araştırma simülasyonu.
+    Daha gerÃ§ekÃ§i ortak-portfÃ¶y araÅŸtÄ±rma simÃ¼lasyonu.
 
-    - Başlangıç equity = 100.
-    - Aynı anda en fazla max_positions.
-    - Her yeni pozisyon başlangıçtaki değil, o andaki equity'nin sabit yüzdesi
-      kadar nominal sermaye kullanır.
-    - Pozisyonlar 60 dk sonra kapanır.
-    - Aynı timestamp'teki sinyaller deterministik olarak symbol sırasına göre işlenir.
-    - Kaldıraç yok; toplam hedef tahsis <= %100.
+    - BaÅŸlangÄ±Ã§ equity = 100.
+    - AynÄ± anda en fazla max_positions.
+    - Her yeni pozisyon baÅŸlangÄ±Ã§taki deÄŸil, o andaki equity'nin sabit yÃ¼zdesi
+      kadar nominal sermaye kullanÄ±r.
+    - Pozisyonlar 60 dk sonra kapanÄ±r.
+    - AynÄ± timestamp'teki sinyaller deterministik olarak symbol sÄ±rasÄ±na gÃ¶re iÅŸlenir.
+    - KaldÄ±raÃ§ yok; toplam hedef tahsis <= %100.
     """
     if not trades:
         return {
@@ -1382,7 +1382,7 @@ def simulate_portfolio_v3(
         )
         accepted += 1
 
-    # Kalan pozisyonları son exit zamanına kadar kapat.
+    # Kalan pozisyonlarÄ± son exit zamanÄ±na kadar kapat.
     if active:
         final_ms = max(x["exit_ms"] for x in active)
         close_due(final_ms)
@@ -1413,13 +1413,13 @@ async def backtest90(
 ):
     """
     ALT-MOMENTUM V3:
-    - 30-90 gün sayfalı 5m veri
-    - next-candle-open giriş
+    - 30-90 gÃ¼n sayfalÄ± 5m veri
+    - next-candle-open giriÅŸ
     - 60 dk hold / 60 dk same-symbol cooldown
     - %0.15 round-trip cost
     - BTC 1H EMA50/EMA200 piyasa rejimi
     - kronolojik DEV/OOS
-    - max 5 eşzamanlı pozisyonlu ortak portföy simülasyonu
+    - max 5 eÅŸzamanlÄ± pozisyonlu ortak portfÃ¶y simÃ¼lasyonu
     """
     try:
         async with httpx.AsyncClient(
@@ -1428,7 +1428,7 @@ async def backtest90(
             universe_data = await build_universe(client)
             selected = universe_data[:count]
 
-            # Önce BTC rejim verisi.
+            # Ã–nce BTC rejim verisi.
             btc_candles = await get_5m_candles_days(
                 client,
                 "BTCUSDT",
@@ -1438,7 +1438,7 @@ async def backtest90(
                 btc_candles
             )
 
-            # 90 gün x 30 coin ağır bir iş; kontrollü concurrency.
+            # 90 gÃ¼n x 30 coin aÄŸÄ±r bir iÅŸ; kontrollÃ¼ concurrency.
             semaphore = asyncio.Semaphore(3)
 
             async def worker(item):
@@ -1510,7 +1510,7 @@ async def backtest90(
             all_trades
         )
 
-        # Portföy simülasyonu aynı birleşik kronolojik trade akışında.
+        # PortfÃ¶y simÃ¼lasyonu aynÄ± birleÅŸik kronolojik trade akÄ±ÅŸÄ±nda.
         portfolio_all = simulate_portfolio_v3(
             all_trades
         )
@@ -1608,13 +1608,13 @@ async def backtest90(
 
 def continuation_events_v4(candles, symbol):
     """
-    Amaç tahmin etmek değil:
-    Coin ZATEN yükselmişken ve hacim artmışken, sonraki 60 dakikada
-    hareket devam ediyor mu sorusunu ölçmek.
+    AmaÃ§ tahmin etmek deÄŸil:
+    Coin ZATEN yÃ¼kselmiÅŸken ve hacim artmÄ±ÅŸken, sonraki 60 dakikada
+    hareket devam ediyor mu sorusunu Ã¶lÃ§mek.
 
-    Sinyal tamamlanmış 5m mum kapanışında görülür.
-    Giriş bir sonraki 5m mum OPEN.
-    Çıkış 60 dakika sonraki OPEN.
+    Sinyal tamamlanmÄ±ÅŸ 5m mum kapanÄ±ÅŸÄ±nda gÃ¶rÃ¼lÃ¼r.
+    GiriÅŸ bir sonraki 5m mum OPEN.
+    Ã‡Ä±kÄ±ÅŸ 60 dakika sonraki OPEN.
     """
     events = []
 
@@ -1635,7 +1635,7 @@ def continuation_events_v4(candles, symbol):
             if avg_volume > 0 else 0
         )
 
-        # Sadece halihazırda yükselmiş hareketleri inceliyoruz.
+        # Sadece halihazÄ±rda yÃ¼kselmiÅŸ hareketleri inceliyoruz.
         if mom5 <= 0 or mom15 <= 0 or mom30 < 0.50:
             continue
 
@@ -1676,8 +1676,8 @@ def bucket_label(value, cuts, labels):
 
 def continuation_bucket_report(events):
     """
-    Önceden belirlenmiş geniş kovalar.
-    Bunlar optimize edilmiş giriş eşikleri değildir; davranışı görmek içindir.
+    Ã–nceden belirlenmiÅŸ geniÅŸ kovalar.
+    Bunlar optimize edilmiÅŸ giriÅŸ eÅŸikleri deÄŸildir; davranÄ±ÅŸÄ± gÃ¶rmek iÃ§indir.
     """
     momentum_labels = [
         "0.50-0.99%",
@@ -1765,8 +1765,8 @@ async def continuation90(
 ):
     """
     V4 continuation study:
-    'Hangisi yükselecek?' değil,
-    'Zaten yükselmiş coin ne zaman yükselmeye devam ediyor?' testi.
+    'Hangisi yÃ¼kselecek?' deÄŸil,
+    'Zaten yÃ¼kselmiÅŸ coin ne zaman yÃ¼kselmeye devam ediyor?' testi.
     """
     try:
         async with httpx.AsyncClient(
@@ -1882,19 +1882,19 @@ async def continuation90(
 
 def continuation_quality_events_v5(candles, symbol):
     """
-    V5: Coin zaten yükselmişken hareketin KALİTESİNİ ölçer.
-    Geleceği tahmin eden özellik kullanılmaz.
+    V5: Coin zaten yÃ¼kselmiÅŸken hareketin KALÄ°TESÄ°NÄ° Ã¶lÃ§er.
+    GeleceÄŸi tahmin eden Ã¶zellik kullanÄ±lmaz.
 
-    Sinyal anında bilinenler:
-    - son 30m yükseliş
-    - son altı 5m getirinin yapısı
-    - pozitif 5m mum sayısı
-    - son 15m / ilk 15m momentum karşılaştırması
-    - 30m içi peak'ten mevcut close'a geri çekilme
-    - son 3 mum hacminin önceki 3 muma göre devamlılığı
+    Sinyal anÄ±nda bilinenler:
+    - son 30m yÃ¼kseliÅŸ
+    - son altÄ± 5m getirinin yapÄ±sÄ±
+    - pozitif 5m mum sayÄ±sÄ±
+    - son 15m / ilk 15m momentum karÅŸÄ±laÅŸtÄ±rmasÄ±
+    - 30m iÃ§i peak'ten mevcut close'a geri Ã§ekilme
+    - son 3 mum hacminin Ã¶nceki 3 muma gÃ¶re devamlÄ±lÄ±ÄŸÄ±
 
-    Giriş: sonraki 5m OPEN
-    Çıkış: girişten 60m sonraki OPEN
+    GiriÅŸ: sonraki 5m OPEN
+    Ã‡Ä±kÄ±ÅŸ: giriÅŸten 60m sonraki OPEN
     """
     events = []
 
@@ -1905,7 +1905,7 @@ def continuation_quality_events_v5(candles, symbol):
         mom15 = pct_change(candles[i - 3]["close"], signal_close)
         mom30 = pct_change(candles[i - 6]["close"], signal_close)
 
-        # Biz sadece zaten yükselmiş hareketleri inceliyoruz.
+        # Biz sadece zaten yÃ¼kselmiÅŸ hareketleri inceliyoruz.
         if mom5 <= 0 or mom15 <= 0 or mom30 < 0.50:
             continue
 
@@ -1990,9 +1990,9 @@ def continuation_quality_events_v5(candles, symbol):
 
 def quality_bucket_report_v5(events):
     """
-    Tek değişkenli davranış raporu.
-    Amaç en iyi hücreyi seçmek değil, hangi hareket özelliklerinin
-    OOS'ta continuation ile ilişkili olduğunu görmek.
+    Tek deÄŸiÅŸkenli davranÄ±ÅŸ raporu.
+    AmaÃ§ en iyi hÃ¼creyi seÃ§mek deÄŸil, hangi hareket Ã¶zelliklerinin
+    OOS'ta continuation ile iliÅŸkili olduÄŸunu gÃ¶rmek.
     """
     dimensions = {
         "positive_candle_count": [
@@ -2037,9 +2037,9 @@ def quality_bucket_report_v5(events):
 
 def focused_continuation_zone_v5(events):
     """
-    V4'te keşfedilen genel bölgeyi ayrı raporlar:
+    V4'te keÅŸfedilen genel bÃ¶lgeyi ayrÄ± raporlar:
     30m momentum 1.0%-1.99%.
-    Burada yeni kalite özelliklerini inceliyoruz; yeni eşik optimize etmiyoruz.
+    Burada yeni kalite Ã¶zelliklerini inceliyoruz; yeni eÅŸik optimize etmiyoruz.
     """
     return [
         e for e in events
@@ -2152,9 +2152,9 @@ async def continuation_quality90(
 
 def combo_hypotheses_v6():
     """
-    Önceden tanımlı continuation hipotezleri.
-    Amaç OOS sonucuna göre eşik uydurmak değil; V4/V5'te gözlenen
-    yapıları ayrı, anlaşılır hipotezler olarak test etmektir.
+    Ã–nceden tanÄ±mlÄ± continuation hipotezleri.
+    AmaÃ§ OOS sonucuna gÃ¶re eÅŸik uydurmak deÄŸil; V4/V5'te gÃ¶zlenen
+    yapÄ±larÄ± ayrÄ±, anlaÅŸÄ±lÄ±r hipotezler olarak test etmektir.
     """
     return [
         (
@@ -2272,7 +2272,7 @@ async def continuation_combo90(
         cooled = apply_symbol_cooldown_v4(raw, 60)
         dev, oos = split_dev_oos(cooled)
 
-        # Ayrı coin genişliği: sonuç tek/az sayıda coin tarafından mı taşınıyor?
+        # AyrÄ± coin geniÅŸliÄŸi: sonuÃ§ tek/az sayÄ±da coin tarafÄ±ndan mÄ± taÅŸÄ±nÄ±yor?
         breadth = {}
         for name, predicate in combo_hypotheses_v6():
             coin_rows = []
@@ -2621,13 +2621,13 @@ async def h6_validate_v7(
 
 def enrich_h6_with_regime_v8(events, alt_candles, btc_candles):
     """
-    V8: H6 eşiklerine DOKUNMADAN, sinyal anındaki rejimi ekler.
-    Gelecek veri kullanılmaz.
+    V8: H6 eÅŸiklerine DOKUNMADAN, sinyal anÄ±ndaki rejimi ekler.
+    Gelecek veri kullanÄ±lmaz.
 
-    Rejim değişkenleri:
+    Rejim deÄŸiÅŸkenleri:
       BTC 1h / 4h / 24h return
       ALT 1h / 4h / 24h return
-    5m tamamlanmış mumlardan hesaplanır.
+    5m tamamlanmÄ±ÅŸ mumlardan hesaplanÄ±r.
     """
     alt_by_close = {c["close_time"]: idx for idx, c in enumerate(alt_candles)}
     btc_by_close = {c["close_time"]: idx for idx, c in enumerate(btc_candles)}
@@ -2699,9 +2699,9 @@ def enrich_h6_with_regime_v8(events, alt_candles, btc_candles):
 
 def regime_report_v8(events):
     """
-    Önceden tanımlı, kaba rejim ayrımları.
-    Amaç 'en iyi eşik' aramak değil; H6'nın hangi piyasa yönünde
-    bozulduğunu veya iyileştiğini görmek.
+    Ã–nceden tanÄ±mlÄ±, kaba rejim ayrÄ±mlarÄ±.
+    AmaÃ§ 'en iyi eÅŸik' aramak deÄŸil; H6'nÄ±n hangi piyasa yÃ¶nÃ¼nde
+    bozulduÄŸunu veya iyileÅŸtiÄŸini gÃ¶rmek.
     """
     regimes = [
         ("ALL", lambda e: True),
@@ -5662,7 +5662,7 @@ async def v18_regime_validate(
         }
 
 # =========================
-# V18 LIGHT — RENDER SAFE
+# V18 LIGHT â€” RENDER SAFE
 # =========================
 @app.get("/v18-light")
 async def v18_light():
@@ -6706,7 +6706,7 @@ async def v27_status():
     }
 
 # ============================================================
-# V28 CHALLENGER DIAGNOSTIC — SIGNAL FUNNEL ONLY
+# V28 CHALLENGER DIAGNOSTIC â€” SIGNAL FUNNEL ONLY
 # V27 forward paper remains unchanged.
 # No orders, no live trading, no V28 paper entries yet.
 # ============================================================
@@ -7304,7 +7304,7 @@ async def v28_btc_block(
 
 
 # ============================================================
-# V29 TOP-N CONTINUATION RANKING — LIGHT 3-DAY BLOCK
+# V29 TOP-N CONTINUATION RANKING â€” LIGHT 3-DAY BLOCK
 # Research only. V27 forward paper remains untouched.
 # Ranking uses information already known at the 60m decision point.
 # ============================================================
@@ -7715,7 +7715,7 @@ async def v30_confirmation_top1(
 
 
 # ============================================================
-# V31 REGIME DIAGNOSTIC — TOP1 / 60M FROZEN CHALLENGER
+# V31 REGIME DIAGNOSTIC â€” TOP1 / 60M FROZEN CHALLENGER
 # Research only. No V27/V29/V30 forward logic is changed.
 # All regime variables are known at the entry decision time.
 # ============================================================
@@ -7944,7 +7944,7 @@ async def v31_regime_block(
 
 
 # ============================================================
-# V32 FORWARD CHALLENGER — FROZEN AFTER V31
+# V32 FORWARD CHALLENGER â€” FROZEN AFTER V31
 # BTC-independent + Top1 + 60m confirmation + 120m hold
 # Separate PostgreSQL state/table. V27 state/rules untouched.
 # Research paper only; no trading/orders.
@@ -8225,7 +8225,7 @@ async def v32_notify(result):
     notes = []
     for p in result.get("new_entries", []):
         msg = (
-            "🧪 V32 PAPER ENTRY\n"
+            "ğŸ§ª V32 PAPER ENTRY\n"
             f"{p['symbol']}\n"
             f"Entry: {p['entry_price']}\n"
             f"Z: {p['relative_momentum_z']} | pctile: {p['cross_section_percentile']}\n"
@@ -8242,7 +8242,7 @@ async def v32_notify(result):
 
     for p in result.get("newly_closed", []):
         msg = (
-            "🧪 V32 PAPER EXIT\n"
+            "ğŸ§ª V32 PAPER EXIT\n"
             f"{p['symbol']}\n"
             f"Entry: {p['entry_price']} | Exit: {p['exit_price']}\n"
             f"Gross: {p['gross_pct']}% | Cost: {p['cost_pct']}%\n"
@@ -8533,4 +8533,404 @@ async def v34_diagnostic():
         "v27": v34_diag(V20_STATE.get("closed", []), "wait_end_change_pct"),
         "v32": v34_diag(V32_STATE.get("closed", []), "continuation_60m_pct"),
         "interpretation_note": "Compare winner vs loser distributions only after enough forward-paper trades accumulate. This endpoint reads existing paper state and does not alter frozen rules."
+    }
+
+
+# ============================================================
+# V35 FORWARD PULLBACK-ENTRY CHALLENGER (READS NEW V27 SIGNALS)
+# Research/paper only. V27/V32 rules and state are not modified.
+# Four predeclared variants share the same live reference-price observation:
+#   30s / -0.25%, 30s / -0.50%, 60s / -0.25%, 60s / -0.50%
+# A paper limit is considered filled when the sampled live Binance price is
+# at or below the limit. Filled positions are held 120 minutes from fill.
+# Fixed 0.15% round-trip research cost; no slippage/queue model.
+# ============================================================
+
+V35_VARIANTS = {
+    "PB_30S_025": {"window_seconds": 30, "pullback_pct": 0.25},
+    "PB_30S_050": {"window_seconds": 30, "pullback_pct": 0.50},
+    "PB_60S_025": {"window_seconds": 60, "pullback_pct": 0.25},
+    "PB_60S_050": {"window_seconds": 60, "pullback_pct": 0.50},
+}
+V35_COST_PCT = 0.15
+V35_HOLD_SECONDS = 120 * 60
+V35_POLL_SECONDS = 1.0
+V35_DB_TABLE = "alt_v35_pullback_state"
+V35_TASK = None
+V35_LOCK = asyncio.Lock()
+V35_STATE = {
+    "started_utc": utc_now(),
+    "seen_v27_keys": set(),
+    "experiments": {},
+    "last_error": None,
+    "last_watch_utc": None,
+}
+
+
+def v35_ms_now():
+    return int(datetime.now(timezone.utc).timestamp() * 1000)
+
+
+def v35_iso_from_ms(ms):
+    return datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc).isoformat()
+
+
+async def v35_live_price(client, symbol):
+    data = await get_json(client, "/api/v3/ticker/price", params={"symbol": symbol})
+    return float(data["price"])
+
+
+def v35_db_init():
+    if not V21_DB_URL:
+        return
+    with v21_db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                CREATE TABLE IF NOT EXISTS {V35_DB_TABLE} (
+                    id INTEGER PRIMARY KEY,
+                    payload JSONB NOT NULL,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+        conn.commit()
+
+
+def v35_serializable_state():
+    return {
+        "started_utc": V35_STATE["started_utc"],
+        "seen_v27_keys": sorted(V35_STATE["seen_v27_keys"]),
+        "experiments": V35_STATE["experiments"],
+        "last_error": V35_STATE["last_error"],
+        "last_watch_utc": V35_STATE["last_watch_utc"],
+    }
+
+
+def v35_save_state():
+    if not V21_DB_URL:
+        return
+    payload = json.dumps(v35_serializable_state())
+    with v21_db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                INSERT INTO {V35_DB_TABLE} (id, payload, updated_at)
+                VALUES (1, %s::jsonb, NOW())
+                ON CONFLICT (id) DO UPDATE
+                SET payload = EXCLUDED.payload, updated_at = NOW()
+            """, (payload,))
+        conn.commit()
+
+
+def v35_load_state():
+    if not V21_DB_URL:
+        return False
+    with v21_db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT payload FROM {V35_DB_TABLE} WHERE id = 1")
+            row = cur.fetchone()
+    if not row:
+        return False
+    payload = row[0]
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+    V35_STATE["started_utc"] = payload.get("started_utc", V35_STATE["started_utc"])
+    V35_STATE["seen_v27_keys"] = set(payload.get("seen_v27_keys", []))
+    V35_STATE["experiments"] = payload.get("experiments", {})
+    V35_STATE["last_error"] = payload.get("last_error")
+    V35_STATE["last_watch_utc"] = payload.get("last_watch_utc")
+    return True
+
+
+def v35_source_rows():
+    rows = []
+    rows.extend(V20_STATE.get("open", {}).values())
+    rows.extend(V20_STATE.get("closed", []))
+    return rows
+
+
+def v35_source_by_key():
+    return {str(x.get("key")): x for x in v35_source_rows() if x.get("key")}
+
+
+async def v35_start_observation(source_pos):
+    """Observe one NEW V27 forward signal for 60 seconds; no exchange order."""
+    source_key = str(source_pos.get("key"))
+    symbol = source_pos.get("symbol")
+    if not source_key or not symbol:
+        return
+
+    async with V35_LOCK:
+        if source_key in V35_STATE["experiments"]:
+            return
+
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
+            reference_price = await v35_live_price(client, symbol)
+            start_ms = v35_ms_now()
+
+            exp = {
+                "source_v27_key": source_key,
+                "symbol": symbol,
+                "source_v27_entry_price": source_pos.get("entry_price"),
+                "reference_price": reference_price,
+                "observation_start_ms": start_ms,
+                "observation_start_utc": v35_iso_from_ms(start_ms),
+                "min_sampled_price": reference_price,
+                "sample_count": 1,
+                "observation_complete": False,
+                "variants": {},
+            }
+            for name, cfg in V35_VARIANTS.items():
+                exp["variants"][name] = {
+                    **cfg,
+                    "limit_price": reference_price * (1.0 - cfg["pullback_pct"] / 100.0),
+                    "status": "WAITING_LIMIT_PAPER",
+                    "fill_time_ms": None,
+                    "fill_time_utc": None,
+                    "fill_price": None,
+                    "exit_due_ms": None,
+                    "exit_time_ms": None,
+                    "exit_time_utc": None,
+                    "exit_price": None,
+                    "gross_pct": None,
+                    "cost_pct": V35_COST_PCT,
+                    "net_pct": None,
+                }
+
+            async with V35_LOCK:
+                V35_STATE["experiments"][source_key] = exp
+            try:
+                v35_save_state()
+            except Exception:
+                pass
+
+            while True:
+                elapsed = (v35_ms_now() - start_ms) / 1000.0
+                if elapsed >= 60.0:
+                    break
+                await asyncio.sleep(V35_POLL_SECONDS)
+                try:
+                    price = await v35_live_price(client, symbol)
+                except Exception:
+                    continue
+                now_ms = v35_ms_now()
+                elapsed = (now_ms - start_ms) / 1000.0
+                exp["sample_count"] += 1
+                exp["min_sampled_price"] = min(exp["min_sampled_price"], price)
+
+                for name, cfg in V35_VARIANTS.items():
+                    v = exp["variants"][name]
+                    if v["status"] != "WAITING_LIMIT_PAPER":
+                        continue
+                    if elapsed <= cfg["window_seconds"] and price <= v["limit_price"]:
+                        v["status"] = "OPEN_PAPER"
+                        v["fill_time_ms"] = now_ms
+                        v["fill_time_utc"] = v35_iso_from_ms(now_ms)
+                        # Paper limit fill at the declared limit, not at sampled lower price.
+                        v["fill_price"] = v["limit_price"]
+                        v["exit_due_ms"] = now_ms + V35_HOLD_SECONDS * 1000
+
+                # Close the 30-second windows as soon as their window expires.
+                if elapsed >= 30.0:
+                    for name, cfg in V35_VARIANTS.items():
+                        v = exp["variants"][name]
+                        if cfg["window_seconds"] == 30 and v["status"] == "WAITING_LIMIT_PAPER":
+                            v["status"] = "NO_FILL_CANCELLED"
+
+            for name, cfg in V35_VARIANTS.items():
+                v = exp["variants"][name]
+                if v["status"] == "WAITING_LIMIT_PAPER":
+                    v["status"] = "NO_FILL_CANCELLED"
+            exp["observation_complete"] = True
+            exp["observation_end_ms"] = v35_ms_now()
+            exp["observation_end_utc"] = v35_iso_from_ms(exp["observation_end_ms"])
+            try:
+                v35_save_state()
+            except Exception:
+                pass
+    except Exception as e:
+        V35_STATE["last_error"] = f"observation {symbol}: {e}"
+        try:
+            v35_save_state()
+        except Exception:
+            pass
+
+
+async def v35_close_due_positions():
+    now_ms = v35_ms_now()
+    due = []
+    for exp in V35_STATE["experiments"].values():
+        for name, v in exp.get("variants", {}).items():
+            if v.get("status") == "OPEN_PAPER" and v.get("exit_due_ms") and now_ms >= int(v["exit_due_ms"]):
+                due.append((exp, name, v))
+    if not due:
+        return 0
+
+    closed_count = 0
+    async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
+        for exp, name, v in due:
+            try:
+                exit_price = await v35_live_price(client, exp["symbol"])
+                exit_ms = v35_ms_now()
+                gross = pct_change(float(v["fill_price"]), exit_price)
+                net = gross - V35_COST_PCT
+                v["status"] = "CLOSED_PAPER"
+                v["exit_time_ms"] = exit_ms
+                v["exit_time_utc"] = v35_iso_from_ms(exit_ms)
+                v["exit_price"] = exit_price
+                v["gross_pct"] = round(gross, 6)
+                v["net_pct"] = round(net, 6)
+                closed_count += 1
+            except Exception as e:
+                V35_STATE["last_error"] = f"exit {exp.get('symbol')} {name}: {e}"
+    if closed_count:
+        try:
+            v35_save_state()
+        except Exception:
+            pass
+    return closed_count
+
+
+def v35_variant_stats(name):
+    rows = []
+    no_fill = 0
+    waiting = 0
+    open_count = 0
+    source = v35_source_by_key()
+    missed_source_nets = []
+
+    for key, exp in V35_STATE["experiments"].items():
+        v = exp.get("variants", {}).get(name)
+        if not v:
+            continue
+        status = v.get("status")
+        if status == "CLOSED_PAPER" and v.get("net_pct") is not None:
+            rows.append(float(v["net_pct"]))
+        elif status == "NO_FILL_CANCELLED":
+            no_fill += 1
+            src = source.get(key)
+            if src and src.get("status") == "CLOSED_PAPER" and src.get("net_pct") is not None:
+                missed_source_nets.append(float(src["net_pct"]))
+        elif status == "OPEN_PAPER":
+            open_count += 1
+        else:
+            waiting += 1
+
+    fills_total = len(rows) + open_count
+    decided = fills_total + no_fill
+    wins = sum(x > 0 for x in rows)
+    losses = sum(x <= 0 for x in rows)
+    gp = sum(x for x in rows if x > 0)
+    gl = -sum(x for x in rows if x < 0)
+    vals_sorted = sorted(rows)
+    med = None
+    if vals_sorted:
+        n = len(vals_sorted)
+        med = vals_sorted[n//2] if n % 2 else (vals_sorted[n//2-1] + vals_sorted[n//2]) / 2.0
+
+    return {
+        "variant": name,
+        **V35_VARIANTS[name],
+        "signals_observed": len(V35_STATE["experiments"]),
+        "decided_fill_or_no_fill": decided,
+        "filled_total": fills_total,
+        "fill_rate_pct": round(100.0 * fills_total / decided, 2) if decided else None,
+        "no_fill_count": no_fill,
+        "waiting_count": waiting,
+        "open_count": open_count,
+        "closed_count": len(rows),
+        "wins": wins,
+        "losses_or_flat": losses,
+        "win_rate_pct": round(100.0 * wins / len(rows), 2) if rows else None,
+        "mean_net_pct": round(mean(rows), 4) if rows else None,
+        "median_net_pct": round(med, 4) if med is not None else None,
+        "profit_factor": round(gp / gl, 4) if gl > 0 else (None if gp == 0 else "INF"),
+        "missed_v27_closed_count": len(missed_source_nets),
+        "missed_v27_mean_net_pct": round(mean(missed_source_nets), 4) if missed_source_nets else None,
+        "missed_v27_win_rate_pct": round(100.0 * sum(x > 0 for x in missed_source_nets) / len(missed_source_nets), 2) if missed_source_nets else None,
+    }
+
+
+async def v35_watch_loop():
+    # Baseline existing V27 history on first install so V35 starts cleanly forward.
+    loaded = False
+    try:
+        if V21_DB_URL:
+            v35_db_init()
+            loaded = v35_load_state()
+    except Exception as e:
+        V35_STATE["last_error"] = f"DB startup: {e}"
+
+    if not loaded:
+        for row in v35_source_rows():
+            if row.get("key"):
+                V35_STATE["seen_v27_keys"].add(str(row["key"]))
+        try:
+            v35_save_state()
+        except Exception:
+            pass
+
+    while True:
+        try:
+            V35_STATE["last_watch_utc"] = utc_now()
+            # Only genuinely new V27 OPEN signals trigger the sub-minute experiment.
+            for pos in list(V20_STATE.get("open", {}).values()):
+                key = str(pos.get("key")) if pos.get("key") else None
+                if not key or key in V35_STATE["seen_v27_keys"]:
+                    continue
+                V35_STATE["seen_v27_keys"].add(key)
+                asyncio.create_task(v35_start_observation(dict(pos)))
+            await v35_close_due_positions()
+        except Exception as e:
+            V35_STATE["last_error"] = f"watch loop: {e}"
+        await asyncio.sleep(1.0)
+
+
+@app.on_event("startup")
+async def v35_startup():
+    global V35_TASK
+    V35_TASK = asyncio.create_task(v35_watch_loop())
+
+
+@app.on_event("shutdown")
+async def v35_shutdown():
+    try:
+        if V21_DB_URL:
+            v35_save_state()
+    except Exception:
+        pass
+
+
+@app.get("/v35-pullback-status")
+async def v35_pullback_status():
+    recent = sorted(
+        V35_STATE["experiments"].values(),
+        key=lambda x: x.get("observation_start_ms", 0),
+        reverse=True,
+    )[:20]
+    return {
+        "model": MODEL,
+        "mode": "RESEARCH_PAPER_ONLY",
+        "status": "OK",
+        "panel": "V35_FORWARD_PULLBACK_ENTRY_CHALLENGER",
+        "trading": False,
+        "orders": False,
+        "mutates_v27": False,
+        "mutates_v32": False,
+        "source_signal": "NEW V27 forward-paper entries only",
+        "reference_price": "live Binance ticker price when V35 detects the new V27 entry",
+        "sampling": "approximately 1 second REST sampling; a touch between samples can be missed",
+        "exit_rule": "120 minutes from actual paper fill; live ticker sampled at/after due time",
+        "round_trip_cost_pct": V35_COST_PCT,
+        "slippage_queue_model": False,
+        "started_utc": V35_STATE["started_utc"],
+        "last_watch_utc": V35_STATE["last_watch_utc"],
+        "last_error": V35_STATE["last_error"],
+        "database_configured": bool(V21_DB_URL),
+        "variants": {name: v35_variant_stats(name) for name in V35_VARIANTS},
+        "recent_experiments": recent,
+        "important_note": (
+            "This is a fresh forward execution experiment. It must not be backfilled by simply adding "
+            "0.25%/0.50% to old V27 returns because no-fill selection changes the trade set."
+        ),
+        "generated_utc": utc_now(),
     }
