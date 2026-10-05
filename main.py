@@ -9133,3 +9133,395 @@ async def v36_paired_comparison():
         "v35_started_utc": V35_STATE.get("started_utc"),
         "generated_utc": utc_now(),
     }
+
+# ============================================================
+# V37 CLEAN FORWARD PULLBACK CHALLENGER
+# Separate paper/research state. Does not mutate V27/V32/V35.
+# Goal: remove the ~5-10 minute V35 detection delay by evaluating the
+# frozen V27 CONTINUED_UP checkpoint from the CURRENT 5m candle OPEN.
+# Then place a paper limit 0.25% below the live reference for 60 seconds.
+# ============================================================
+
+V37_DB_TABLE = "alt_v37_realtime_pullback_state"
+V37_PULLBACK_PCT = 0.25
+V37_WINDOW_SECONDS = 60
+V37_HOLD_SECONDS = 120 * 60
+V37_COST_PCT = 0.15
+V37_POLL_SECONDS = 1.0
+V37_SCAN_INTERVAL_SECONDS = 60
+V37_LOCK = asyncio.Lock()
+V37_STATE = {
+    "started_utc": utc_now(),
+    "seen_keys": set(),
+    "experiments": {},
+    "last_scan_started_utc": None,
+    "last_scan_finished_utc": None,
+    "last_scan_seconds": None,
+    "last_universe_size": 0,
+    "last_candidate_count": 0,
+    "last_error": None,
+}
+
+
+def v37_serializable_state():
+    return {
+        **{k: v for k, v in V37_STATE.items() if k != "seen_keys"},
+        "seen_keys": sorted(V37_STATE["seen_keys"]),
+    }
+
+
+def v37_db_init():
+    if not V21_DB_URL:
+        return
+    with v21_db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                CREATE TABLE IF NOT EXISTS {V37_DB_TABLE} (
+                    id INTEGER PRIMARY KEY,
+                    payload JSONB NOT NULL,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+        conn.commit()
+
+
+def v37_save_state():
+    if not V21_DB_URL:
+        return
+    payload = json.dumps(v37_serializable_state())
+    with v21_db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                INSERT INTO {V37_DB_TABLE} (id, payload, updated_at)
+                VALUES (1, %s::jsonb, NOW())
+                ON CONFLICT (id) DO UPDATE
+                SET payload = EXCLUDED.payload, updated_at = NOW()
+            """, (payload,))
+        conn.commit()
+
+
+def v37_load_state():
+    if not V21_DB_URL:
+        return False
+    with v21_db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT payload FROM {V37_DB_TABLE} WHERE id = 1")
+            row = cur.fetchone()
+    if not row:
+        return False
+    p = row[0]
+    if isinstance(p, str):
+        p = json.loads(p)
+    for k in V37_STATE:
+        if k == "seen_keys":
+            V37_STATE[k] = set(p.get(k, []))
+        elif k in p:
+            V37_STATE[k] = p[k]
+    return True
+
+
+async def v37_get_klines_including_current(client, symbol, limit=400):
+    raw = await get_json(client, "/api/v3/klines", params={
+        "symbol": symbol, "interval": "5m", "limit": limit
+    })
+    return [{
+        "open_time": int(k[0]), "open": float(k[1]), "high": float(k[2]),
+        "low": float(k[3]), "close": float(k[4]), "volume": float(k[5]),
+        "close_time": int(k[6]),
+    } for k in raw]
+
+
+def v37_latest_candidate(candles, symbol):
+    """Evaluate only the newest current-5m checkpoint, without waiting for it to close."""
+    if len(candles) < 310:
+        return None
+    # Last row is the current/in-progress 5m candle. Its OPEN is known now.
+    entry_idx = len(candles) - 1
+    signal_i = entry_idx - (V15_WAIT_MINUTES // 5)
+    if signal_i < 294:
+        return None
+
+    completed = candles[:entry_idx]  # excludes current candle for rolling history
+    ret30, mus, sigmas = precompute_rolling_volatility_v12(completed, 288)
+    if signal_i >= len(ret30):
+        return None
+    mom30 = ret30[signal_i]
+    mu, sigma = mus[signal_i], sigmas[signal_i]
+    if mom30 is None or mom30 <= 0 or mu is None or sigma is None or sigma <= 0:
+        return None
+    z = (mom30 - mu) / sigma
+    signal_close = candles[signal_i]["close"]
+    checkpoint_open = candles[entry_idx]["open"]
+    continuation = pct_change(signal_close, checkpoint_open)
+    if continuation < 0.75:
+        return None
+    return {
+        "symbol": symbol,
+        "signal_time_ms": candles[signal_i]["close_time"],
+        "entry_open_time": candles[entry_idx]["open_time"],
+        "relative_momentum_z": z,
+        "wait_end_change_pct": continuation,
+        "checkpoint_open": checkpoint_open,
+    }
+
+
+async def v37_observe_limit(candidate):
+    key = f'{candidate["symbol"]}:{candidate["entry_open_time"]}'
+    symbol = candidate["symbol"]
+    async with V37_LOCK:
+        if key in V37_STATE["experiments"]:
+            return
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
+            ref = await v35_live_price(client, symbol)
+            start_ms = v35_ms_now()
+            limit_price = ref * (1.0 - V37_PULLBACK_PCT / 100.0)
+            latency_s = (start_ms - int(candidate["entry_open_time"])) / 1000.0
+            exp = {
+                "key": key, "symbol": symbol,
+                "entry_open_time": candidate["entry_open_time"],
+                "checkpoint_open": candidate["checkpoint_open"],
+                "reference_price": ref,
+                "observation_start_ms": start_ms,
+                "observation_start_utc": v35_iso_from_ms(start_ms),
+                "detection_latency_seconds": round(latency_s, 3),
+                "relative_momentum_z": round(candidate["relative_momentum_z"], 4),
+                "cross_section_percentile": round(candidate["cross_section_percentile"], 4),
+                "wait_end_change_pct": round(candidate["wait_end_change_pct"], 4),
+                "btc_4h_pct": round(candidate["btc_4h_pct"], 4),
+                "btc_24h_pct": round(candidate["btc_24h_pct"], 4),
+                "alt_market_mean_30m_pct": round(candidate["alt_market_mean_30m_pct"], 4),
+                "pullback_pct": V37_PULLBACK_PCT,
+                "window_seconds": V37_WINDOW_SECONDS,
+                "limit_price": limit_price,
+                "min_sampled_price": ref,
+                "sample_count": 1,
+                "status": "WAITING_LIMIT_PAPER",
+                "fill_time_ms": None, "fill_time_utc": None, "fill_price": None,
+                "exit_due_ms": None, "exit_time_ms": None, "exit_time_utc": None,
+                "exit_price": None, "gross_pct": None, "cost_pct": V37_COST_PCT,
+                "net_pct": None,
+            }
+            async with V37_LOCK:
+                V37_STATE["experiments"][key] = exp
+            try: v37_save_state()
+            except Exception: pass
+
+            while (v35_ms_now() - start_ms) / 1000.0 < V37_WINDOW_SECONDS:
+                await asyncio.sleep(V37_POLL_SECONDS)
+                try:
+                    price = await v35_live_price(client, symbol)
+                except Exception:
+                    continue
+                exp["sample_count"] += 1
+                exp["min_sampled_price"] = min(exp["min_sampled_price"], price)
+                if price <= limit_price:
+                    now_ms = v35_ms_now()
+                    exp["status"] = "OPEN_PAPER"
+                    exp["fill_time_ms"] = now_ms
+                    exp["fill_time_utc"] = v35_iso_from_ms(now_ms)
+                    exp["fill_price"] = limit_price
+                    exp["exit_due_ms"] = now_ms + V37_HOLD_SECONDS * 1000
+                    break
+            if exp["status"] == "WAITING_LIMIT_PAPER":
+                exp["status"] = "NO_FILL_CANCELLED"
+            try: v37_save_state()
+            except Exception: pass
+    except Exception as e:
+        V37_STATE["last_error"] = f"observation {symbol}: {e}"
+
+
+async def v37_close_due():
+    now_ms = v35_ms_now()
+    due = [x for x in V37_STATE["experiments"].values()
+           if x.get("status") == "OPEN_PAPER" and x.get("exit_due_ms") and now_ms >= int(x["exit_due_ms"])]
+    if not due:
+        return
+    async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
+        for x in due:
+            try:
+                px = await v35_live_price(client, x["symbol"])
+                t = v35_ms_now()
+                gross = pct_change(float(x["fill_price"]), px)
+                x["status"] = "CLOSED_PAPER"
+                x["exit_time_ms"] = t
+                x["exit_time_utc"] = v35_iso_from_ms(t)
+                x["exit_price"] = px
+                x["gross_pct"] = round(gross, 6)
+                x["net_pct"] = round(gross - V37_COST_PCT, 6)
+            except Exception as e:
+                V37_STATE["last_error"] = f"exit {x.get('symbol')}: {e}"
+    try: v37_save_state()
+    except Exception: pass
+
+
+async def v37_scan_once():
+    started_ms = v35_ms_now()
+    V37_STATE["last_scan_started_utc"] = utc_now()
+    async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
+        universe = await build_universe(client)
+        V37_STATE["last_universe_size"] = len(universe)
+        semaphore = asyncio.Semaphore(12)
+        async def fetch(item):
+            async with semaphore:
+                try:
+                    c = await v37_get_klines_including_current(client, item["symbol"], 400)
+                    return item["symbol"], c
+                except Exception:
+                    return item["symbol"], None
+        fetched = await asyncio.gather(*[fetch(x) for x in universe])
+        good = {s: c for s, c in fetched if c}
+        if "BTCUSDT" not in good:
+            good["BTCUSDT"] = await v37_get_klines_including_current(client, "BTCUSDT", 400)
+
+        raw = []
+        for sym, candles in good.items():
+            if sym == "BTCUSDT":
+                continue
+            e = v37_latest_candidate(candles, sym)
+            if e:
+                raw.append(e)
+
+        # Cross-sectional percentile for the same original signal timestamp.
+        by_time = {}
+        for e in raw:
+            by_time.setdefault(e["signal_time_ms"], []).append(e)
+        ranked = []
+        for group in by_time.values():
+            if len(group) < 5:
+                continue
+            ordered = sorted(group, key=lambda x: x["relative_momentum_z"])
+            n = len(ordered)
+            for idx, e in enumerate(ordered):
+                x = dict(e)
+                x["cross_section_percentile"] = idx / (n - 1) if n > 1 else 1.0
+                ranked.append(x)
+
+        btc = good["BTCUSDT"]
+        accepted = []
+        for e in ranked:
+            if e["relative_momentum_z"] < 1.0 or e["cross_section_percentile"] < 0.80:
+                continue
+            reg = btc_regime_at_v17(btc, e["signal_time_ms"])
+            if not reg or reg["btc_trend"] != "BTC_BULL":
+                continue
+            vals = []
+            for sym, c in good.items():
+                if sym == "BTCUSDT":
+                    continue
+                # Find original signal candle by close_time; compute its 30m move.
+                idx = next((j for j, q in enumerate(c) if q["close_time"] == e["signal_time_ms"]), None)
+                if idx is not None and idx >= 6:
+                    vals.append(pct_change(c[idx-6]["close"], c[idx]["close"]))
+            if not vals:
+                continue
+            alt_mean = mean(vals)
+            if alt_mean >= 0.5:
+                continue
+            x = dict(e)
+            x["btc_4h_pct"] = reg["btc_4h_pct"]
+            x["btc_24h_pct"] = reg["btc_24h_pct"]
+            x["alt_market_mean_30m_pct"] = alt_mean
+            accepted.append(x)
+
+        V37_STATE["last_candidate_count"] = len(accepted)
+        for e in accepted:
+            key = f'{e["symbol"]}:{e["entry_open_time"]}'
+            if key in V37_STATE["seen_keys"]:
+                continue
+            V37_STATE["seen_keys"].add(key)
+            asyncio.create_task(v37_observe_limit(e))
+
+    finished_ms = v35_ms_now()
+    V37_STATE["last_scan_finished_utc"] = utc_now()
+    V37_STATE["last_scan_seconds"] = round((finished_ms - started_ms) / 1000.0, 3)
+    try: v37_save_state()
+    except Exception: pass
+
+
+async def v37_loop():
+    loaded = False
+    try:
+        if V21_DB_URL:
+            v37_db_init(); loaded = v37_load_state()
+    except Exception as e:
+        V37_STATE["last_error"] = f"DB startup: {e}"
+    await asyncio.sleep(20)
+    while True:
+        try:
+            await v37_scan_once()
+            await v37_close_due()
+        except Exception as e:
+            V37_STATE["last_error"] = f"loop: {e}"
+        await asyncio.sleep(V37_SCAN_INTERVAL_SECONDS)
+
+
+@app.on_event("startup")
+async def v37_startup():
+    global V37_TASK
+    V37_TASK = asyncio.create_task(v37_loop())
+
+
+@app.on_event("shutdown")
+async def v37_shutdown():
+    try: v37_save_state()
+    except Exception: pass
+
+
+def v37_stats():
+    rows = list(V37_STATE["experiments"].values())
+    closed = [float(x["net_pct"]) for x in rows if x.get("status") == "CLOSED_PAPER" and x.get("net_pct") is not None]
+    fills = [x for x in rows if x.get("status") in ("OPEN_PAPER", "CLOSED_PAPER")]
+    nofills = [x for x in rows if x.get("status") == "NO_FILL_CANCELLED"]
+    waiting = [x for x in rows if x.get("status") == "WAITING_LIMIT_PAPER"]
+    lat = [float(x["detection_latency_seconds"]) for x in rows if x.get("detection_latency_seconds") is not None]
+    gp = sum(x for x in closed if x > 0); gl = -sum(x for x in closed if x < 0)
+    return {
+        "signals_observed": len(rows), "filled_total": len(fills),
+        "fill_rate_pct": round(100*len(fills)/len(rows),2) if rows else None,
+        "no_fill_total": len(nofills), "waiting_total": len(waiting),
+        "closed_count": len(closed), "win_rate_pct": round(100*sum(x>0 for x in closed)/len(closed),2) if closed else None,
+        "mean_net_pct": round(mean(closed),4) if closed else None,
+        "median_net_pct": round(median(closed),4) if closed else None,
+        "profit_factor": round(gp/gl,4) if gl>0 else (None if gp==0 else "INF"),
+        "detection_latency_seconds": {
+            "count": len(lat), "mean": round(mean(lat),2) if lat else None,
+            "median": round(median(lat),2) if lat else None,
+            "min": round(min(lat),2) if lat else None, "max": round(max(lat),2) if lat else None,
+        },
+    }
+
+
+@app.get("/v37-status")
+async def v37_status():
+    recent = sorted(V37_STATE["experiments"].values(), key=lambda x: x.get("observation_start_ms",0), reverse=True)[:20]
+    return {
+        **MODE_INFO, "status": "OK", "panel": "V37_CLEAN_REALTIME_PULLBACK_CHALLENGER",
+        "trading": False, "orders": False,
+        "mutates_v27": False, "mutates_v32": False, "mutates_v35": False,
+        "frozen_rules": {
+            "source_logic": "V27 Candidate B, evaluated at current 5m checkpoint OPEN",
+            "pullback_pct": V37_PULLBACK_PCT, "limit_window_seconds": V37_WINDOW_SECONDS,
+            "hold_minutes_from_fill": 120, "round_trip_cost_pct": V37_COST_PCT,
+        },
+        "scanner": {
+            "interval_seconds": V37_SCAN_INTERVAL_SECONDS,
+            "last_scan_started_utc": V37_STATE["last_scan_started_utc"],
+            "last_scan_finished_utc": V37_STATE["last_scan_finished_utc"],
+            "last_scan_seconds": V37_STATE["last_scan_seconds"],
+            "last_universe_size": V37_STATE["last_universe_size"],
+            "last_candidate_count": V37_STATE["last_candidate_count"],
+            "last_error": V37_STATE["last_error"],
+        },
+        "stats": v37_stats(), "started_utc": V37_STATE["started_utc"],
+        "recent_experiments": recent,
+        "limitations": [
+            "Paper/research only; no exchange orders.",
+            "Current 5m candle OPEN is used only as the already-known 60m checkpoint price; future current-candle high/low/close are not used.",
+            "Limit touch uses approximately 1-second REST sampling and can miss brief touches.",
+            "Exit uses live ticker at/after 120 minutes from actual paper fill.",
+            "Fixed 0.15% cost; slippage and queue position are not modeled.",
+            "The key validation metric is V37 detection latency; results should not be interpreted until latency is materially below V35's ~460 seconds."
+        ],
+        "generated_utc": utc_now(),
+    }
