@@ -9864,3 +9864,206 @@ async def v40_z_continuation_matrix():
         "interpretation_guardrail": "Exploratory interaction diagnostic only. Look for the same broad cell pattern in V27 and V32, adequate cell counts, positive median/mean and PF>1 together. Do not derive a new trading threshold from the best cell alone.",
         "generated_utc": utc_now(),
     }
+
+
+# ============================================================
+# V41 - PROSPECTIVE OVEREXTENSION VALIDATION (READ-ONLY)
+# ============================================================
+# Predeclared after V40:
+# Test whether the HIGH-Z tertile is prospectively worse than
+# LOW/MID-Z among NEW closed V27 and V32 trades.
+#
+# IMPORTANT:
+# - V41 does not block or alter any trade.
+# - Baseline is fixed at first V41 initialization.
+# - Z cutpoints are frozen from the PRE-V41 closed sample.
+# - Only trades not present at baseline are included later.
+# - V27 and V32 are analyzed separately.
+# ============================================================
+
+V41_STATE = {
+    "initialized": False,
+    "initialized_utc": None,
+    "v27_baseline_keys": [],
+    "v32_baseline_keys": [],
+    "v27_high_z_cut": None,
+    "v32_high_z_cut": None,
+}
+
+def _v41_trade_key(t):
+    return "|".join([
+        str(t.get("symbol", "")),
+        str(t.get("entry_open_time", t.get("entry_time_utc", ""))),
+        str(t.get("exit_time_utc", "")),
+    ])
+
+def _v41_num(t, *fields):
+    for field in fields:
+        value = t.get(field)
+        if value is not None:
+            try:
+                return float(value)
+            except Exception:
+                pass
+    return None
+
+def _v41_z(t):
+    return _v41_num(t, "relative_momentum_z", "z", "z_score")
+
+def _v41_cont_v27(t):
+    return _v41_num(t, "wait_end_change_pct", "continuation_60m_pct")
+
+def _v41_cont_v32(t):
+    return _v41_num(t, "continuation_60m_pct", "wait_end_change_pct")
+
+def _v41_rank_high_cut(trades):
+    vals = sorted(v for v in (_v41_z(t) for t in trades) if v is not None)
+    if not vals:
+        return None
+    # HIGH = upper third. Freeze this numeric cut at V41 initialization.
+    idx = max(0, min(len(vals) - 1, (2 * len(vals)) // 3))
+    return float(vals[idx])
+
+def _v41_summary(rows):
+    values = [_v41_num(x, "net_pct") for x in rows]
+    values = [x for x in values if x is not None]
+    if not values:
+        return {
+            "n": 0, "wins": 0, "losses": 0, "win_rate_pct": None,
+            "ge_2pct_count": 0, "ge_2pct_rate": None,
+            "mean_net_pct": None, "median_net_pct": None,
+            "profit_factor": None,
+        }
+    wins = [x for x in values if x > 0]
+    losses = [x for x in values if x < 0]
+    gp = sum(wins)
+    gl = abs(sum(losses))
+    pf = (gp / gl) if gl > 0 else (None if gp > 0 else 0.0)
+    ge2 = sum(1 for x in values if x >= 2.0)
+    return {
+        "n": len(values),
+        "wins": len(wins),
+        "losses": len(losses),
+        "win_rate_pct": round(len(wins) / len(values) * 100.0, 2),
+        "ge_2pct_count": ge2,
+        "ge_2pct_rate": round(ge2 / len(values) * 100.0, 2),
+        "mean_net_pct": round(mean(values), 4),
+        "median_net_pct": round(median(values), 4),
+        "profit_factor": round(pf, 4) if pf is not None else None,
+    }
+
+def _v41_branch_report(current, baseline_keys, high_cut, cont_fn):
+    baseline = set(baseline_keys)
+    new_rows = [t for t in current if _v41_trade_key(t) not in baseline]
+    usable = [t for t in new_rows if _v41_z(t) is not None and _v41_num(t, "net_pct") is not None]
+    high = [t for t in usable if _v41_z(t) >= high_cut] if high_cut is not None else []
+    control = [t for t in usable if _v41_z(t) < high_cut] if high_cut is not None else []
+
+    def cont_median(rows):
+        vals = [cont_fn(t) for t in rows]
+        vals = [v for v in vals if v is not None]
+        return round(median(vals), 4) if vals else None
+
+    hs = _v41_summary(high)
+    cs = _v41_summary(control)
+
+    return {
+        "new_closed_since_v41_baseline": len(new_rows),
+        "usable_with_z_and_net": len(usable),
+        "frozen_high_z_cut": round(high_cut, 6) if high_cut is not None else None,
+        "HIGH_Z_overextended_candidate": {
+            **hs,
+            "continuation_median_pct": cont_median(high),
+        },
+        "LOW_MID_Z_control": {
+            **cs,
+            "continuation_median_pct": cont_median(control),
+        },
+        "prospective_difference_HIGH_minus_CONTROL": {
+            "mean_net_pct_points": (
+                round(hs["mean_net_pct"] - cs["mean_net_pct"], 4)
+                if hs["mean_net_pct"] is not None and cs["mean_net_pct"] is not None else None
+            ),
+            "median_net_pct_points": (
+                round(hs["median_net_pct"] - cs["median_net_pct"], 4)
+                if hs["median_net_pct"] is not None and cs["median_net_pct"] is not None else None
+            ),
+            "win_rate_pct_points": (
+                round(hs["win_rate_pct"] - cs["win_rate_pct"], 2)
+                if hs["win_rate_pct"] is not None and cs["win_rate_pct"] is not None else None
+            ),
+            "ge_2pct_rate_points": (
+                round(hs["ge_2pct_rate"] - cs["ge_2pct_rate"], 2)
+                if hs["ge_2pct_rate"] is not None and cs["ge_2pct_rate"] is not None else None
+            ),
+        },
+    }
+
+def _v41_initialize_if_needed():
+    if V41_STATE["initialized"]:
+        return
+
+    v27_closed = list(V20_STATE.get("closed", []))
+    v32_closed = list(V32_STATE.get("closed", []))
+
+    V41_STATE["v27_baseline_keys"] = [_v41_trade_key(t) for t in v27_closed]
+    V41_STATE["v32_baseline_keys"] = [_v41_trade_key(t) for t in v32_closed]
+    V41_STATE["v27_high_z_cut"] = _v41_rank_high_cut(v27_closed)
+    V41_STATE["v32_high_z_cut"] = _v41_rank_high_cut(v32_closed)
+    V41_STATE["initialized_utc"] = utc_now()
+    V41_STATE["initialized"] = True
+
+@app.get("/v41-prospective-overextension")
+async def v41_prospective_overextension():
+    _v41_initialize_if_needed()
+
+    v27_closed = list(V20_STATE.get("closed", []))
+    v32_closed = list(V32_STATE.get("closed", []))
+
+    return {
+        **MODE_INFO,
+        "status": "OK",
+        "panel": "V41_PROSPECTIVE_OVEREXTENSION_VALIDATION",
+        "trading": False,
+        "orders": False,
+        "mutates_v27": False,
+        "mutates_v32": False,
+        "mutates_v35": False,
+        "mutates_v37": False,
+        "mutates_v38": False,
+        "mutates_v39": False,
+        "mutates_v40": False,
+        "runs_extra_market_scan": False,
+        "predeclared_hypothesis": (
+            "Among NEW forward closed trades after the V41 baseline, "
+            "the frozen upper-third Z group (HIGH-Z / overextended candidate) "
+            "will have worse outcomes than the LOW/MID-Z control group."
+        ),
+        "baseline": {
+            "initialized_utc": V41_STATE["initialized_utc"],
+            "v27_closed_at_baseline": len(V41_STATE["v27_baseline_keys"]),
+            "v32_closed_at_baseline": len(V41_STATE["v32_baseline_keys"]),
+            "cut_method": (
+                "Upper-third Z cut frozen from pre-V41 closed trades at first endpoint initialization; "
+                "future trades do not move the cut."
+            ),
+        },
+        "v27": _v41_branch_report(
+            v27_closed,
+            V41_STATE["v27_baseline_keys"],
+            V41_STATE["v27_high_z_cut"],
+            _v41_cont_v27,
+        ),
+        "v32": _v41_branch_report(
+            v32_closed,
+            V41_STATE["v32_baseline_keys"],
+            V41_STATE["v32_high_z_cut"],
+            _v41_cont_v32,
+        ),
+        "interpretation_guardrail": (
+            "Prospective diagnostic only. Do not alter V27/V32 entry logic from early V41 results. "
+            "Require adequate NEW sample size and broadly consistent deterioration in HIGH-Z across both branches."
+        ),
+        "generated_utc": utc_now(),
+    }
+
