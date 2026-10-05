@@ -9525,3 +9525,108 @@ async def v37_status():
         ],
         "generated_utc": utc_now(),
     }
+
+# ============================================================
+# V38 READ-ONLY >= +2% SEPARATOR DIAGNOSTIC
+# No strategy mutation. No market scan. No orders.
+# Compares CLOSED_PAPER trades with net >= +2% vs net < +2%.
+# V27, V32 and V37 are analyzed separately to avoid pseudo-replication.
+# ============================================================
+
+def v38_float(x):
+    try:
+        v = float(x)
+        return v if math.isfinite(v) else None
+    except (TypeError, ValueError):
+        return None
+
+def v38_quantile(vals, q):
+    xs = sorted(vals)
+    if not xs: return None
+    if len(xs) == 1: return xs[0]
+    pos = (len(xs)-1)*q
+    lo, hi = int(math.floor(pos)), int(math.ceil(pos))
+    if lo == hi: return xs[lo]
+    return xs[lo] + (xs[hi]-xs[lo])*(pos-lo)
+
+def v38_desc(vals):
+    xs = [float(x) for x in vals if x is not None]
+    if not xs:
+        return {"n":0,"mean":None,"median":None,"q1":None,"q3":None,"iqr":None}
+    q1, q3 = v38_quantile(xs,.25), v38_quantile(xs,.75)
+    return {"n":len(xs),"mean":round(sum(xs)/len(xs),4),"median":round(v38_quantile(xs,.5),4),
+            "q1":round(q1,4),"q3":round(q3,4),"iqr":round(q3-q1,4)}
+
+def v38_mann_whitney(a,b):
+    # Rank-sum with average ranks, tie-corrected normal approximation.
+    # Cliff's delta gives direction/effect magnitude independent of p-value.
+    a=[float(x) for x in a if x is not None]; b=[float(x) for x in b if x is not None]
+    n1,n2=len(a),len(b)
+    if n1==0 or n2==0:
+        return {"u":None,"p_two_sided_approx":None,"cliffs_delta":None,"prob_superiority":None,"warning":"one group empty"}
+    tagged=[(x,0) for x in a]+[(x,1) for x in b]
+    tagged.sort(key=lambda z:z[0])
+    ranks=[0.0]*len(tagged); tie_sizes=[]; i=0
+    while i<len(tagged):
+        j=i+1
+        while j<len(tagged) and tagged[j][0]==tagged[i][0]: j+=1
+        r=((i+1)+j)/2.0
+        for k in range(i,j): ranks[k]=r
+        if j-i>1: tie_sizes.append(j-i)
+        i=j
+    r1=sum(r for r,t in zip(ranks,tagged) if t[1]==0)
+    u1=r1-n1*(n1+1)/2.0
+    u2=n1*n2-u1
+    u=min(u1,u2)
+    N=n1+n2
+    tie_term=sum(t**3-t for t in tie_sizes)
+    var_u=n1*n2/12.0*((N+1)-(tie_term/(N*(N-1)) if N>1 else 0))
+    z=(u1-n1*n2/2.0)/math.sqrt(var_u) if var_u>0 else 0.0
+    p=math.erfc(abs(z)/math.sqrt(2.0))
+    # delta >0 means >=2% group tends to have higher feature values.
+    gt=sum(x>y for x in a for y in b); lt=sum(x<y for x in a for y in b)
+    delta=(gt-lt)/(n1*n2)
+    ps=(delta+1)/2.0
+    return {"u":round(u,3),"p_two_sided_approx":round(p,6),"cliffs_delta":round(delta,4),
+            "prob_superiority":round(ps,4),
+            "warning":"Approximate p-value; interpret with effect size and sample counts, especially when >=2% group is small."}
+
+def v38_dataset(rows, fields):
+    closed=[r for r in rows if r.get("status")=="CLOSED_PAPER" and v38_float(r.get("net_pct")) is not None]
+    hi=[r for r in closed if float(r["net_pct"])>=2.0]
+    lo=[r for r in closed if float(r["net_pct"])<2.0]
+    tests={}
+    for field in fields:
+        av=[v38_float(r.get(field)) for r in hi]; av=[x for x in av if x is not None]
+        bv=[v38_float(r.get(field)) for r in lo]; bv=[x for x in bv if x is not None]
+        mw=v38_mann_whitney(av,bv)
+        tests[field]={"ge_2pct":v38_desc(av),"lt_2pct":v38_desc(bv),**mw,
+                      "direction":"HIGHER_IN_GE_2" if mw.get("cliffs_delta") is not None and mw["cliffs_delta"]>0 else
+                                  ("LOWER_IN_GE_2" if mw.get("cliffs_delta") is not None and mw["cliffs_delta"]<0 else "NO_DIRECTION")}
+    ranked=sorted(
+        [{"field":k,"cliffs_delta":v.get("cliffs_delta"),"abs_cliffs_delta":abs(v.get("cliffs_delta")) if v.get("cliffs_delta") is not None else None,
+          "p_two_sided_approx":v.get("p_two_sided_approx"),"direction":v.get("direction")} for k,v in tests.items()],
+        key=lambda x:(x["abs_cliffs_delta"] is not None, x["abs_cliffs_delta"] or -1), reverse=True)
+    return {"closed_count":len(closed),"ge_2pct_count":len(hi),"lt_2pct_count":len(lo),
+            "ge_2pct_rate":round(100*len(hi)/len(closed),2) if closed else None,
+            "tests":tests,"ranked_by_abs_effect_size":ranked}
+
+@app.get("/v38-ge2-separator")
+async def v38_ge2_separator():
+    common=["relative_momentum_z","cross_section_percentile","alt_market_mean_30m_pct","btc_4h_pct","btc_24h_pct"]
+    v27_fields=common+["wait_end_change_pct"]
+    v32_fields=["relative_momentum_z","cross_section_percentile","alt_market_mean_30m_pct","continuation_60m_pct"]
+    v37_fields=common+["wait_end_change_pct","detection_latency_seconds"]
+    return {
+        "model":MODEL,"mode":"RESEARCH_PAPER_ONLY","status":"OK",
+        "panel":"V38_READ_ONLY_GE2_SEPARATOR_DIAGNOSTIC","trading":False,"orders":False,
+        "threshold_definition":"GE_2: net_pct >= +2.0%; LT_2: net_pct < +2.0% (includes 0..2 and negatives)",
+        "mutates_v27":False,"mutates_v32":False,"mutates_v35":False,"mutates_v37":False,
+        "runs_extra_market_scan":False,
+        "v27":v38_dataset(V20_STATE.get("closed",[]),v27_fields),
+        "v32":v38_dataset(V32_STATE.get("closed",[]),v32_fields),
+        "v37":v38_dataset(list(V37_STATE.get("experiments",{}).values()),v37_fields),
+        "v35_note":"Not pooled into V27/V32/V37 because V35 variants reuse V27 source signals and are not independent observations; use V36 paired comparison for V35.",
+        "interpretation":"Look first for a sizable Cliff's delta with the SAME direction across independent forward branches, then consider p-values. This is diagnostic only; do not create a threshold from one small subgroup.",
+        "generated_utc":utc_now(),
+    }
