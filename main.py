@@ -9631,3 +9631,109 @@ async def v38_ge2_separator():
         "interpretation":"Look first for a sizable Cliff's delta with the SAME direction across independent forward branches, then consider p-values. This is diagnostic only; do not create a threshold from one small subgroup.",
         "generated_utc":utc_now(),
     }
+
+
+# ============================================================
+# V39 READ-ONLY CONTINUATION QUARTILE DIAGNOSTIC
+# No strategy mutation. No market scan. No orders.
+# Tests whether stronger 60m continuation is associated with
+# monotonically better forward outcomes in V27 and V32.
+# ============================================================
+
+def v39_pf(values):
+    wins = [x for x in values if x > 0]
+    losses = [x for x in values if x < 0]
+    gp = sum(wins)
+    gl = -sum(losses)
+    if gl > 0:
+        return round(gp / gl, 4)
+    return None if gp == 0 else "INF"
+
+
+def v39_quartiles(rows, continuation_field):
+    clean = []
+    for r in rows:
+        if r.get("status") != "CLOSED_PAPER":
+            continue
+        net = v38_float(r.get("net_pct"))
+        cont = v38_float(r.get(continuation_field))
+        if net is None or cont is None:
+            continue
+        clean.append({"net": net, "cont": cont})
+
+    clean.sort(key=lambda x: x["cont"])
+    n = len(clean)
+    if n == 0:
+        return {"n": 0, "continuation_field": continuation_field, "quartiles": [], "monotonic_checks": None}
+
+    # Rank-based quartiles keep group sizes as balanced as possible and avoid
+    # optimizing any numerical continuation threshold on this same sample.
+    groups = [[] for _ in range(4)]
+    for i, row in enumerate(clean):
+        q = min(3, (i * 4) // n)
+        groups[q].append(row)
+
+    result = []
+    for idx, g in enumerate(groups, start=1):
+        nets = [x["net"] for x in g]
+        conts = [x["cont"] for x in g]
+        wins = sum(x > 0 for x in nets)
+        ge2 = sum(x >= 2.0 for x in nets)
+        result.append({
+            "quartile": f"Q{idx}",
+            "n": len(g),
+            "continuation_min_pct": round(min(conts), 4) if conts else None,
+            "continuation_max_pct": round(max(conts), 4) if conts else None,
+            "continuation_median_pct": round(median(conts), 4) if conts else None,
+            "ge_2pct_count": ge2,
+            "ge_2pct_rate": round(100.0 * ge2 / len(g), 2) if g else None,
+            "win_rate_pct": round(100.0 * wins / len(g), 2) if g else None,
+            "mean_net_pct": round(mean(nets), 4) if nets else None,
+            "median_net_pct": round(median(nets), 4) if nets else None,
+            "profit_factor": v39_pf(nets),
+        })
+
+    def nondecreasing(field):
+        vals = [x[field] for x in result]
+        if any(v is None or isinstance(v, str) for v in vals):
+            return None
+        return all(vals[i] <= vals[i+1] for i in range(len(vals)-1))
+
+    return {
+        "n": n,
+        "continuation_field": continuation_field,
+        "quartile_method": "rank-based Q1..Q4; approximately equal counts; no optimized numeric threshold",
+        "quartiles": result,
+        "monotonic_checks": {
+            "ge_2pct_rate_nondecreasing_Q1_to_Q4": nondecreasing("ge_2pct_rate"),
+            "win_rate_nondecreasing_Q1_to_Q4": nondecreasing("win_rate_pct"),
+            "mean_net_nondecreasing_Q1_to_Q4": nondecreasing("mean_net_pct"),
+            "median_net_nondecreasing_Q1_to_Q4": nondecreasing("median_net_pct"),
+            "profit_factor_nondecreasing_Q1_to_Q4": nondecreasing("profit_factor"),
+        },
+    }
+
+
+@app.get("/v39-continuation-quartiles")
+async def v39_continuation_quartiles():
+    v27 = v39_quartiles(V20_STATE.get("closed", []), "wait_end_change_pct")
+    v32 = v39_quartiles(V32_STATE.get("closed", []), "continuation_60m_pct")
+    return {
+        "model": MODEL,
+        "mode": "RESEARCH_PAPER_ONLY",
+        "status": "OK",
+        "panel": "V39_READ_ONLY_CONTINUATION_QUARTILE_DIAGNOSTIC",
+        "trading": False,
+        "orders": False,
+        "mutates_v27": False,
+        "mutates_v32": False,
+        "mutates_v35": False,
+        "mutates_v37": False,
+        "mutates_v38": False,
+        "runs_extra_market_scan": False,
+        "question": "Does stronger observed 60m continuation show a graded Q1->Q4 improvement in forward outcomes?",
+        "v27": v27,
+        "v32": v32,
+        "interpretation_guardrail": "Diagnostic only. A monotonic pattern across both independent forward branches is more persuasive than one favorable quartile or one p-value; do not derive a new threshold from this panel alone.",
+        "generated_utc": utc_now(),
+    }
