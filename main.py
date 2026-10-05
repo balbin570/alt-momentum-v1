@@ -9737,3 +9737,130 @@ async def v39_continuation_quartiles():
         "interpretation_guardrail": "Diagnostic only. A monotonic pattern across both independent forward branches is more persuasive than one favorable quartile or one p-value; do not derive a new threshold from this panel alone.",
         "generated_utc": utc_now(),
     }
+
+# ============================================================
+# V40 - READ-ONLY Z x CONTINUATION TERTILE MATRIX DIAGNOSTIC
+# ============================================================
+
+def v40_num(x):
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return None
+
+
+def v40_tertile_labels(rows, field):
+    valid = []
+    for r in rows:
+        v = v40_num(r.get(field))
+        if v is not None:
+            valid.append((v, r))
+    valid.sort(key=lambda x: x[0])
+    n = len(valid)
+    out = {}
+    labels = ["LOW", "MID", "HIGH"]
+    for i, (v, r) in enumerate(valid):
+        # Rank-based tertiles; deterministic and no numeric threshold optimization.
+        bucket = min(2, (i * 3) // max(1, n))
+        out[id(r)] = labels[bucket]
+    return out
+
+
+def v40_cell_stats(rows, continuation_field):
+    if not rows:
+        return {
+            "n": 0,
+            "ge_2pct_count": 0,
+            "ge_2pct_rate": None,
+            "win_rate_pct": None,
+            "mean_net_pct": None,
+            "median_net_pct": None,
+            "profit_factor": None,
+            "z_median": None,
+            "continuation_median_pct": None,
+            "alt_market_mean30_median_pct": None,
+        }
+    nets = [v40_num(r.get("net_pct")) for r in rows]
+    nets = [x for x in nets if x is not None]
+    zvals = [v40_num(r.get("relative_momentum_z")) for r in rows]
+    zvals = [x for x in zvals if x is not None]
+    cont = [v40_num(r.get(continuation_field)) for r in rows]
+    cont = [x for x in cont if x is not None]
+    alt = [v40_num(r.get("alt_market_mean_30m_pct")) for r in rows]
+    alt = [x for x in alt if x is not None]
+    wins = [x for x in nets if x > 0]
+    losses = [x for x in nets if x < 0]
+    gp = sum(wins)
+    gl = abs(sum(losses))
+    pf = (gp / gl) if gl > 0 else (None if gp > 0 else 0.0)
+    ge2 = sum(1 for x in nets if x >= 2.0)
+    return {
+        "n": len(nets),
+        "ge_2pct_count": ge2,
+        "ge_2pct_rate": round(100.0 * ge2 / len(nets), 2) if nets else None,
+        "win_rate_pct": round(100.0 * len(wins) / len(nets), 2) if nets else None,
+        "mean_net_pct": round(mean(nets), 4) if nets else None,
+        "median_net_pct": round(median(nets), 4) if nets else None,
+        "profit_factor": round(pf, 4) if pf is not None else None,
+        "z_median": round(median(zvals), 4) if zvals else None,
+        "continuation_median_pct": round(median(cont), 4) if cont else None,
+        "alt_market_mean30_median_pct": round(median(alt), 4) if alt else None,
+    }
+
+
+def v40_matrix(rows, continuation_field):
+    usable = [r for r in rows if v40_num(r.get("net_pct")) is not None and v40_num(r.get("relative_momentum_z")) is not None and v40_num(r.get(continuation_field)) is not None]
+    zlab = v40_tertile_labels(usable, "relative_momentum_z")
+    clab = v40_tertile_labels(usable, continuation_field)
+    order = ["LOW", "MID", "HIGH"]
+    cells = []
+    for c in order:
+        for z in order:
+            subset = [r for r in usable if clab.get(id(r)) == c and zlab.get(id(r)) == z]
+            cells.append({
+                "continuation_tertile": c,
+                "z_tertile": z,
+                **v40_cell_stats(subset, continuation_field),
+            })
+    # Descriptive ranking only, not a selection rule.
+    ranked = sorted(
+        cells,
+        key=lambda x: (
+            -1 if x["profit_factor"] is None else x["profit_factor"],
+            -999 if x["median_net_pct"] is None else x["median_net_pct"],
+        ),
+        reverse=True,
+    )
+    return {
+        "n": len(usable),
+        "continuation_field": continuation_field,
+        "binning": "Independent rank-based tertiles for Z and continuation; no optimized numeric thresholds.",
+        "cells": cells,
+        "descriptive_rank_by_profit_factor": ranked,
+    }
+
+
+@app.get("/v40-z-continuation-matrix")
+async def v40_z_continuation_matrix():
+    v27_rows = list(V20_STATE.get("closed", []))
+    v32_rows = list(V32_STATE.get("closed", []))
+    return {
+        "model": MODEL,
+        "mode": "RESEARCH_PAPER_ONLY",
+        "status": "OK",
+        "panel": "V40_READ_ONLY_Z_X_CONTINUATION_TERTILE_MATRIX",
+        "trading": False,
+        "orders": False,
+        "mutates_v27": False,
+        "mutates_v32": False,
+        "mutates_v35": False,
+        "mutates_v37": False,
+        "mutates_v38": False,
+        "mutates_v39": False,
+        "runs_extra_market_scan": False,
+        "question": "Are outcomes better when observed 60m continuation is strong but relative-momentum Z is not excessively high?",
+        "v27": v40_matrix(v27_rows, "wait_end_change_pct"),
+        "v32": v40_matrix(v32_rows, "continuation_60m_pct"),
+        "interpretation_guardrail": "Exploratory interaction diagnostic only. Look for the same broad cell pattern in V27 and V32, adequate cell counts, positive median/mean and PF>1 together. Do not derive a new trading threshold from the best cell alone.",
+        "generated_utc": utc_now(),
+    }
