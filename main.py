@@ -8934,3 +8934,202 @@ async def v35_pullback_status():
         ),
         "generated_utc": utc_now(),
     }
+
+
+# ============================================================
+# V36 READ-ONLY PAIRED COMPARISON PANEL
+# Compares the same V27 source signal with V35 30s/-0.25% and 60s/-0.25%.
+# No strategy/state mutation. Research/paper only.
+# ============================================================
+
+V36_VARIANTS = ("PB_30S_025", "PB_60S_025")
+
+
+def v36_basic_stats(values):
+    vals = [float(x) for x in values if x is not None]
+    if not vals:
+        return {
+            "count": 0,
+            "wins": 0,
+            "losses_or_flat": 0,
+            "win_rate_pct": None,
+            "mean_net_pct": None,
+            "median_net_pct": None,
+            "profit_factor": None,
+        }
+    wins = [x for x in vals if x > 0]
+    losses = [x for x in vals if x <= 0]
+    gp = sum(wins)
+    gl = -sum(x for x in vals if x < 0)
+    return {
+        "count": len(vals),
+        "wins": len(wins),
+        "losses_or_flat": len(losses),
+        "win_rate_pct": round(100.0 * len(wins) / len(vals), 2),
+        "mean_net_pct": round(mean(vals), 4),
+        "median_net_pct": round(median(vals), 4),
+        "profit_factor": round(gp / gl, 4) if gl > 0 else (None if gp == 0 else "INF"),
+    }
+
+
+def v36_variant_report(name, source):
+    paired_filled = []
+    no_fill_source = []
+    pending_source = 0
+    fills_total = 0
+    no_fill_total = 0
+    waiting_total = 0
+
+    for key, exp in V35_STATE.get("experiments", {}).items():
+        v = exp.get("variants", {}).get(name)
+        if not v:
+            continue
+        status = v.get("status")
+        src = source.get(str(key))
+
+        if status in ("OPEN_PAPER", "CLOSED_PAPER"):
+            fills_total += 1
+        elif status == "NO_FILL_CANCELLED":
+            no_fill_total += 1
+        else:
+            waiting_total += 1
+
+        # Strict paired outcome: both V35 fill and its exact source V27 trade are closed.
+        if (
+            status == "CLOSED_PAPER"
+            and v.get("net_pct") is not None
+            and src
+            and src.get("status") == "CLOSED_PAPER"
+            and src.get("net_pct") is not None
+        ):
+            v35_net = float(v["net_pct"])
+            v27_net = float(src["net_pct"])
+            paired_filled.append({
+                "key": str(key),
+                "symbol": exp.get("symbol"),
+                "v27_net_pct": v27_net,
+                "v35_net_pct": v35_net,
+                "v35_minus_v27_pct_points": v35_net - v27_net,
+            })
+
+        if status == "NO_FILL_CANCELLED":
+            if src and src.get("status") == "CLOSED_PAPER" and src.get("net_pct") is not None:
+                v27_net = float(src["net_pct"])
+                no_fill_source.append({
+                    "key": str(key),
+                    "symbol": exp.get("symbol"),
+                    "v27_net_pct": v27_net,
+                })
+            else:
+                pending_source += 1
+
+    paired_v27 = [x["v27_net_pct"] for x in paired_filled]
+    paired_v35 = [x["v35_net_pct"] for x in paired_filled]
+    improvements = [x["v35_minus_v27_pct_points"] for x in paired_filled]
+    no_fill_nets = [x["v27_net_pct"] for x in no_fill_source]
+
+    avoided_bad = sum(x < 0 for x in no_fill_nets)
+    missed_good = sum(x > 0 for x in no_fill_nets)
+    missed_flat = sum(x == 0 for x in no_fill_nets)
+
+    decided = fills_total + no_fill_total
+    return {
+        "variant": name,
+        **V35_VARIANTS[name],
+        "signals_observed": len(V35_STATE.get("experiments", {})),
+        "decided_fill_or_no_fill": decided,
+        "filled_total": fills_total,
+        "fill_rate_pct": round(100.0 * fills_total / decided, 2) if decided else None,
+        "no_fill_total": no_fill_total,
+        "waiting_total": waiting_total,
+        "strict_paired_closed_count": len(paired_filled),
+        "paired_same_source": {
+            "v27_immediate_entry": v36_basic_stats(paired_v27),
+            "v35_pullback_entry": v36_basic_stats(paired_v35),
+            "v35_minus_v27_mean_pct_points": round(mean(improvements), 4) if improvements else None,
+            "v35_minus_v27_median_pct_points": round(median(improvements), 4) if improvements else None,
+            "v35_better_trade_count": sum(x > 0 for x in improvements),
+            "v35_worse_trade_count": sum(x < 0 for x in improvements),
+            "equal_trade_count": sum(x == 0 for x in improvements),
+        },
+        "no_fill_source_v27_outcomes": {
+            "closed_source_count": len(no_fill_source),
+            "source_still_pending_count": pending_source,
+            "v27_stats": v36_basic_stats(no_fill_nets),
+            "bad_v27_trades_avoided_count": avoided_bad,
+            "good_v27_trades_missed_count": missed_good,
+            "flat_v27_trades_missed_count": missed_flat,
+            "bad_avoided_share_pct": round(100.0 * avoided_bad / len(no_fill_nets), 2) if no_fill_nets else None,
+            "good_missed_share_pct": round(100.0 * missed_good / len(no_fill_nets), 2) if no_fill_nets else None,
+        },
+        "recent_strict_pairs": paired_filled[-10:],
+    }
+
+
+def v36_reference_timing_report():
+    gaps = []
+    latencies = []
+    for exp in V35_STATE.get("experiments", {}).values():
+        ref = exp.get("reference_price")
+        src_entry = exp.get("source_v27_entry_price")
+        if ref is not None and src_entry not in (None, 0):
+            gaps.append(pct_change(float(src_entry), float(ref)))
+
+        key = str(exp.get("source_v27_key") or "")
+        start_ms = exp.get("observation_start_ms")
+        # V27 key format is symbol:entry_open_time_ms.
+        try:
+            entry_ms = int(key.rsplit(":", 1)[1])
+            if start_ms is not None:
+                latencies.append((int(start_ms) - entry_ms) / 1000.0)
+        except Exception:
+            pass
+
+    return {
+        "reference_vs_v27_entry_gap_pct": {
+            "count": len(gaps),
+            "mean_pct": round(mean(gaps), 4) if gaps else None,
+            "median_pct": round(median(gaps), 4) if gaps else None,
+            "min_pct": round(min(gaps), 4) if gaps else None,
+            "max_pct": round(max(gaps), 4) if gaps else None,
+        },
+        "v35_detection_latency_seconds_from_v27_entry_open_time": {
+            "count": len(latencies),
+            "mean_seconds": round(mean(latencies), 2) if latencies else None,
+            "median_seconds": round(median(latencies), 2) if latencies else None,
+            "min_seconds": round(min(latencies), 2) if latencies else None,
+            "max_seconds": round(max(latencies), 2) if latencies else None,
+        },
+        "note": (
+            "V35 limit levels are based on the live reference price when V35 detects the V27 entry, "
+            "not on V27's theoretical 5m entry-open price. This diagnostic quantifies that timing/reference gap."
+        ),
+    }
+
+
+@app.get("/v36-paired-comparison")
+async def v36_paired_comparison():
+    source = v35_source_by_key()
+    return {
+        "model": MODEL,
+        "mode": "RESEARCH_PAPER_ONLY",
+        "status": "OK",
+        "panel": "V36_READ_ONLY_PAIRED_V27_V35_COMPARISON",
+        "trading": False,
+        "orders": False,
+        "mutates_v27": False,
+        "mutates_v32": False,
+        "mutates_v35": False,
+        "comparison": "V27 immediate paper entry vs V35 pullback entry on the exact same source signal",
+        "variants": {name: v36_variant_report(name, source) for name in V36_VARIANTS},
+        "reference_timing_diagnostic": v36_reference_timing_report(),
+        "interpretation_guardrails": [
+            "Strict paired results include only cases where both the V27 source and V35 filled trade are closed.",
+            "No-fill analysis counts a bad V27 source as avoided and a good V27 source as missed; it does not invent a V35 return for an unfilled order.",
+            "V35 exits use a live ticker sample at/after 120 minutes from actual fill, while V27 uses its own frozen paper exit model; paired differences therefore include entry timing and execution-model differences.",
+            "Fixed research cost is 0.15%; slippage and queue position are not modeled.",
+            "Approximately 1-second REST sampling can miss brief limit touches.",
+        ],
+        "v35_started_utc": V35_STATE.get("started_utc"),
+        "generated_utc": utc_now(),
+    }
