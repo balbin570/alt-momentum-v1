@@ -13132,3 +13132,208 @@ async def v612_start(
         "params": params,
         "note": "V61.2 persistent research wrapper; active V61.1 strategy unchanged.",
     }
+
+
+# ============================================================
+# V62 SHADOW CHALLENGER — RESEARCH ONLY
+# Active V61.1/V55 entries, FAST_3S exits and paper state are untouched.
+# Goal: compare timing, not promote a new strategy.
+# ============================================================
+V62_STUDY = {"status":"IDLE","progress":{},"params":None,"result":None,
+             "error":None,"started_utc":None,"finished_utc":None}
+V62_TASK = None
+
+# Predeclared before looking at V62 results; do not optimize from a tiny sample.
+V62_PULLBACK_MIN_PCT = 0.25
+V62_PULLBACK_MAX_PCT = 1.50
+V62_PULLBACK_WINDOW_BARS = 6       # 30m after EARLY entry point
+V62_ATR_LOOKBACK = 14
+V62_ATR_STOP_MULT = 1.5
+V62_ATR_TRAIL_MULT = 2.0
+V62_ATR_ACTIVATE_R = 1.0
+V62_MAX_HOLD_BARS = 24             # 120m
+
+
+def v62_pullback_reaccel_entries(early_entries, store):
+    """Already-risen EARLY_TOP1 -> micro pullback -> reacceleration -> next-bar open.
+    This is NOT dip buying: source signal must already be an EARLY momentum candidate.
+    Reacceleration is causal: positive candle closes above previous candle high.
+    """
+    out=[]
+    for _, si, ei in early_entries:
+        d=store[si]
+        o,h,l,c,t=d['o'],d['h'],d['l'],d['c'],d['t']
+        if ei < 2 or ei+2 >= d['n']:
+            continue
+        running_high=max(h[ei-1], h[ei])
+        pullback_seen=False
+        end=min(d['n']-2, ei+V62_PULLBACK_WINDOW_BARS)
+        for j in range(ei, end+1):
+            running_high=max(running_high,h[j])
+            dd=(l[j]/running_high-1.0)*100.0
+            if -V62_PULLBACK_MAX_PCT <= dd <= -V62_PULLBACK_MIN_PCT:
+                pullback_seen=True
+            # After a qualifying pullback, require an actual reacceleration candle.
+            if pullback_seen and j>=1 and c[j] > o[j] and c[j] > h[j-1]:
+                entry_idx=j+1
+                if entry_idx < d['n']:
+                    out.append((t[entry_idx],si,entry_idx))
+                break
+    out.sort(key=lambda x:x[0])
+    return out
+
+
+def v62_atr_pct(d, entry_idx):
+    if entry_idx < V62_ATR_LOOKBACK+1:
+        return None
+    vals=[]
+    for j in range(entry_idx-V62_ATR_LOOKBACK, entry_idx):
+        prev=d['c'][j-1]
+        tr=max(d['h'][j]-d['l'][j], abs(d['h'][j]-prev), abs(d['l'][j]-prev))
+        if prev>0:
+            vals.append(tr/prev*100.0)
+    return sum(vals)/len(vals) if vals else None
+
+
+def v62_simulate_atr(d, entry_idx, entry_slip, exit_slip, stop_slip, cost):
+    atr=v62_atr_pct(d,entry_idx)
+    if atr is None or atr<=0:
+        return None
+    if entry_idx+V62_MAX_HOLD_BARS >= d['n']:
+        return None
+    entry=d['o'][entry_idx]*(1+entry_slip/100.0)
+    risk=max(0.35, atr*V62_ATR_STOP_MULT)  # floor only prevents microscopic stops
+    trail_dist=max(0.35, atr*V62_ATR_TRAIL_MULT)
+    activate=risk*V62_ATR_ACTIVATE_R
+    hard=entry*(1-risk/100.0)
+    peak=entry
+    trailing=False
+    for j in range(entry_idx, entry_idx+V62_MAX_HOLD_BARS):
+        op,hi,lo=d['o'][j],d['h'][j],d['l'][j]
+        if lo<=hard:
+            px=min(hard,op)*(1-stop_slip/100.0)
+            return ((px/entry-1)*100.0-cost,'ATR_HARD_STOP',j,atr,risk,trail_dist)
+        peak=max(peak,hi)
+        if peak>=entry*(1+activate/100.0):
+            trailing=True
+        if trailing:
+            ts=peak*(1-trail_dist/100.0)
+            if lo<=ts:
+                px=min(ts,op)*(1-stop_slip/100.0)
+                return ((px/entry-1)*100.0-cost,'ATR_TRAILING_STOP',j,atr,risk,trail_dist)
+    xi=entry_idx+V62_MAX_HOLD_BARS
+    px=d['o'][xi]*(1-exit_slip/100.0)
+    return ((px/entry-1)*100.0-cost,'ATR_TIME_120M',xi,atr,risk,trail_dist)
+
+
+def v62_run_entry_comparison(variants, store, entry_slip, stop_slip, cost):
+    rng=random.Random(62)
+    configs=[
+        {"name":"TIME_ONLY_120m","stop":None,"act":None,"dist":None,"hold":120},
+        {"name":"V55_FIXED","stop":3.0,"act":2.0,"dist":1.5,"hold":120},
+    ]
+    out={}
+    for name,entries in variants.items():
+        out[name]={"n_signals":len(entries)}
+        for cfg in configs:
+            busy={}; trades=[]
+            for t_ms,si,ei in entries:
+                if busy.get(si,0)>t_ms: continue
+                sim=v61_simulate(store[si]['o'],store[si]['h'],store[si]['l'],ei,cfg,
+                                 entry_slip,entry_slip,stop_slip,cost)
+                if sim is None: continue
+                net,reason,xi=sim
+                busy[si]=store[si]['t'][min(xi,store[si]['n']-1)]
+                day=datetime.fromtimestamp(t_ms/1000,tz=timezone.utc).strftime('%Y-%m-%d')
+                trades.append((net,day,reason))
+            out[name][cfg['name']]=v61_stats(trades,rng)
+        busy={}; trades=[]; atr_meta=[]
+        for t_ms,si,ei in entries:
+            if busy.get(si,0)>t_ms: continue
+            sim=v62_simulate_atr(store[si],ei,entry_slip,entry_slip,stop_slip,cost)
+            if sim is None: continue
+            net,reason,xi,atr,risk,dist=sim
+            busy[si]=store[si]['t'][min(xi,store[si]['n']-1)]
+            day=datetime.fromtimestamp(t_ms/1000,tz=timezone.utc).strftime('%Y-%m-%d')
+            trades.append((net,day,reason)); atr_meta.append((atr,risk,dist))
+        z=v61_stats(trades,rng)
+        if atr_meta:
+            z['mean_atr_pct']=round(sum(x[0] for x in atr_meta)/len(atr_meta),4)
+            z['mean_initial_risk_pct']=round(sum(x[1] for x in atr_meta)/len(atr_meta),4)
+            z['mean_trail_distance_pct']=round(sum(x[2] for x in atr_meta)/len(atr_meta),4)
+        out[name]['ATR_DYNAMIC_PREDECLARED']=z
+    return out
+
+
+async def v62_study_run(n_symbols,days,entry_slip,stop_slip,cost):
+    V62_STUDY.update(status='RUNNING',params={"symbols":n_symbols,"days":days,
+        "entry_slip_pct":entry_slip,"stop_slip_pct":stop_slip,"cost_pct":cost},
+        progress={"stage":"universe"},started_utc=utc_now(),finished_utc=None,error=None,result=None)
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
+            uni=await build_universe(client)
+            syms=[u['symbol'] for u in uni if u['symbol']!='BTCUSDT'][:n_symbols]
+            sem=asyncio.Semaphore(6)
+            async def fetch(sym):
+                async with sem:
+                    try: return sym,await get_5m_candles_days(client,sym,days),None
+                    except Exception as exc: return sym,None,str(exc)
+            alt_acc,conf_by_slot,early_by_slot,store={},{},{},{}
+            errors=[]; done=0
+            for start in range(0,len(syms),6):
+                batch=await asyncio.gather(*[fetch(x) for x in syms[start:start+6]])
+                for sym,candles,err in batch:
+                    done+=1; V62_STUDY['progress']={"stage":"fetch+features","done":done,"total":len(syms)}
+                    if err or not candles or len(candles)<400:
+                        errors.append({"symbol":sym,"error":err or 'yetersiz veri'}); continue
+                    # V61 extractor plus close array needed for ATR.
+                    si=len(store)
+                    await asyncio.to_thread(v61_extract_symbol,sym,si,candles,alt_acc,conf_by_slot,early_by_slot,store)
+                    store[si]['c']=array('d',[c['close'] for c in candles])
+        if not store: raise RuntimeError('Hicbir sembol icin veri alinamadi.')
+        V62_STUDY['progress']={"stage":"simulate"}
+        def compute():
+            base=v61_build_entries(conf_by_slot,early_by_slot,alt_acc,store)
+            variants={
+                'CONF_60M_TOP1_MAXCONT':base['CONF_TOP1_MAXCONT_(V32_replika)'],
+                'EARLY_TOP1_MAXZ':base['EARLY_TOP1_MAXZ'],
+            }
+            variants['PULLBACK_REACCEL_TOP1']=v62_pullback_reaccel_entries(base['EARLY_TOP1_MAXZ'],store)
+            return v62_run_entry_comparison(variants,store,entry_slip,stop_slip,cost)
+        result=await asyncio.to_thread(compute)
+        V62_STUDY.update(status='DONE',progress={"stage":"done"},finished_utc=utc_now(),result={
+            'entry_comparison':result,
+            'predeclared_pullback':{"min_pct":V62_PULLBACK_MIN_PCT,"max_pct":V62_PULLBACK_MAX_PCT,
+                "window_minutes":V62_PULLBACK_WINDOW_BARS*5,
+                "reacceleration":"bullish 5m candle close > previous candle high; entry next 5m open"},
+            'predeclared_atr_exit':{"lookback_bars":V62_ATR_LOOKBACK,"stop_mult":V62_ATR_STOP_MULT,
+                "trail_mult":V62_ATR_TRAIL_MULT,"activate_R":V62_ATR_ACTIVATE_R,"max_hold_minutes":120},
+            'data':{"symbols_used":len(store),"symbols_failed":errors[:20]},
+            'guardrails':["SHADOW/RESEARCH only; active V61.1 entries unchanged.",
+                "Do not select the best cell from this small sample; require larger temporal validation.",
+                "BTC regime is intentionally measured later, not used to suppress entries yet.",
+                "WebSocket/real orders are intentionally not enabled by this research patch."],
+        })
+    except Exception as exc:
+        V62_STUDY.update(status='ERROR',error=f'{type(exc).__name__}: {exc}',finished_utc=utc_now())
+
+
+@app.get('/v62-shadow-start')
+async def v62_shadow_start(symbols:int=Query(20,ge=20,le=50),days:int=Query(20,ge=14,le=40),
+    entry_slip_pct:float=Query(0.10,ge=0,le=1),stop_slip_pct:float=Query(0.30,ge=0,le=2),
+    cost_pct:float=Query(0.15,ge=0,le=1)):
+    global V62_TASK
+    if V62_TASK is not None and not V62_TASK.done():
+        return {"status":"ALREADY_RUNNING","progress":V62_STUDY.get('progress')}
+    V62_TASK=asyncio.create_task(v62_study_run(symbols,days,entry_slip_pct,stop_slip_pct,cost_pct))
+    return {"status":"STARTED","paper_only":True,"active_strategy_changed":False,
+            "compare":["CONF_60M","EARLY","PULLBACK_REACCEL"],
+            "exits":["TIME120","V55_FIXED","ATR_DYNAMIC_PREDECLARED"]}
+
+
+@app.get('/v62-shadow-status')
+async def v62_shadow_status():
+    return {**MODE_INFO,"status":"OK","panel":"V62_SHADOW_CHALLENGER",
+        "trading":False,"orders":False,"active_strategy_changed":False,
+        "active_risk_changed":False,"v61_fast_3s_changed":False,
+        "study":V62_STUDY,"generated_utc":utc_now()}
