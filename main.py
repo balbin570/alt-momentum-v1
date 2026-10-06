@@ -14076,3 +14076,99 @@ async def v69_start(symbols:int=Query(40,ge=20,le=50),days:int=Query(40,ge=20,le
 @app.get("/v69-status")
 async def v69_status():
     return {**MODE_INFO,"status":"OK","panel":"V69_DYNAMIC_BTC_MARKET_REGIME","trading":False,"orders":False,"active_strategy_changed":False,"active_risk_changed":False,"study":V69_STUDY,"generated_utc":utc_now()}
+
+
+# ============================================================
+# V70 — BTC30 x ALT-BREADTH REGIME INTERSECTION VALIDATION
+# Frozen entry: V66 CONFIRM_10M. Frozen exit: TIME120.
+# No new thresholds; validates the V69 intersection hypothesis.
+# ============================================================
+V70_STUDY={"status":"IDLE","progress":{},"params":None,"result":None,"error":None,"started_utc":None,"finished_utc":None}
+V70_TASK=None
+
+def v70_compute(store, btc, cost, entry_slip):
+    cand=v66_candidates(store)
+    bt={int(x["open_time"]):x for x in btc}; btc_times=sorted(bt)
+    rows=[]; busy={}
+    for tm,si,i,ch,vr in cand:
+        d=store[si];o,h,l,c,t=d["o"],d["h"],d["l"],d["c"],d["t"]; breakout=c[i]
+        if i+3>=len(o) or not (c[i+1]>breakout and c[i+2]>c[i+1]): continue
+        ei=i+3; et=t[ei]
+        if busy.get(si,0)>et: continue
+        xi=min(len(o)-1,ei+24); ep=o[ei]*(1+entry_slip/100); net=((o[xi]/ep)-1)*100-cost
+        busy[si]=t[xi]
+        pos=bisect.bisect_right(btc_times,et)-1
+        if pos<6: continue
+        btc30=v69_pct(float(bt[btc_times[pos-6]]["close"]),float(bt[btc_times[pos]]["close"]))
+        alt30=[]
+        for sj,dd in store.items():
+            k=bisect.bisect_right(dd["t"],et)-1
+            if k>=6: alt30.append(v69_pct(dd["c"][k-6],dd["c"][k]))
+        breadth=sum(alt30)/len(alt30) if alt30 else None
+        if breadth is None: continue
+        day=datetime.fromtimestamp(et/1000,tz=timezone.utc).strftime("%Y-%m-%d")
+        rows.append({"net":net,"day":day,"btc30":btc30,"breadth30":breadth})
+    groups={
+      "CONTROL_ALL":lambda r:True,
+      "ALT_BREADTH30_POSITIVE":lambda r:r["breadth30"]>0,
+      "BTC30_POSITIVE":lambda r:r["btc30"]>0,
+      "BTC30_POSITIVE_AND_ALT_BREADTH30_POSITIVE":lambda r:r["btc30"]>0 and r["breadth30"]>0,
+      "BTC30_NEGATIVE_OR_ALT_BREADTH30_NEGATIVE":lambda r:not (r["btc30"]>0 and r["breadth30"]>0),
+    }
+    out={}
+    for name,pred in groups.items():
+        rr=[r for r in rows if pred(r)]
+        st=v69_stats(rr)
+        days=sorted(set(r["day"] for r in rr)); cut=days[len(days)//2] if days else None
+        st["temporal_halves"]={
+          "FIRST_HALF":v69_stats([r for r in rr if cut and r["day"]<cut]),
+          "SECOND_HALF":v69_stats([r for r in rr if cut and r["day"]>=cut])
+        }
+        st["mean_context"]={
+          "btc30_pct":round(sum(r["btc30"] for r in rr)/len(rr),4) if rr else None,
+          "alt_breadth30_pct":round(sum(r["breadth30"] for r in rr)/len(rr),4) if rr else None
+        }
+        out[name]=st
+    return len(cand),len(rows),out
+
+async def v70_run(n_symbols,days,entry_slip,cost):
+    V70_STUDY.update(status="RUNNING",progress={"stage":"universe"},params={"symbols":n_symbols,"days":days,"entry_slip_pct":entry_slip,"cost_pct":cost},result=None,error=None,started_utc=utc_now(),finished_utc=None)
+    try:
+      async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
+        uni=await build_universe(client); syms=[u["symbol"] for u in uni if u["symbol"]!="BTCUSDT"][:n_symbols]; sem=asyncio.Semaphore(6)
+        async def fetch(sym):
+          async with sem:
+            try:return sym,await get_5m_candles_days(client,sym,days),None
+            except Exception as e:return sym,None,str(e)
+        aa,cc,ee,store={},{},{},{}; errs=[]; done=0
+        for st in range(0,len(syms),6):
+          for sym,candles,err in await asyncio.gather(*[fetch(x) for x in syms[st:st+6]]):
+            done+=1; V70_STUDY["progress"]={"stage":"fetch_alts","done":done,"total":len(syms)}
+            if err or not candles or len(candles)<400: errs.append({"symbol":sym,"error":err or "insufficient"}); continue
+            si=len(store); await asyncio.to_thread(v61_extract_symbol,sym,si,candles,aa,cc,ee,store)
+            store[si]["c"]=array("d",[x["close"] for x in candles]); store[si]["v"]=array("d",[x.get("volume",0.0) for x in candles])
+        V70_STUDY["progress"]={"stage":"fetch_btc"}
+        btc=await get_5m_candles_days(client,"BTCUSDT",days+1)
+      V70_STUDY["progress"]={"stage":"intersection"}
+      raw,n,res=await asyncio.to_thread(v70_compute,store,btc,cost,entry_slip)
+      V70_STUDY.update(status="DONE",progress={"stage":"done"},finished_utc=utc_now(),result={
+        "entry":"FROZEN_V66_CONFIRM_10M","exit":"TIME120_CONTROL","raw_breakouts":raw,"analyzed_trades":n,
+        "groups":res,
+        "primary_candidate":"BTC30_POSITIVE_AND_ALT_BREADTH30_POSITIVE",
+        "rules":{"btc30_positive":"BTC trailing 30m return > 0","alt_breadth30_positive":"mean trailing 30m return across selected alt universe > 0"},
+        "data":{"symbols_used":len(store),"symbols_failed":errs[:20]},
+        "guardrails":["Research only; no real orders.","Entry and exit frozen.","No threshold optimization.","Primary intersection hypothesis declared before result.","Active V61/V55/FAST_3S unchanged."]
+      })
+    except Exception as e:
+      V70_STUDY.update(status="ERROR",error=f"{type(e).__name__}: {e}",finished_utc=utc_now())
+
+@app.get("/v70-start")
+async def v70_start(symbols:int=Query(40,ge=20,le=50),days:int=Query(40,ge=20,le=40),entry_slip_pct:float=Query(.10,ge=0,le=1),cost_pct:float=Query(.15,ge=0,le=1)):
+    global V70_TASK
+    if V70_TASK is not None and not V70_TASK.done(): return {"status":"ALREADY_RUNNING","progress":V70_STUDY.get("progress")}
+    V70_TASK=asyncio.create_task(v70_run(symbols,days,entry_slip_pct,cost_pct))
+    return {"status":"STARTED","paper_only":True,"primary_candidate":"BTC30_POSITIVE_AND_ALT_BREADTH30_POSITIVE"}
+
+@app.get("/v70-status")
+async def v70_status():
+    return {**MODE_INFO,"status":"OK","panel":"V70_REGIME_INTERSECTION_VALIDATION","trading":False,"orders":False,"active_strategy_changed":False,"active_risk_changed":False,"study":V70_STUDY,"generated_utc":utc_now()}
