@@ -14172,3 +14172,125 @@ async def v70_start(symbols:int=Query(40,ge=20,le=50),days:int=Query(40,ge=20,le
 @app.get("/v70-status")
 async def v70_status():
     return {**MODE_INFO,"status":"OK","panel":"V70_REGIME_INTERSECTION_VALIDATION","trading":False,"orders":False,"active_strategy_changed":False,"active_risk_changed":False,"study":V70_STUDY,"generated_utc":utc_now()}
+
+
+# ============================================================
+# V71 — GOOD vs BAD REGIME DIAGNOSTIC
+# Frozen cohort: V70 primary candidate
+# BTC30 > 0 AND ALT breadth30 > 0
+# Frozen entry V66 CONFIRM_10M + TIME120.
+# Diagnostic only: NO threshold selection / NO active changes.
+# ============================================================
+V71_STUDY={"status":"IDLE","progress":{},"params":None,"result":None,"error":None,"started_utc":None,"finished_utc":None}
+V71_TASK=None
+
+def v71_mean(vals):
+    vals=[x for x in vals if x is not None]
+    return round(sum(vals)/len(vals),5) if vals else None
+
+def v71_compute(store, btc, cost, entry_slip):
+    cand=v66_candidates(store)
+    bt={int(x["open_time"]):x for x in btc}; btimes=sorted(bt)
+    rows=[]; busy={}
+    for tm,si,i,ch,vr in cand:
+        d=store[si];o,h,l,c,t=d["o"],d["h"],d["l"],d["c"],d["t"]; breakout=c[i]
+        if i+3>=len(o) or not (c[i+1]>breakout and c[i+2]>c[i+1]): continue
+        ei=i+3; et=t[ei]
+        if busy.get(si,0)>et: continue
+        xi=min(len(o)-1,ei+24); ep=o[ei]*(1+entry_slip/100); net=((o[xi]/ep)-1)*100-cost
+        busy[si]=t[xi]
+        bp=bisect.bisect_right(btimes,et)-1
+        if bp<48: continue
+        def br(bars):
+            return v69_pct(float(bt[btimes[bp-bars]]["close"]),float(bt[btimes[bp]]["close"]))
+        b30,b60,b120,b240=br(6),br(12),br(24),br(48)
+        # BTC realized 1h volatility from last 12 completed 5m returns
+        rets=[]
+        for z in range(bp-11,bp+1):
+            if z>0:
+                p0=float(bt[btimes[z-1]]["close"]); p1=float(bt[btimes[z]]["close"])
+                rets.append(v69_pct(p0,p1))
+        btc_vol1h=statistics.pstdev(rets) if len(rets)>=2 else None
+        alt30=[];alt60=[];alt240=[]
+        for sj,dd in store.items():
+            k=bisect.bisect_right(dd["t"],et)-1
+            if k>=48:
+                alt30.append(v69_pct(dd["c"][k-6],dd["c"][k]))
+                alt60.append(v69_pct(dd["c"][k-12],dd["c"][k]))
+                alt240.append(v69_pct(dd["c"][k-48],dd["c"][k]))
+        breadth30=sum(alt30)/len(alt30) if alt30 else None
+        breadth60=sum(alt60)/len(alt60) if alt60 else None
+        breadth240=sum(alt240)/len(alt240) if alt240 else None
+        # Frozen V70 primary cohort only
+        if not (b30>0 and breadth30 is not None and breadth30>0): continue
+        day=datetime.fromtimestamp(et/1000,tz=timezone.utc).strftime("%Y-%m-%d")
+        rows.append({"net":net,"day":day,"btc30":b30,"btc60":b60,"btc120":b120,"btc240":b240,
+                     "btc_accel_30_vs_60":b30-(b60/2.0),"btc_vol1h":btc_vol1h,
+                     "breadth30":breadth30,"breadth60":breadth60,"breadth240":breadth240,
+                     "breadth_accel_30_vs_60":breadth30-(breadth60/2.0) if breadth60 is not None else None})
+    days=sorted(set(r["day"] for r in rows)); cut=days[len(days)//2] if days else None
+    halves={"FIRST_HALF":[r for r in rows if cut and r["day"]<cut],
+            "SECOND_HALF":[r for r in rows if cut and r["day"]>=cut]}
+    def summarize(rr):
+        return {
+          "performance":v69_stats(rr),
+          "context_means":{
+            "btc30_pct":v71_mean([r["btc30"] for r in rr]),
+            "btc1h_pct":v71_mean([r["btc60"] for r in rr]),
+            "btc2h_pct":v71_mean([r["btc120"] for r in rr]),
+            "btc4h_pct":v71_mean([r["btc240"] for r in rr]),
+            "btc_accel_30_vs_60":v71_mean([r["btc_accel_30_vs_60"] for r in rr]),
+            "btc_1h_realized_vol_pct":v71_mean([r["btc_vol1h"] for r in rr]),
+            "alt_breadth30_pct":v71_mean([r["breadth30"] for r in rr]),
+            "alt_breadth1h_pct":v71_mean([r["breadth60"] for r in rr]),
+            "alt_breadth4h_pct":v71_mean([r["breadth240"] for r in rr]),
+            "alt_breadth_accel_30_vs_60":v71_mean([r["breadth_accel_30_vs_60"] for r in rr])
+          }
+        }
+    a=summarize(halves["FIRST_HALF"]); b=summarize(halves["SECOND_HALF"])
+    dif={}
+    for k in a["context_means"]:
+        x=a["context_means"][k]; y=b["context_means"][k]
+        dif[k]=round(y-x,5) if x is not None and y is not None else None
+    return len(cand),len(rows),cut,{"FIRST_HALF":a,"SECOND_HALF":b,"SECOND_MINUS_FIRST":dif}
+
+async def v71_run(n_symbols,days,entry_slip,cost):
+    V71_STUDY.update(status="RUNNING",progress={"stage":"universe"},params={"symbols":n_symbols,"days":days,"entry_slip_pct":entry_slip,"cost_pct":cost},result=None,error=None,started_utc=utc_now(),finished_utc=None)
+    try:
+      async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
+        uni=await build_universe(client); syms=[u["symbol"] for u in uni if u["symbol"]!="BTCUSDT"][:n_symbols]; sem=asyncio.Semaphore(6)
+        async def fetch(sym):
+          async with sem:
+            try:return sym,await get_5m_candles_days(client,sym,days),None
+            except Exception as e:return sym,None,str(e)
+        aa,cc,ee,store={},{},{},{}; errs=[];done=0
+        for st in range(0,len(syms),6):
+          for sym,candles,err in await asyncio.gather(*[fetch(x) for x in syms[st:st+6]]):
+            done+=1;V71_STUDY["progress"]={"stage":"fetch_alts","done":done,"total":len(syms)}
+            if err or not candles or len(candles)<500: errs.append({"symbol":sym,"error":err or "insufficient"});continue
+            si=len(store);await asyncio.to_thread(v61_extract_symbol,sym,si,candles,aa,cc,ee,store)
+            store[si]["c"]=array("d",[x["close"] for x in candles]);store[si]["v"]=array("d",[x.get("volume",0.0) for x in candles])
+        V71_STUDY["progress"]={"stage":"fetch_btc"};btc=await get_5m_candles_days(client,"BTCUSDT",days+1)
+      V71_STUDY["progress"]={"stage":"diagnostic"}
+      raw,n,cut,res=await asyncio.to_thread(v71_compute,store,btc,cost,entry_slip)
+      V71_STUDY.update(status="DONE",progress={"stage":"done"},finished_utc=utc_now(),result={
+        "cohort":"FROZEN_V70_BTC30_POSITIVE_AND_ALT_BREADTH30_POSITIVE",
+        "entry":"FROZEN_V66_CONFIRM_10M","exit":"TIME120_CONTROL","raw_breakouts":raw,"cohort_trades":n,
+        "half_split_day":cut,"diagnostic":res,
+        "features":["BTC 30m/1h/2h/4h returns","BTC 30m-vs-1h acceleration","BTC 1h realized volatility","ALT breadth 30m/1h/4h","ALT breadth acceleration"],
+        "data":{"symbols_used":len(store),"symbols_failed":errs[:20]},
+        "guardrails":["Diagnostic only; no threshold selected.","Frozen V70 cohort only.","No real orders.","Active V61/V55/FAST_3S unchanged."]
+      })
+    except Exception as e:
+      V71_STUDY.update(status="ERROR",error=f"{type(e).__name__}: {e}",finished_utc=utc_now())
+
+@app.get("/v71-start")
+async def v71_start(symbols:int=Query(40,ge=20,le=50),days:int=Query(40,ge=20,le=40),entry_slip_pct:float=Query(.10,ge=0,le=1),cost_pct:float=Query(.15,ge=0,le=1)):
+    global V71_TASK
+    if V71_TASK is not None and not V71_TASK.done(): return {"status":"ALREADY_RUNNING","progress":V71_STUDY.get("progress")}
+    V71_TASK=asyncio.create_task(v71_run(symbols,days,entry_slip_pct,cost_pct))
+    return {"status":"STARTED","paper_only":True,"study":"GOOD_VS_BAD_REGIME_DIAGNOSTIC","cohort":"FROZEN_V70_PRIMARY"}
+
+@app.get("/v71-status")
+async def v71_status():
+    return {**MODE_INFO,"status":"OK","panel":"V71_REGIME_DIAGNOSTIC","trading":False,"orders":False,"active_strategy_changed":False,"active_risk_changed":False,"study":V71_STUDY,"generated_utc":utc_now()}
