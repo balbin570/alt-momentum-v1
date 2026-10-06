@@ -30,7 +30,7 @@ MODEL = "ALT-MOMENTUM-V1"
 MIN_QUOTE_VOLUME_USDT = 250_000
 ROUND_TRIP_COST_PCT = 0.15
 
-# Altcoin araştırması için istemediğimiz baz varlıklar
+# Altcoin araÅŸtÄ±rmasÄ± iÃ§in istemediÄŸimiz baz varlÄ±klar
 EXCLUDED_BASES = {
     "BTC",
     "ETH",
@@ -264,16 +264,16 @@ def analyze_latest(symbol, candles, quote_volume):
 
 def historical_events(candles):
     """
-    Burada AL sinyali üretmiyoruz.
+    Burada AL sinyali Ã¼retmiyoruz.
 
-    Amaç:
-    Geçmişte belirli momentum + hacim koşulları oluştuğunda
-    fiyatın 15/30/60 dakika sonra ne yaptığını ölçmek.
+    AmaÃ§:
+    GeÃ§miÅŸte belirli momentum + hacim koÅŸullarÄ± oluÅŸtuÄŸunda
+    fiyatÄ±n 15/30/60 dakika sonra ne yaptÄ±ÄŸÄ±nÄ± Ã¶lÃ§mek.
     """
 
     events = []
 
-    # İleri ölçüm için 12 mum = 60 dakika gerekir.
+    # Ä°leri Ã¶lÃ§Ã¼m iÃ§in 12 mum = 60 dakika gerekir.
     for i in range(7, len(candles) - 12):
 
         current = candles[i]["close"]
@@ -306,8 +306,8 @@ def historical_events(candles):
             else 0
         )
 
-        # İlk araştırma koşulu.
-        # Bunlar nihai parametre değildir.
+        # Ä°lk araÅŸtÄ±rma koÅŸulu.
+        # Bunlar nihai parametre deÄŸildir.
         if mom5 < 0.30:
             continue
 
@@ -320,7 +320,7 @@ def historical_events(candles):
         if volume_ratio < 1.20:
             continue
 
-        # Çoktan aşırı koşmuş hareketleri ilk aşamada ayır.
+        # Ã‡oktan aÅŸÄ±rÄ± koÅŸmuÅŸ hareketleri ilk aÅŸamada ayÄ±r.
         if mom5 > 3.00:
             continue
 
@@ -546,8 +546,8 @@ async def backtest(
 ):
     """
     Research endpoint.
-    Emir üretmez.
-    Paper trade açmaz.
+    Emir Ã¼retmez.
+    Paper trade aÃ§maz.
     """
 
     symbol = symbol.upper().strip()
@@ -597,8 +597,8 @@ async def backtest(
 
 def apply_cooldown(events, cooldown_minutes):
     """
-    Aynı coin için birbirine çok yakın eventleri bağımsız işlem gibi
-    saymamak amacıyla cooldown uygular.
+    AynÄ± coin iÃ§in birbirine Ã§ok yakÄ±n eventleri baÄŸÄ±msÄ±z iÅŸlem gibi
+    saymamak amacÄ±yla cooldown uygular.
     """
     if not events:
         return []
@@ -624,8 +624,8 @@ def apply_cooldown(events, cooldown_minutes):
 
 def summarize_events_with_cost(events, cost_pct=ROUND_TRIP_COST_PCT):
     """
-    15/30/60 dk brüt sonuçları ve sabit round-trip maliyet sonrası
-    net sonuçları birlikte özetler.
+    15/30/60 dk brÃ¼t sonuÃ§larÄ± ve sabit round-trip maliyet sonrasÄ±
+    net sonuÃ§larÄ± birlikte Ã¶zetler.
     """
     if not events:
         return {
@@ -698,17 +698,17 @@ async def backtest_all(
     ),
 ):
     """
-    Çoklu altcoin research/event-study endpointi.
+    Ã‡oklu altcoin research/event-study endpointi.
 
-    - Emir üretmez.
-    - Paper trade açmaz.
-    - Mevcut 24h likidite evreninden en yüksek hacimli coinleri seçer.
-    - Ham eventleri, 30 dk cooldown ve 60 dk cooldown sonuçlarını karşılaştırır.
-    - %0.15 round-trip araştırma maliyetini net sonuçlardan düşer.
+    - Emir Ã¼retmez.
+    - Paper trade aÃ§maz.
+    - Mevcut 24h likidite evreninden en yÃ¼ksek hacimli coinleri seÃ§er.
+    - Ham eventleri, 30 dk cooldown ve 60 dk cooldown sonuÃ§larÄ±nÄ± karÅŸÄ±laÅŸtÄ±rÄ±r.
+    - %0.15 round-trip araÅŸtÄ±rma maliyetini net sonuÃ§lardan dÃ¼ÅŸer.
 
     Not:
-    Bu ilk geniş test current-universe yaklaşımı kullanır; dolayısıyla
-    survivorship / current-liquidity bias içerebilir.
+    Bu ilk geniÅŸ test current-universe yaklaÅŸÄ±mÄ± kullanÄ±r; dolayÄ±sÄ±yla
+    survivorship / current-liquidity bias iÃ§erebilir.
     """
     try:
         async with httpx.AsyncClient() as client:
@@ -773,7 +773,7 @@ async def backtest_all(
                 )
             )
 
-        # Coin listesini hacme göre okunabilir sırada tut.
+        # Coin listesini hacme gÃ¶re okunabilir sÄ±rada tut.
         per_coin.sort(
             key=lambda x: x["quote_volume_24h"],
             reverse=True,
@@ -829,15 +829,15 @@ async def backtest_all(
 
 async def get_5m_candles_days(client, symbol, days=30):
     """
-    Binance 1000-kline limitini geriye doğru sayfalayarak tamamlanmış
-    5m mumları toplar. Varsayılan 30 gün ~= 8640 mum.
+    Binance 1000-kline limitini geriye doÄŸru sayfalayarak tamamlanmÄ±ÅŸ
+    5m mumlarÄ± toplar. VarsayÄ±lan 30 gÃ¼n ~= 8640 mum.
     """
     now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
     start_ms = now_ms - (days * 24 * 60 * 60 * 1000)
     end_time = now_ms
     by_open_time = {}
 
-    # 30 gün için yaklaşık 9 istek gerekir. Güvenli üst sınır bırakıyoruz.
+    # 30 gÃ¼n iÃ§in yaklaÅŸÄ±k 9 istek gerekir. GÃ¼venli Ã¼st sÄ±nÄ±r bÄ±rakÄ±yoruz.
     max_pages = max(2, int((days * 288) / 1000) + 3)
 
     for _ in range(max_pages):
@@ -880,10 +880,10 @@ async def get_5m_candles_days(client, symbol, days=30):
         if oldest_open <= start_ms:
             break
 
-        # Bir önceki sayfanın sonundan daha eski veriye git.
+        # Bir Ã¶nceki sayfanÄ±n sonundan daha eski veriye git.
         end_time = oldest_open - 1
 
-        # Binance'a gereksiz burst yapmamak için küçük bir ara.
+        # Binance'a gereksiz burst yapmamak iÃ§in kÃ¼Ã§Ã¼k bir ara.
         await asyncio.sleep(0.03)
 
     candles = sorted(
@@ -897,17 +897,17 @@ async def get_5m_candles_days(client, symbol, days=30):
 def historical_trades_v2(candles, symbol):
     """
     V2 research trade modeli:
-    - Sinyal tamamlanmış 5m mum kapanışında hesaplanır.
-    - Giriş bir sonraki 5m mumun OPEN fiyatıdır.
-    - Çıkış girişten tam 60 dakika sonraki mumun OPEN fiyatıdır.
-    - Aynı coin için girişler arasında en az 60 dakika cooldown.
-    - Sabit %0.15 round-trip araştırma maliyeti.
+    - Sinyal tamamlanmÄ±ÅŸ 5m mum kapanÄ±ÅŸÄ±nda hesaplanÄ±r.
+    - GiriÅŸ bir sonraki 5m mumun OPEN fiyatÄ±dÄ±r.
+    - Ã‡Ä±kÄ±ÅŸ giriÅŸten tam 60 dakika sonraki mumun OPEN fiyatÄ±dÄ±r.
+    - AynÄ± coin iÃ§in giriÅŸler arasÄ±nda en az 60 dakika cooldown.
+    - Sabit %0.15 round-trip araÅŸtÄ±rma maliyeti.
     """
     trades = []
     last_entry_open_time = None
     cooldown_ms = 60 * 60 * 1000
 
-    # i sinyal mumu; i+1 giriş; i+13 = girişten 60 dk sonraki open.
+    # i sinyal mumu; i+1 giriÅŸ; i+13 = giriÅŸten 60 dk sonraki open.
     for i in range(7, len(candles) - 13):
         signal_close = candles[i]["close"]
 
@@ -1078,7 +1078,7 @@ def split_dev_oos(trades):
 
     split_index = int(len(ordered) * 2 / 3)
 
-    # Çok küçük örneklerde yine kronolojik bir ayrım yap.
+    # Ã‡ok kÃ¼Ã§Ã¼k Ã¶rneklerde yine kronolojik bir ayrÄ±m yap.
     if len(ordered) >= 2:
         split_index = min(
             max(split_index, 1),
@@ -1102,15 +1102,15 @@ async def backtest30(
     ),
 ):
     """
-    30 günlük çoklu-altcoin V2 araştırma backtesti.
+    30 gÃ¼nlÃ¼k Ã§oklu-altcoin V2 araÅŸtÄ±rma backtesti.
 
     Bu endpoint:
-    - gerçek emir üretmez,
-    - paper trade açmaz,
-    - next-candle-open giriş kullanır,
-    - 60 dk hold + 60 dk same-symbol cooldown kullanır,
-    - %0.15 maliyet düşer,
-    - kronolojik DEV/OOS raporu üretir.
+    - gerÃ§ek emir Ã¼retmez,
+    - paper trade aÃ§maz,
+    - next-candle-open giriÅŸ kullanÄ±r,
+    - 60 dk hold + 60 dk same-symbol cooldown kullanÄ±r,
+    - %0.15 maliyet dÃ¼ÅŸer,
+    - kronolojik DEV/OOS raporu Ã¼retir.
     """
     try:
         async with httpx.AsyncClient(
@@ -1119,7 +1119,7 @@ async def backtest30(
             universe_data = await build_universe(client)
             selected = universe_data[:count]
 
-            # 30 coin x ~9 Binance sayfası. Render/Binance için kontrollü eşzamanlılık.
+            # 30 coin x ~9 Binance sayfasÄ±. Render/Binance iÃ§in kontrollÃ¼ eÅŸzamanlÄ±lÄ±k.
             semaphore = asyncio.Semaphore(3)
 
             async def worker(item):
@@ -1179,8 +1179,8 @@ async def backtest30(
                 }
             )
 
-        # Birleşik DEV/OOS coin başına değil, tüm işlemlerin kronolojik
-        # ilk 2/3 ve son 1/3'ü olarak da raporlanır.
+        # BirleÅŸik DEV/OOS coin baÅŸÄ±na deÄŸil, tÃ¼m iÅŸlemlerin kronolojik
+        # ilk 2/3 ve son 1/3'Ã¼ olarak da raporlanÄ±r.
         combined_dev, combined_oos = split_dev_oos(all_trades)
 
         return {
@@ -1252,12 +1252,12 @@ def ema_series(values, period):
 
 def btc_regime_map_from_5m(candles):
     """
-    BTC 5m verisini 1 saatlik kapanışlara indirger.
+    BTC 5m verisini 1 saatlik kapanÄ±ÅŸlara indirger.
     Rejim:
       BULL    = close > EMA50 > EMA200
       BEAR    = close < EMA50 < EMA200
-      NEUTRAL = diğer durumlar
-    Her 5m zaman damgası için yalnızca o ana kadar tamamlanmış 1H bilgi kullanılır.
+      NEUTRAL = diÄŸer durumlar
+    Her 5m zaman damgasÄ± iÃ§in yalnÄ±zca o ana kadar tamamlanmÄ±ÅŸ 1H bilgi kullanÄ±lÄ±r.
     """
     if not candles:
         return {}
@@ -1333,15 +1333,15 @@ def simulate_portfolio_v3(
     allocation_per_trade_pct=20.0,
 ):
     """
-    Daha gerçekçi ortak-portföy araştırma simülasyonu.
+    Daha gerÃ§ekÃ§i ortak-portfÃ¶y araÅŸtÄ±rma simÃ¼lasyonu.
 
-    - Başlangıç equity = 100.
-    - Aynı anda en fazla max_positions.
-    - Her yeni pozisyon başlangıçtaki değil, o andaki equity'nin sabit yüzdesi
-      kadar nominal sermaye kullanır.
-    - Pozisyonlar 60 dk sonra kapanır.
-    - Aynı timestamp'teki sinyaller deterministik olarak symbol sırasına göre işlenir.
-    - Kaldıraç yok; toplam hedef tahsis <= %100.
+    - BaÅŸlangÄ±Ã§ equity = 100.
+    - AynÄ± anda en fazla max_positions.
+    - Her yeni pozisyon baÅŸlangÄ±Ã§taki deÄŸil, o andaki equity'nin sabit yÃ¼zdesi
+      kadar nominal sermaye kullanÄ±r.
+    - Pozisyonlar 60 dk sonra kapanÄ±r.
+    - AynÄ± timestamp'teki sinyaller deterministik olarak symbol sÄ±rasÄ±na gÃ¶re iÅŸlenir.
+    - KaldÄ±raÃ§ yok; toplam hedef tahsis <= %100.
     """
     if not trades:
         return {
@@ -1421,7 +1421,7 @@ def simulate_portfolio_v3(
         )
         accepted += 1
 
-    # Kalan pozisyonları son exit zamanına kadar kapat.
+    # Kalan pozisyonlarÄ± son exit zamanÄ±na kadar kapat.
     if active:
         final_ms = max(x["exit_ms"] for x in active)
         close_due(final_ms)
@@ -1452,13 +1452,13 @@ async def backtest90(
 ):
     """
     ALT-MOMENTUM V3:
-    - 30-90 gün sayfalı 5m veri
-    - next-candle-open giriş
+    - 30-90 gÃ¼n sayfalÄ± 5m veri
+    - next-candle-open giriÅŸ
     - 60 dk hold / 60 dk same-symbol cooldown
     - %0.15 round-trip cost
     - BTC 1H EMA50/EMA200 piyasa rejimi
     - kronolojik DEV/OOS
-    - max 5 eşzamanlı pozisyonlu ortak portföy simülasyonu
+    - max 5 eÅŸzamanlÄ± pozisyonlu ortak portfÃ¶y simÃ¼lasyonu
     """
     try:
         async with httpx.AsyncClient(
@@ -1467,7 +1467,7 @@ async def backtest90(
             universe_data = await build_universe(client)
             selected = universe_data[:count]
 
-            # Önce BTC rejim verisi.
+            # Ã–nce BTC rejim verisi.
             btc_candles = await get_5m_candles_days(
                 client,
                 "BTCUSDT",
@@ -1477,7 +1477,7 @@ async def backtest90(
                 btc_candles
             )
 
-            # 90 gün x 30 coin ağır bir iş; kontrollü concurrency.
+            # 90 gÃ¼n x 30 coin aÄŸÄ±r bir iÅŸ; kontrollÃ¼ concurrency.
             semaphore = asyncio.Semaphore(3)
 
             async def worker(item):
@@ -1549,7 +1549,7 @@ async def backtest90(
             all_trades
         )
 
-        # Portföy simülasyonu aynı birleşik kronolojik trade akışında.
+        # PortfÃ¶y simÃ¼lasyonu aynÄ± birleÅŸik kronolojik trade akÄ±ÅŸÄ±nda.
         portfolio_all = simulate_portfolio_v3(
             all_trades
         )
@@ -1647,13 +1647,13 @@ async def backtest90(
 
 def continuation_events_v4(candles, symbol):
     """
-    Amaç tahmin etmek değil:
-    Coin ZATEN yükselmişken ve hacim artmışken, sonraki 60 dakikada
-    hareket devam ediyor mu sorusunu ölçmek.
+    AmaÃ§ tahmin etmek deÄŸil:
+    Coin ZATEN yÃ¼kselmiÅŸken ve hacim artmÄ±ÅŸken, sonraki 60 dakikada
+    hareket devam ediyor mu sorusunu Ã¶lÃ§mek.
 
-    Sinyal tamamlanmış 5m mum kapanışında görülür.
-    Giriş bir sonraki 5m mum OPEN.
-    Çıkış 60 dakika sonraki OPEN.
+    Sinyal tamamlanmÄ±ÅŸ 5m mum kapanÄ±ÅŸÄ±nda gÃ¶rÃ¼lÃ¼r.
+    GiriÅŸ bir sonraki 5m mum OPEN.
+    Ã‡Ä±kÄ±ÅŸ 60 dakika sonraki OPEN.
     """
     events = []
 
@@ -1674,7 +1674,7 @@ def continuation_events_v4(candles, symbol):
             if avg_volume > 0 else 0
         )
 
-        # Sadece halihazırda yükselmiş hareketleri inceliyoruz.
+        # Sadece halihazÄ±rda yÃ¼kselmiÅŸ hareketleri inceliyoruz.
         if mom5 <= 0 or mom15 <= 0 or mom30 < 0.50:
             continue
 
@@ -1715,8 +1715,8 @@ def bucket_label(value, cuts, labels):
 
 def continuation_bucket_report(events):
     """
-    Önceden belirlenmiş geniş kovalar.
-    Bunlar optimize edilmiş giriş eşikleri değildir; davranışı görmek içindir.
+    Ã–nceden belirlenmiÅŸ geniÅŸ kovalar.
+    Bunlar optimize edilmiÅŸ giriÅŸ eÅŸikleri deÄŸildir; davranÄ±ÅŸÄ± gÃ¶rmek iÃ§indir.
     """
     momentum_labels = [
         "0.50-0.99%",
@@ -1804,8 +1804,8 @@ async def continuation90(
 ):
     """
     V4 continuation study:
-    'Hangisi yükselecek?' değil,
-    'Zaten yükselmiş coin ne zaman yükselmeye devam ediyor?' testi.
+    'Hangisi yÃ¼kselecek?' deÄŸil,
+    'Zaten yÃ¼kselmiÅŸ coin ne zaman yÃ¼kselmeye devam ediyor?' testi.
     """
     try:
         async with httpx.AsyncClient(
@@ -1921,19 +1921,19 @@ async def continuation90(
 
 def continuation_quality_events_v5(candles, symbol):
     """
-    V5: Coin zaten yükselmişken hareketin KALİTESİNİ ölçer.
-    Geleceği tahmin eden özellik kullanılmaz.
+    V5: Coin zaten yÃ¼kselmiÅŸken hareketin KALÄ°TESÄ°NÄ° Ã¶lÃ§er.
+    GeleceÄŸi tahmin eden Ã¶zellik kullanÄ±lmaz.
 
-    Sinyal anında bilinenler:
-    - son 30m yükseliş
-    - son altı 5m getirinin yapısı
-    - pozitif 5m mum sayısı
-    - son 15m / ilk 15m momentum karşılaştırması
-    - 30m içi peak'ten mevcut close'a geri çekilme
-    - son 3 mum hacminin önceki 3 muma göre devamlılığı
+    Sinyal anÄ±nda bilinenler:
+    - son 30m yÃ¼kseliÅŸ
+    - son altÄ± 5m getirinin yapÄ±sÄ±
+    - pozitif 5m mum sayÄ±sÄ±
+    - son 15m / ilk 15m momentum karÅŸÄ±laÅŸtÄ±rmasÄ±
+    - 30m iÃ§i peak'ten mevcut close'a geri Ã§ekilme
+    - son 3 mum hacminin Ã¶nceki 3 muma gÃ¶re devamlÄ±lÄ±ÄŸÄ±
 
-    Giriş: sonraki 5m OPEN
-    Çıkış: girişten 60m sonraki OPEN
+    GiriÅŸ: sonraki 5m OPEN
+    Ã‡Ä±kÄ±ÅŸ: giriÅŸten 60m sonraki OPEN
     """
     events = []
 
@@ -1944,7 +1944,7 @@ def continuation_quality_events_v5(candles, symbol):
         mom15 = pct_change(candles[i - 3]["close"], signal_close)
         mom30 = pct_change(candles[i - 6]["close"], signal_close)
 
-        # Biz sadece zaten yükselmiş hareketleri inceliyoruz.
+        # Biz sadece zaten yÃ¼kselmiÅŸ hareketleri inceliyoruz.
         if mom5 <= 0 or mom15 <= 0 or mom30 < 0.50:
             continue
 
@@ -2029,9 +2029,9 @@ def continuation_quality_events_v5(candles, symbol):
 
 def quality_bucket_report_v5(events):
     """
-    Tek değişkenli davranış raporu.
-    Amaç en iyi hücreyi seçmek değil, hangi hareket özelliklerinin
-    OOS'ta continuation ile ilişkili olduğunu görmek.
+    Tek deÄŸiÅŸkenli davranÄ±ÅŸ raporu.
+    AmaÃ§ en iyi hÃ¼creyi seÃ§mek deÄŸil, hangi hareket Ã¶zelliklerinin
+    OOS'ta continuation ile iliÅŸkili olduÄŸunu gÃ¶rmek.
     """
     dimensions = {
         "positive_candle_count": [
@@ -2076,9 +2076,9 @@ def quality_bucket_report_v5(events):
 
 def focused_continuation_zone_v5(events):
     """
-    V4'te keşfedilen genel bölgeyi ayrı raporlar:
+    V4'te keÅŸfedilen genel bÃ¶lgeyi ayrÄ± raporlar:
     30m momentum 1.0%-1.99%.
-    Burada yeni kalite özelliklerini inceliyoruz; yeni eşik optimize etmiyoruz.
+    Burada yeni kalite Ã¶zelliklerini inceliyoruz; yeni eÅŸik optimize etmiyoruz.
     """
     return [
         e for e in events
@@ -2191,9 +2191,9 @@ async def continuation_quality90(
 
 def combo_hypotheses_v6():
     """
-    Önceden tanımlı continuation hipotezleri.
-    Amaç OOS sonucuna göre eşik uydurmak değil; V4/V5'te gözlenen
-    yapıları ayrı, anlaşılır hipotezler olarak test etmektir.
+    Ã–nceden tanÄ±mlÄ± continuation hipotezleri.
+    AmaÃ§ OOS sonucuna gÃ¶re eÅŸik uydurmak deÄŸil; V4/V5'te gÃ¶zlenen
+    yapÄ±larÄ± ayrÄ±, anlaÅŸÄ±lÄ±r hipotezler olarak test etmektir.
     """
     return [
         (
@@ -2311,7 +2311,7 @@ async def continuation_combo90(
         cooled = apply_symbol_cooldown_v4(raw, 60)
         dev, oos = split_dev_oos(cooled)
 
-        # Ayrı coin genişliği: sonuç tek/az sayıda coin tarafından mı taşınıyor?
+        # AyrÄ± coin geniÅŸliÄŸi: sonuÃ§ tek/az sayÄ±da coin tarafÄ±ndan mÄ± taÅŸÄ±nÄ±yor?
         breadth = {}
         for name, predicate in combo_hypotheses_v6():
             coin_rows = []
@@ -2660,13 +2660,13 @@ async def h6_validate_v7(
 
 def enrich_h6_with_regime_v8(events, alt_candles, btc_candles):
     """
-    V8: H6 eşiklerine DOKUNMADAN, sinyal anındaki rejimi ekler.
-    Gelecek veri kullanılmaz.
+    V8: H6 eÅŸiklerine DOKUNMADAN, sinyal anÄ±ndaki rejimi ekler.
+    Gelecek veri kullanÄ±lmaz.
 
-    Rejim değişkenleri:
+    Rejim deÄŸiÅŸkenleri:
       BTC 1h / 4h / 24h return
       ALT 1h / 4h / 24h return
-    5m tamamlanmış mumlardan hesaplanır.
+    5m tamamlanmÄ±ÅŸ mumlardan hesaplanÄ±r.
     """
     alt_by_close = {c["close_time"]: idx for idx, c in enumerate(alt_candles)}
     btc_by_close = {c["close_time"]: idx for idx, c in enumerate(btc_candles)}
@@ -2738,9 +2738,9 @@ def enrich_h6_with_regime_v8(events, alt_candles, btc_candles):
 
 def regime_report_v8(events):
     """
-    Önceden tanımlı, kaba rejim ayrımları.
-    Amaç 'en iyi eşik' aramak değil; H6'nın hangi piyasa yönünde
-    bozulduğunu veya iyileştiğini görmek.
+    Ã–nceden tanÄ±mlÄ±, kaba rejim ayrÄ±mlarÄ±.
+    AmaÃ§ 'en iyi eÅŸik' aramak deÄŸil; H6'nÄ±n hangi piyasa yÃ¶nÃ¼nde
+    bozulduÄŸunu veya iyileÅŸtiÄŸini gÃ¶rmek.
     """
     regimes = [
         ("ALL", lambda e: True),
@@ -5701,7 +5701,7 @@ async def v18_regime_validate(
         }
 
 # =========================
-# V18 LIGHT — RENDER SAFE
+# V18 LIGHT â€” RENDER SAFE
 # =========================
 @app.get("/v18-light")
 async def v18_light():
@@ -5977,6 +5977,16 @@ async def live_quote(client, symbol):
         return None
 
 
+# =========================
+# V43 LOW-LATENCY EXECUTION
+# =========================
+# Strategy thresholds are unchanged. This is an execution-quality guard:
+# a signal detected too late is skipped instead of being entered many minutes
+# after its theoretical checkpoint.
+V43_EXECUTION_VERSION = "V43_LOW_LATENCY"
+V43_MAX_ENTRY_DELAY_SECONDS = 120
+V43_STARTED_UTC = utc_now()
+
 async def apply_live_entry(client, pos, candle_open_price, hold_ms):
     """
     Paper girisini gercekte alinabilecek fiyata cevirir.
@@ -5997,6 +6007,13 @@ async def apply_live_entry(client, pos, candle_open_price, hold_ms):
     pos["spread_pct"] = round(q["spread_pct"], 4)
     pos["entry_delay_seconds"] = round((now_ms - int(pos["entry_open_time"])) / 1000.0)
     pos["entry_slippage_vs_candle_pct"] = round(pct_change(candle_open_price, q["ask"]), 4)
+    pos["execution_version"] = V43_EXECUTION_VERSION
+
+    if pos["entry_delay_seconds"] > V43_MAX_ENTRY_DELAY_SECONDS:
+        return False, (
+            f"entry delay {pos['entry_delay_seconds']}s > "
+            f"{V43_MAX_ENTRY_DELAY_SECONDS}s"
+        )
 
     if q["spread_pct"] > SPREAD_MAX_PCT:
         return False, f"spread {q['spread_pct']:.3f}% > {SPREAD_MAX_PCT}%"
@@ -6159,7 +6176,7 @@ async def v20_scan_once():
         # build_universe() keeps the existing liquidity/safety exclusions;
         # there is no longer a top-10 cap.
 
-        semaphore = asyncio.Semaphore(2)
+        semaphore = asyncio.Semaphore(30)
 
         async def fetch(item):
             async with semaphore:
@@ -6372,7 +6389,7 @@ async def v20_forward_status():
 # Candidate B remains FROZEN. This section changes operations only:
 # automatic scanning + durable paper state. It does NOT place orders.
 
-V21_SCAN_INTERVAL_SECONDS = 300
+V21_SCAN_INTERVAL_SECONDS = 60
 V21_DB_URL = os.getenv("DATABASE_URL", "").strip()
 V21_AUTO_TASK = None
 V21_LAST_SCAN = {
@@ -6920,7 +6937,7 @@ async def v27_status():
     }
 
 # ============================================================
-# V28 CHALLENGER DIAGNOSTIC — SIGNAL FUNNEL ONLY
+# V28 CHALLENGER DIAGNOSTIC â€” SIGNAL FUNNEL ONLY
 # V27 forward paper remains unchanged.
 # No orders, no live trading, no V28 paper entries yet.
 # ============================================================
@@ -7518,7 +7535,7 @@ async def v28_btc_block(
 
 
 # ============================================================
-# V29 TOP-N CONTINUATION RANKING — LIGHT 3-DAY BLOCK
+# V29 TOP-N CONTINUATION RANKING â€” LIGHT 3-DAY BLOCK
 # Research only. V27 forward paper remains untouched.
 # Ranking uses information already known at the 60m decision point.
 # ============================================================
@@ -7929,7 +7946,7 @@ async def v30_confirmation_top1(
 
 
 # ============================================================
-# V31 REGIME DIAGNOSTIC — TOP1 / 60M FROZEN CHALLENGER
+# V31 REGIME DIAGNOSTIC â€” TOP1 / 60M FROZEN CHALLENGER
 # Research only. No V27/V29/V30 forward logic is changed.
 # All regime variables are known at the entry decision time.
 # ============================================================
@@ -8158,7 +8175,7 @@ async def v31_regime_block(
 
 
 # ============================================================
-# V32 FORWARD CHALLENGER — FROZEN AFTER V31
+# V32 FORWARD CHALLENGER â€” FROZEN AFTER V31
 # BTC-independent + Top1 + 60m confirmation + 120m hold
 # Separate PostgreSQL state/table. V27 state/rules untouched.
 # Research paper only; no trading/orders.
@@ -8179,7 +8196,7 @@ V32_LAST_SCAN = {
 V32_AUTO_TASK = None
 V32_COST_PCT = 0.15
 V32_HOLD_MS = 120 * 60 * 1000
-V32_SCAN_INTERVAL_SECONDS = 300
+V32_SCAN_INTERVAL_SECONDS = 60
 
 def v32_db_init():
     if not V21_DB_URL:
@@ -8259,7 +8276,7 @@ def v32_public_state():
 async def v32_scan_once():
     async with httpx.AsyncClient(timeout=httpx.Timeout(180.0)) as client:
         universe = await build_universe(client)
-        semaphore = asyncio.Semaphore(12)
+        semaphore = asyncio.Semaphore(30)
 
         async def fetch(item):
             async with semaphore:
@@ -8473,10 +8490,11 @@ async def v32_run_once():
     V32_LAST_SCAN["error"] = None
     try:
         result = await v32_scan_once()
-        notes = await v32_notify(result)
-        result["telegram_notifications"] = notes
+        # V43 reliability: persist state before external notification.
         if V21_DB_URL:
             v32_save_state()
+        notes = await v32_notify(result)
+        result["telegram_notifications"] = notes
         V32_LAST_SCAN["status"] = result.get("status", "OK")
         return result
     except Exception as e:
@@ -8488,7 +8506,7 @@ async def v32_run_once():
 
 async def v32_auto_loop():
     # Offset from V27 loop so the two broad-universe scans do not start together.
-    await asyncio.sleep(120)
+    await asyncio.sleep(30)
     while True:
         await v32_run_once()
         await asyncio.sleep(V32_SCAN_INTERVAL_SECONDS)
@@ -9659,10 +9677,12 @@ async def v37_loop():
     await asyncio.sleep(20)
     while True:
         try:
-            await v37_scan_once()
+            # V43: V37 discovery scanning is retired to free Binance/API capacity
+            # for the main V27/V32 low-latency forward branches.
+            # Existing V37 paper positions are still allowed to close normally.
             await v37_close_due()
         except Exception as e:
-            V37_STATE["last_error"] = f"loop: {e}"
+            V37_STATE["last_error"] = f"close-only loop: {e}"
         await asyncio.sleep(V37_SCAN_INTERVAL_SECONDS)
 
 
@@ -10441,5 +10461,63 @@ async def alt_live_overview():
             "skipped_recent": V32_STATE.get("skipped", [])[-20:],
             "seen_keys": len(V32_STATE["seen_signal_keys"]),
         },
+        "generated_utc": utc_now(),
+    }
+
+
+# =========================
+# V43 STATUS
+# =========================
+@app.get("/v43-status")
+async def v43_status():
+    def _new_v43_rows(state):
+        rows = list(state.get("open", {}).values()) + list(state.get("closed", []))
+        return [x for x in rows if x.get("execution_version") == V43_EXECUTION_VERSION]
+
+    def _latency(rows):
+        vals = [float(x["entry_delay_seconds"]) for x in rows
+                if x.get("entry_delay_seconds") is not None]
+        if not vals:
+            return {"n": 0, "mean_seconds": None, "median_seconds": None,
+                    "max_seconds": None}
+        return {
+            "n": len(vals),
+            "mean_seconds": round(mean(vals), 2),
+            "median_seconds": round(median(vals), 2),
+            "max_seconds": round(max(vals), 2),
+        }
+
+    v27_rows = _new_v43_rows(V20_STATE)
+    v32_rows = _new_v43_rows(V32_STATE)
+    return {
+        **MODE_INFO,
+        "status": "OK",
+        "panel": "V43_LOW_LATENCY_EXECUTION",
+        "research_only": True,
+        "trading": False,
+        "orders": False,
+        "strategy_thresholds_changed": False,
+        "execution_changes": {
+            "v27_scan_interval_seconds": V21_SCAN_INTERVAL_SECONDS,
+            "v32_scan_interval_seconds": V32_SCAN_INTERVAL_SECONDS,
+            "candle_fetch_concurrency": 30,
+            "max_entry_delay_seconds": V43_MAX_ENTRY_DELAY_SECONDS,
+            "late_signals": "SKIP_PAPER_ENTRY",
+            "live_entry_price": "BEST_ASK",
+            "spread_max_pct": SPREAD_MAX_PCT,
+            "v37_new_scans": False,
+            "v37_existing_positions": "CLOSE_ONLY",
+            "v32_persist_before_telegram": True,
+        },
+        "v43_process_started_utc": V43_STARTED_UTC,
+        "v27_v43_rows": len(v27_rows),
+        "v27_latency": _latency(v27_rows),
+        "v32_v43_rows": len(v32_rows),
+        "v32_latency": _latency(v32_rows),
+        "note": (
+            "Only rows tagged V43_LOW_LATENCY belong to the clean V43 execution "
+            "cohort. Pre-V43 open/closed rows remain in PostgreSQL but are not "
+            "counted in these latency statistics."
+        ),
         "generated_utc": utc_now(),
     }
