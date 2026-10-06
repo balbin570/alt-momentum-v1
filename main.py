@@ -10966,3 +10966,150 @@ async def v48_status():
         "note": "Read-only latest V32 scan visibility, including automatic scans. Strategy and paper execution rules unchanged.",
         "generated_utc": utc_now(),
     }
+
+
+@app.get("/v49-timing-diagnostic")
+async def v49_timing_diagnostic():
+    import time
+
+    t0 = time.perf_counter()
+    started_utc = utc_now()
+    now_ms = int(time.time() * 1000)
+
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+        t_snap0 = time.perf_counter()
+        good, errors, universe_count, cache_hit = await v44_market_snapshot(client)
+        t_snap1 = time.perf_counter()
+
+        if not good:
+            return {
+                **MODE_INFO,
+                "status": "ERROR",
+                "panel": "V49_TIMING_DIAGNOSTIC",
+                "error": "No snapshot data",
+                "fetch_errors": errors,
+            }
+
+        # Same V32 forward candidate construction and cross-sectional ranking.
+        t_calc0 = time.perf_counter()
+        all_rows = []
+        for symbol, candles in good.items():
+            if symbol == "BTCUSDT":
+                continue
+            all_rows.extend(relative_candidates_forward_live(candles, symbol))
+
+        ranked = rank_cross_section_v12(all_rows)
+        alt_snaps = compute_alt_market_snapshots_v18(good)
+
+        eligible = []
+        for e in ranked:
+            if e.get("relative_momentum_z", -999) < V32_RELATIVE_Z_MIN:
+                continue
+            if e.get("cross_section_percentile", 0) < V32_CROSS_SECTION_MIN:
+                continue
+            if e.get("behavior") != "CONTINUED_UP":
+                continue
+            alt = alt_snaps.get(e.get("signal_time_ms"))
+            if not alt:
+                continue
+            if float(alt.get("mean_30m_pct", 999)) >= V32_ALT_MEAN_30M_MAX:
+                continue
+            row = dict(e)
+            row["alt_market_mean_30m_pct"] = float(alt.get("mean_30m_pct"))
+            eligible.append(row)
+
+        # Same V32 Top1 rule per original signal timestamp.
+        grouped = {}
+        for e in eligible:
+            grouped.setdefault(e["signal_time_ms"], []).append(e)
+        top1 = []
+        for _, rows in grouped.items():
+            rows = sorted(
+                rows,
+                key=lambda x: (
+                    float(x.get("wait_end_change_pct", -999)),
+                    float(x.get("relative_momentum_z", -999)),
+                    float(x.get("cross_section_percentile", -999)),
+                ),
+                reverse=True,
+            )
+            if rows:
+                top1.append(rows[0])
+        top1.sort(key=lambda x: x["entry_open_time"])
+        t_calc1 = time.perf_counter()
+
+        newest_completed_open_ms = max(
+            (c[-1]["open_time"] for c in good.values() if c),
+            default=None,
+        )
+
+        recent = []
+        for e in top1[-12:]:
+            entry_ms = int(e["entry_open_time"])
+            signal_ms = int(e.get("signal_time_ms") or 0)
+            delay_now = (now_ms - entry_ms) / 1000.0
+            recent.append({
+                "symbol": e["symbol"],
+                "signal_time_ms": signal_ms,
+                "entry_open_time": entry_ms,
+                "signal_to_entry_open_seconds": round((entry_ms - signal_ms) / 1000.0, 3) if signal_ms else None,
+                "entry_open_to_request_now_seconds": round(delay_now, 3),
+                "z": round(float(e.get("relative_momentum_z", 0.0)), 4),
+                "percentile": round(float(e.get("cross_section_percentile", 0.0)), 4),
+                "continuation_60m_pct": round(float(e.get("wait_end_change_pct", 0.0)), 4),
+            })
+
+        # Fetch a live quote only for the newest Top1 candidate, read-only.
+        quote_timing = None
+        if top1:
+            e = top1[-1]
+            q0 = time.perf_counter()
+            q = await live_quote(client, e["symbol"])
+            q1 = time.perf_counter()
+            quote_now_ms = int(time.time() * 1000)
+            quote_timing = {
+                "symbol": e["symbol"],
+                "entry_open_time": e["entry_open_time"],
+                "quote_seconds": round(q1 - q0, 4),
+                "delay_at_quote_seconds": round((quote_now_ms - int(e["entry_open_time"])) / 1000.0, 3),
+                "quote": q,
+            }
+
+    t1 = time.perf_counter()
+    return {
+        **MODE_INFO,
+        "status": "OK",
+        "panel": "V49_TIMING_DIAGNOSTIC",
+        "research_only": True,
+        "trading": False,
+        "orders": False,
+        "strategy_thresholds_changed": False,
+        "late_entry_guard_seconds": V43_MAX_ENTRY_DELAY_SECONDS,
+        "timing_seconds": {
+            "snapshot": round(t_snap1 - t_snap0, 4),
+            "candidate_and_ranking": round(t_calc1 - t_calc0, 4),
+            "total": round(t1 - t0, 4),
+        },
+        "snapshot": {
+            "cache_hit": cache_hit,
+            "universe_count": universe_count,
+            "symbols_ok": len(good),
+            "fetch_errors_count": len(errors),
+            "newest_completed_open_ms": newest_completed_open_ms,
+        },
+        "counts": {
+            "raw_relative_rows": len(all_rows),
+            "ranked_rows": len(ranked),
+            "eligible_rows": len(eligible),
+            "top1_rows": len(top1),
+        },
+        "recent_top1_timing": recent,
+        "newest_top1_live_quote_timing": quote_timing,
+        "interpretation_hint": (
+            "Compare entry_open_to_request_now_seconds and delay_at_quote_seconds with "
+            "the <=120s guard. signal_to_entry_open_seconds shows how entry_open_time "
+            "is positioned relative to the original signal timestamp."
+        ),
+        "started_utc": started_utc,
+        "generated_utc": utc_now(),
+    }
