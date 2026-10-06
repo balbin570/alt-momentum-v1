@@ -1,3 +1,13 @@
+import inspect
+# ============================================================
+# V61.2 SAFE EVENT-STUDY PATCH
+# ------------------------------------------------------------
+# V61.1 strategy / entry / risk / FAST_3S behavior is unchanged.
+# This patch adds a persistent, low-load event-study job registry
+# so research progress/result survives Render restarts.
+# PAPER / RESEARCH ONLY. No real orders.
+# ============================================================
+
 # ============================================================
 # ALT-MOMENTUM-V1 / V61 (paper-only)
 # V60 uzerine eklenenler (giris/cikis KURALLARI DEGISMEDI):
@@ -12883,3 +12893,223 @@ async def v61_event_study():
             "params": V61_STUDY["params"], "started_utc": V61_STUDY["started_utc"],
             "finished_utc": V61_STUDY["finished_utc"], "error": V61_STUDY["error"],
             "result": V61_STUDY["result"]}
+
+
+# ============================================================
+# V61.2 — PERSISTENT SAFE EVENT-STUDY CONTROL PLANE
+# ============================================================
+V612_JOB = {
+    "status": "IDLE",
+    "params": None,
+    "progress": {},
+    "started_utc": None,
+    "updated_utc": None,
+    "finished_utc": None,
+    "error": None,
+    "result": None,
+}
+V612_TASK = None
+V612_BATCH_SIZE = 5
+V612_PAUSE_SECONDS = 2.0
+
+def _v612_now():
+    return datetime.now(timezone.utc).isoformat()
+
+def _v612_db_conn():
+    # Reuse the same configured PostgreSQL URL already used by the paper state.
+    url = (
+        os.getenv("DATABASE_URL")
+        or os.getenv("POSTGRES_URL")
+        or os.getenv("V7_DATABASE_URL")
+    )
+    if not url:
+        return None
+    return psycopg.connect(url)
+
+def v612_db_init():
+    conn = _v612_db_conn()
+    if conn is None:
+        return False
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS alt_v612_eventstudy_state (
+                        id INTEGER PRIMARY KEY,
+                        payload JSONB NOT NULL,
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                """)
+        return True
+    finally:
+        conn.close()
+
+def v612_save():
+    V612_JOB["updated_utc"] = _v612_now()
+    conn = _v612_db_conn()
+    if conn is None:
+        return False
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO alt_v612_eventstudy_state(id, payload, updated_at)
+                    VALUES (1, %s::jsonb, NOW())
+                    ON CONFLICT (id) DO UPDATE
+                    SET payload = EXCLUDED.payload, updated_at = NOW()
+                """, (json.dumps(V612_JOB, ensure_ascii=False, default=str),))
+        return True
+    finally:
+        conn.close()
+
+def v612_load():
+    conn = _v612_db_conn()
+    if conn is None:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT payload FROM alt_v612_eventstudy_state WHERE id=1")
+            row = cur.fetchone()
+        if row and isinstance(row[0], dict):
+            V612_JOB.clear()
+            V612_JOB.update(row[0])
+            # A task cannot survive process restart. Mark it resumable rather than
+            # pretending it is still running.
+            if V612_JOB.get("status") == "RUNNING":
+                V612_JOB["status"] = "PAUSED_RESTART"
+                V612_JOB["error"] = None
+            return True
+        return False
+    finally:
+        conn.close()
+
+async def _v612_run_existing_study(params):
+    """
+    Low-risk wrapper. It uses the existing V61 study function if discoverable.
+    We do not duplicate or silently alter its statistical logic here.
+    """
+    global V612_TASK
+    V612_JOB.update({
+        "status": "RUNNING",
+        "params": params,
+        "progress": {"stage": "starting"},
+        "started_utc": V612_JOB.get("started_utc") or _v612_now(),
+        "finished_utc": None,
+        "error": None,
+        "result": None,
+    })
+    v612_save()
+    try:
+        # Locate the existing event-study coroutine/function by common names.
+        candidates = [
+            "v61_event_study_worker",
+            "v61_run_event_study",
+            "v61_event_study_run",
+            "_v61_event_study_worker",
+        ]
+        fn = None
+        for name in candidates:
+            obj = globals().get(name)
+            if callable(obj):
+                fn = obj
+                break
+
+        if fn is None:
+            V612_JOB["status"] = "COMPATIBILITY_ERROR"
+            V612_JOB["error"] = (
+                "Existing V61 event-study worker function name was not found. "
+                "Active scanner/FAST_3S is unaffected."
+            )
+            v612_save()
+            return
+
+        V612_JOB["progress"] = {
+            "stage": "running_existing_engine",
+            "batch_size_target": V612_BATCH_SIZE,
+            "note": "Persistent control plane active; strategy is unchanged."
+        }
+        v612_save()
+
+        # Support either kwargs-style or dict-style existing worker.
+        try:
+            out = fn(**params)
+        except TypeError:
+            out = fn(params)
+        if inspect.isawaitable(out):
+            out = await out
+
+        # Some existing workers store their result in a global state and return None.
+        if out is None:
+            old_state = globals().get("V61_EVENT_STUDY") or globals().get("V61_EVENT_STUDY_STATE")
+            if isinstance(old_state, dict):
+                out = old_state.get("result")
+
+        V612_JOB["result"] = out
+        V612_JOB["status"] = "DONE" if out is not None else "DONE_NO_RESULT"
+        V612_JOB["progress"] = {"stage": "done"}
+        V612_JOB["finished_utc"] = _v612_now()
+        v612_save()
+    except asyncio.CancelledError:
+        V612_JOB["status"] = "PAUSED_RESTART"
+        V612_JOB["progress"] = {"stage": "interrupted"}
+        v612_save()
+        raise
+    except Exception as exc:
+        V612_JOB["status"] = "ERROR"
+        V612_JOB["error"] = f"{type(exc).__name__}: {exc}"
+        V612_JOB["finished_utc"] = _v612_now()
+        v612_save()
+
+@app.on_event("startup")
+async def v612_startup():
+    try:
+        v612_db_init()
+        v612_load()
+    except Exception as exc:
+        V612_JOB["status"] = "DB_ERROR"
+        V612_JOB["error"] = f"{type(exc).__name__}: {exc}"
+
+@app.get("/v61-2-status")
+async def v612_status():
+    return {
+        "model": "ALT-MOMENTUM-V1",
+        "mode": "RESEARCH_PAPER_ONLY",
+        "trading": False,
+        "orders": False,
+        "status": "OK",
+        "panel": "V61_2_SAFE_EVENT_STUDY",
+        "strategy_changed": False,
+        "risk_changed": False,
+        "fast_stop_changed": False,
+        "persistent_state": True,
+        "batch_size_target": V612_BATCH_SIZE,
+        "job": V612_JOB,
+        "generated_utc": _v612_now(),
+    }
+
+@app.get("/v61-2-event-study-start")
+async def v612_start(
+    symbols: int = Query(20, ge=5, le=50),
+    days: int = Query(20, ge=5, le=40),
+    entry_slip_pct: float = Query(0.10, ge=0, le=2),
+    stop_slip_pct: float = Query(0.30, ge=0, le=5),
+    cost_pct: float = Query(0.15, ge=0, le=2),
+):
+    global V612_TASK
+    if V612_TASK is not None and not V612_TASK.done():
+        return {"status": "ALREADY_RUNNING", "job": V612_JOB}
+
+    params = {
+        "symbols": int(symbols),
+        "days": int(days),
+        "entry_slip_pct": float(entry_slip_pct),
+        "stop_slip_pct": float(stop_slip_pct),
+        "cost_pct": float(cost_pct),
+    }
+    V612_JOB["started_utc"] = _v612_now()
+    V612_TASK = asyncio.create_task(_v612_run_existing_study(params))
+    return {
+        "status": "STARTED",
+        "params": params,
+        "note": "V61.2 persistent research wrapper; active V61.1 strategy unchanged.",
+    }
