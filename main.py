@@ -13003,6 +13003,7 @@ async def _v612_run_existing_study(params):
     try:
         # Locate the existing event-study coroutine/function by common names.
         candidates = [
+            "v61_study_run",  # actual worker name in the user's V61 source
             "v61_event_study_worker",
             "v61_run_event_study",
             "v61_event_study_run",
@@ -13031,19 +13032,36 @@ async def _v612_run_existing_study(params):
         }
         v612_save()
 
-        # Support either kwargs-style or dict-style existing worker.
-        try:
-            out = fn(**params)
-        except TypeError:
-            out = fn(params)
+        # V61's real worker signature is positional:
+        # v61_study_run(n_symbols, days, entry_slip, stop_slip, cost)
+        if getattr(fn, "__name__", "") == "v61_study_run":
+            out = fn(
+                params["symbols"],
+                params["days"],
+                params["entry_slip_pct"],
+                params["stop_slip_pct"],
+                params["cost_pct"],
+            )
+        else:
+            try:
+                out = fn(**params)
+            except TypeError:
+                out = fn(params)
         if inspect.isawaitable(out):
             out = await out
 
         # Some existing workers store their result in a global state and return None.
         if out is None:
-            old_state = globals().get("V61_EVENT_STUDY") or globals().get("V61_EVENT_STUDY_STATE")
+            old_state = (
+                globals().get("V61_STUDY")
+                or globals().get("V61_EVENT_STUDY")
+                or globals().get("V61_EVENT_STUDY_STATE")
+            )
             if isinstance(old_state, dict):
                 out = old_state.get("result")
+                # Mirror the real worker's terminal state/error.
+                if out is None and old_state.get("status") == "ERROR":
+                    raise RuntimeError(old_state.get("error") or "V61 study worker failed")
 
         V612_JOB["result"] = out
         V612_JOB["status"] = "DONE" if out is not None else "DONE_NO_RESULT"
