@@ -13685,3 +13685,89 @@ async def v65_combined_status():
 async def v65_time_sync():
     try:off=await get_binance_time_offset();return {'status':'OK','offset_ms':off,'synced_utc':V65_TIME_SYNC_UTC}
     except Exception as e:return {'status':'UNAVAILABLE_NON_BLOCKING','offset_ms':0,'error':str(e),'note':'Render cannot access Binance /time; research/backtest may continue without server-time offset.'}
+
+
+# ============================================================
+# V66 — EARLY BREAKOUT: MICRO-CONFIRMATION + FAILURE EXIT STUDY
+# Research only. Active V61/V55/FAST_3S remains unchanged.
+# Frozen source breakout: >=0.50% completed 5m candle + volume ratio >=1.20.
+# ============================================================
+V66_STUDY={"status":"IDLE","progress":{},"params":None,"result":None,"error":None,"started_utc":None,"finished_utc":None}
+V66_TASK=None
+
+def v66_candidates(store):
+    by_slot={}
+    for si,d in store.items():
+        o,c,v,t=d['o'],d['c'],d.get('v'),d['t']
+        if v is None: continue
+        for i in range(20,len(o)-3):
+            ch=((c[i]/o[i])-1)*100 if o[i] else 0
+            av=sum(v[i-20:i])/20;vr=(v[i]/av) if av>0 else 0
+            if ch>=0.50 and vr>=1.20: by_slot.setdefault(t[i],[]).append((ch,vr,si,i))
+    out=[]
+    for tm,a in by_slot.items():
+        ch,vr,si,i=max(a,key=lambda x:(x[0],x[1]));out.append((tm,si,i,ch,vr))
+    return sorted(out)
+
+def v66_exit(store,si,entry_i,entry_px,breakout_level,cost,entry_slip,mode):
+    d=store[si];o,h,l,c=d['o'],d['h'],d['l'],d['c'];end=min(len(o)-1,entry_i+24)
+    ep=entry_px*(1+entry_slip/100)
+    xi=end;reason='TIME_STOP_120M';xp=o[end]
+    for j in range(entry_i,end+1):
+        # Failure exit is causal at completed 5m close; execute next bar open.
+        if mode=='FAILURE_EXIT' and c[j] < breakout_level and j+1 < len(o):
+            xi=j+1;xp=o[xi];reason='BREAKOUT_FAILURE';break
+    net=((xp/ep)-1)*100-cost
+    return net,reason,xi
+
+def v66_stats_rows(rows):
+    rng=random.Random(66);return v61_stats([(r[0],r[1],r[2]) for r in rows],rng)
+
+def v66_compute(store,cost,entry_slip):
+    cand=v66_candidates(store);models={'BASE_IMMEDIATE':[],'CONFIRM_5M':[],'CONFIRM_10M':[],'CONFIRM_5M_FAILURE_EXIT':[],'CONFIRM_10M_FAILURE_EXIT':[]}
+    busy={k:{} for k in models}
+    for tm,si,i,ch,vr in cand:
+        d=store[si];o,h,l,c,t=d['o'],d['h'],d['l'],d['c'],d['t'];breakout=c[i]
+        specs=[('BASE_IMMEDIATE',i+1,True,'TIME'),
+               ('CONFIRM_5M',i+2,(i+1<len(c) and c[i+1]>breakout),'TIME'),
+               ('CONFIRM_10M',i+3,(i+2<len(c) and c[i+1]>breakout and c[i+2]>c[i+1]),'TIME'),
+               ('CONFIRM_5M_FAILURE_EXIT',i+2,(i+1<len(c) and c[i+1]>breakout),'FAILURE_EXIT'),
+               ('CONFIRM_10M_FAILURE_EXIT',i+3,(i+2<len(c) and c[i+1]>breakout and c[i+2]>c[i+1]),'FAILURE_EXIT')]
+        for name,ei,ok,mode in specs:
+            if not ok or ei>=len(o):continue
+            etm=t[ei]
+            if busy[name].get(si,0)>etm:continue
+            net,reason,xi=v66_exit(store,si,ei,o[ei],breakout,cost,entry_slip,mode)
+            busy[name][si]=t[min(xi,len(t)-1)];day=datetime.fromtimestamp(etm/1000,tz=timezone.utc).strftime('%Y-%m-%d')
+            models[name].append((net,day,reason))
+    return len(cand),{k:v66_stats_rows(v) for k,v in models.items()}
+
+async def v66_run(n_symbols,days,entry_slip,cost):
+    V66_STUDY.update(status='RUNNING',progress={'stage':'universe'},params={'symbols':n_symbols,'days':days,'entry_slip_pct':entry_slip,'cost_pct':cost},result=None,error=None,started_utc=utc_now(),finished_utc=None)
+    try:
+      async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
+        uni=await build_universe(client);syms=[u['symbol'] for u in uni if u['symbol']!='BTCUSDT'][:n_symbols];sem=asyncio.Semaphore(6)
+        async def fetch(sym):
+          async with sem:
+            try:return sym,await get_5m_candles_days(client,sym,days),None
+            except Exception as e:return sym,None,str(e)
+        aa,cc,ee,store={},{},{},{};errs=[];done=0
+        for st in range(0,len(syms),6):
+          for sym,candles,err in await asyncio.gather(*[fetch(x) for x in syms[st:st+6]]):
+            done+=1;V66_STUDY['progress']={'stage':'fetch','done':done,'total':len(syms)}
+            if err or not candles or len(candles)<400:errs.append({'symbol':sym,'error':err or 'insufficient'});continue
+            si=len(store);await asyncio.to_thread(v61_extract_symbol,sym,si,candles,aa,cc,ee,store)
+            store[si]['c']=array('d',[x['close'] for x in candles]);store[si]['v']=array('d',[x.get('volume',0.0) for x in candles])
+      V66_STUDY['progress']={'stage':'simulate'};raw,res=await asyncio.to_thread(v66_compute,store,cost,entry_slip)
+      V66_STUDY.update(status='DONE',progress={'stage':'done'},finished_utc=utc_now(),result={'raw_breakouts':raw,'models':res,
+        'rules':{'breakout':'completed 5m >= +0.50% and volume >=1.20x prior20','confirm_5m':'next completed 5m close remains above breakout close','confirm_10m':'two subsequent completed closes rising above breakout close','failure_exit':'after entry, first completed 5m close below breakout close -> exit next 5m open','max_hold_minutes':120},
+        'data':{'symbols_used':len(store),'symbols_failed':errs[:20]},'guardrails':['Research only; no real orders.','Rules fixed before result.','No threshold optimization in this run.','Active V61/V55/FAST_3S unchanged.']})
+    except Exception as e:V66_STUDY.update(status='ERROR',error=f'{type(e).__name__}: {e}',finished_utc=utc_now())
+
+@app.get('/v66-start')
+async def v66_start(symbols:int=Query(30,ge=20,le=50),days:int=Query(30,ge=20,le=40),entry_slip_pct:float=Query(.10,ge=0,le=1),cost_pct:float=Query(.15,ge=0,le=1)):
+    global V66_TASK
+    if V66_TASK is not None and not V66_TASK.done():return {'status':'ALREADY_RUNNING','progress':V66_STUDY.get('progress')}
+    V66_TASK=asyncio.create_task(v66_run(symbols,days,entry_slip_pct,cost_pct));return {'status':'STARTED','paper_only':True,'models':['BASE_IMMEDIATE','CONFIRM_5M','CONFIRM_10M','CONFIRM_5M_FAILURE_EXIT','CONFIRM_10M_FAILURE_EXIT']}
+@app.get('/v66-status')
+async def v66_status():return {**MODE_INFO,'status':'OK','panel':'V66_BREAKOUT_FAILURE_TEST','trading':False,'orders':False,'active_strategy_changed':False,'active_risk_changed':False,'study':V66_STUDY,'generated_utc':utc_now()}
