@@ -8303,7 +8303,53 @@ def v32_db_init():
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
             """)
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS alt_v54_scan_history (
+                    id BIGSERIAL PRIMARY KEY,
+                    captured_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    payload JSONB NOT NULL
+                )
+            """)
         conn.commit()
+
+def v54_persist_scan_history(row):
+    if not V21_DB_URL:
+        return
+    payload = json.dumps(row)
+    with v21_db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO alt_v54_scan_history (captured_at, payload)
+                VALUES (NOW(), %s::jsonb)
+            """, (payload,))
+            cur.execute("""
+                DELETE FROM alt_v54_scan_history
+                WHERE id NOT IN (
+                    SELECT id FROM alt_v54_scan_history
+                    ORDER BY id DESC
+                    LIMIT 100
+                )
+            """)
+        conn.commit()
+
+def v54_load_scan_history(limit=20):
+    if not V21_DB_URL:
+        return []
+    with v21_db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT payload
+                FROM alt_v54_scan_history
+                ORDER BY id DESC
+                LIMIT %s
+            """, (int(limit),))
+            rows = cur.fetchall()
+    out = []
+    for row in reversed(rows):
+        payload = row[0] if isinstance(row[0], dict) else json.loads(row[0])
+        out.append(payload)
+    return out
 
 def v32_serializable_state():
     return {
@@ -8545,7 +8591,7 @@ async def v32_scan_once():
                 continue
             entry_funnel["fresh_last_10m"] += 1
             key = f'{e["symbol"]}:{e["entry_open_time"]}'
-            if key in V47_SEEN_KEYS["V32"]:
+            if key in V32_STATE["seen_signal_keys"]:
                 _v46_reject("rejected_seen_key", e, "key already processed in V47")
                 continue
             if e["symbol"] in V32_STATE["open"]:
@@ -8661,7 +8707,7 @@ async def v32_run_once():
         V48_LAST_V32_RESULT["captured_utc"] = utc_now()
         _v51_captured = V48_LAST_V32_RESULT["captured_utc"]
         _v51_funnel = result.get("entry_funnel_v46") or {}
-        V51_V32_SCAN_HISTORY.append({
+        _v54_row = {
             "captured_utc": _v51_captured,
             "status": result.get("status"),
             "universe_size": result.get("universe_size"),
@@ -8671,8 +8717,11 @@ async def v32_run_once():
             "new_entries": result.get("new_entries", []),
             "newly_closed_count": len(result.get("newly_closed", [])),
             "fetch_errors_count": len(result.get("fetch_errors", [])),
-        })
+        }
+        V51_V32_SCAN_HISTORY.append(_v54_row)
         del V51_V32_SCAN_HISTORY[:-20]
+        if V21_DB_URL:
+            v54_persist_scan_history(_v54_row)
         # V43 reliability: persist state before external notification.
         if V21_DB_URL:
             v32_save_state()
@@ -8686,12 +8735,18 @@ async def v32_run_once():
         err = {"status": "ERROR", "error": str(e)}
         V48_LAST_V32_RESULT["result"] = err
         V48_LAST_V32_RESULT["captured_utc"] = utc_now()
-        V51_V32_SCAN_HISTORY.append({
+        _v54_error_row = {
             "captured_utc": V48_LAST_V32_RESULT["captured_utc"],
             "status": "ERROR",
             "error": str(e),
-        })
+        }
+        V51_V32_SCAN_HISTORY.append(_v54_error_row)
         del V51_V32_SCAN_HISTORY[:-20]
+        try:
+            if V21_DB_URL:
+                v54_persist_scan_history(_v54_error_row)
+        except Exception:
+            pass
         return err
     finally:
         V32_LAST_SCAN["finished_utc"] = utc_now()
@@ -8710,6 +8765,7 @@ async def v32_startup():
         if V21_DB_URL:
             v32_db_init()
             v32_load_state()
+            V51_V32_SCAN_HISTORY[:] = v54_load_scan_history(20)
     except Exception as e:
         V32_LAST_SCAN["status"] = "DB_STARTUP_ERROR"
         V32_LAST_SCAN["error"] = str(e)
@@ -11285,5 +11341,39 @@ async def v53_status():
         "historical_alignment": "signal_i -> checkpoint entry_idx = signal_i + 13",
         "v27_untouched": True,
         "note": "V32 forward architecture now evaluates the frozen CONTINUED_UP checkpoint from the observable current 5m OPEN; no wait for checkpoint candle close.",
+        "generated_utc": utc_now(),
+    }
+
+
+@app.get("/v54-status")
+async def v54_status():
+    db_history = []
+    db_error = None
+    try:
+        db_history = v54_load_scan_history(20) if V21_DB_URL else list(V51_V32_SCAN_HISTORY)
+    except Exception as e:
+        db_error = str(e)
+        db_history = list(V51_V32_SCAN_HISTORY)
+
+    latest = db_history[-1] if db_history else None
+    return {
+        **MODE_INFO,
+        "status": "OK" if db_error is None else "DEGRADED",
+        "panel": "V54_PERSISTENT_FORWARD_ENGINE",
+        "research_only": True,
+        "trading": False,
+        "orders": False,
+        "strategy_thresholds_changed": False,
+        "late_entry_guard_seconds": V43_MAX_ENTRY_DELAY_SECONDS,
+        "execution_version": "V53_CAUSAL_CHECKPOINT_OPEN",
+        "persistent_v32_state": bool(V21_DB_URL),
+        "persistent_seen_keys": len(V32_STATE.get("seen_signal_keys", set())),
+        "open_positions": len(V32_STATE.get("open", {})),
+        "closed_positions": len(V32_STATE.get("closed", [])),
+        "persistent_history_count": len(db_history),
+        "latest_scan": latest,
+        "last_scan_runtime": V32_LAST_SCAN,
+        "db_error": db_error,
+        "note": "V53 signal logic unchanged. V54 persists V32 seen keys/state plus the latest scan heartbeat/history across Render restarts.",
         "generated_utc": utc_now(),
     }
