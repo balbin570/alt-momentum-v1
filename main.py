@@ -8322,6 +8322,8 @@ V32_STATE = {
     "closed": [],
     "seen_signal_keys": set(),
     "started_utc": utc_now(),
+    "v59_counterfactual_pending": {},
+    "v59_counterfactual_done": [],
 }
 V57_LEGACY_QUARANTINE = []
 V32_LAST_SCAN = {
@@ -8400,6 +8402,8 @@ def v32_serializable_state():
         "closed": V32_STATE["closed"],
         "seen_signal_keys": sorted(prune_seen_keys(V32_STATE["seen_signal_keys"])),
         "started_utc": V32_STATE["started_utc"],
+        "v59_counterfactual_pending": V32_STATE.get("v59_counterfactual_pending", {}),
+        "v59_counterfactual_done": V32_STATE.get("v59_counterfactual_done", []),
     }
 
 def v32_save_state():
@@ -8431,6 +8435,8 @@ def v32_load_state():
     V32_STATE["closed"] = payload.get("closed", [])
     V32_STATE["seen_signal_keys"] = set(payload.get("seen_signal_keys", []))
     V32_STATE["started_utc"] = payload.get("started_utc", V32_STATE["started_utc"])
+    V32_STATE["v59_counterfactual_pending"] = payload.get("v59_counterfactual_pending", {})
+    V32_STATE["v59_counterfactual_done"] = payload.get("v59_counterfactual_done", [])
 
 def v32_public_state():
     closed = V32_STATE["closed"]
@@ -8800,6 +8806,7 @@ async def v32_scan_once():
                 V32_STATE["closed"].append(closed)
                 del V32_STATE["open"][sym]
                 newly_closed.append(closed)
+                v59_register_counterfactual(closed)
                 continue
 
             # Legacy V53 and earlier positions: do not retroactively change their exit rule.
@@ -8877,6 +8884,8 @@ async def v32_run_once():
         del V51_V32_SCAN_HISTORY[:-20]
         if V21_DB_URL:
             v54_persist_scan_history(_v54_row)
+        # V59: resolve due 120m counterfactual benchmarks before persistent save.
+        result["v59_counterfactual_completed"] = await v59_process_counterfactuals()
         # V43 reliability: persist state before external notification.
         if V21_DB_URL:
             v32_save_state()
@@ -11656,6 +11665,69 @@ async def v57_status():
     }
 
 
+
+def v59_register_counterfactual(closed):
+    if closed.get("execution_version") != V55_EXECUTION_VERSION:
+        return
+    if closed.get("exit_reason") not in ("HARD_STOP", "TRAILING_STOP"):
+        return
+    key = closed.get("key")
+    if not key or closed.get("exit_due_time") is None or closed.get("entry_price") is None:
+        return
+    pending = V32_STATE.setdefault("v59_counterfactual_pending", {})
+    done = V32_STATE.setdefault("v59_counterfactual_done", [])
+    if key in pending or any(x.get("key") == key for x in done):
+        return
+    pending[key] = {
+        "key": key,
+        "symbol": closed.get("symbol"),
+        "entry_price": closed.get("entry_price"),
+        "entry_live_ms": closed.get("entry_live_ms"),
+        "entry_open_time": closed.get("entry_open_time"),
+        "exit_due_time": closed.get("exit_due_time"),
+        "actual_exit_reason": closed.get("exit_reason"),
+        "actual_exit_price": closed.get("exit_price"),
+        "actual_net_pct": closed.get("net_pct"),
+        "registered_utc": utc_now(),
+    }
+
+async def v59_process_counterfactuals():
+    pending = V32_STATE.setdefault("v59_counterfactual_pending", {})
+    done = V32_STATE.setdefault("v59_counterfactual_done", [])
+    if not pending:
+        return []
+    now_ms = alt_now_ms()
+    completed = []
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        for key, item in list(pending.items()):
+            due = int(item.get("exit_due_time", 0))
+            if not due or now_ms < due:
+                continue
+            candle = await v56_fetch_legacy_exit_candle(client, item["symbol"], due)
+            if candle is None:
+                continue
+            cf_price = candle["open"]
+            gross = pct_change(float(item["entry_price"]), cf_price)
+            cf_net = gross - V32_COST_PCT
+            actual = float(item.get("actual_net_pct", 0.0))
+            row = {
+                **item,
+                "counterfactual_exit_open_time": candle["open_time"],
+                "counterfactual_exit_price": cf_price,
+                "counterfactual_gross_pct": round(gross, 4),
+                "counterfactual_net_pct": round(cf_net, 4),
+                "risk_engine_advantage_pct": round(actual - cf_net, 4),
+                "benchmark": "HOLD_TO_ORIGINAL_120M_DUE",
+                "completed_utc": utc_now(),
+                "version": "V59_COUNTERFACTUAL_EXIT",
+            }
+            done.append(row)
+            del pending[key]
+            completed.append(row)
+    if len(done) > 500:
+        del done[:-500]
+    return completed
+
 def v58_safe_stats(values):
     vals = [float(x) for x in values if x is not None]
     if not vals:
@@ -11729,4 +11801,66 @@ async def v58_analysis():
         },
         "last_scan_runtime":V32_LAST_SCAN,
         "generated_utc":utc_now()
+    }
+
+
+@app.get("/v59-analysis")
+async def v59_analysis():
+    pending = list(V32_STATE.get("v59_counterfactual_pending", {}).values())
+    done = list(V32_STATE.get("v59_counterfactual_done", []))
+
+    early_closed = [
+        p for p in V32_STATE.get("closed", [])
+        if p.get("execution_version") == V55_EXECUTION_VERSION
+        and p.get("exit_reason") in ("HARD_STOP", "TRAILING_STOP")
+    ]
+    tracked = {x.get("key") for x in pending} | {x.get("key") for x in done}
+    old_untracked = [p.get("key") for p in early_closed if p.get("key") not in tracked]
+
+    def st(rows, field):
+        return v58_safe_stats([r.get(field) for r in rows if r.get(field) is not None])
+
+    by_reason = {}
+    for reason in ("HARD_STOP", "TRAILING_STOP"):
+        q = [r for r in done if r.get("actual_exit_reason") == reason]
+        by_reason[reason] = {
+            "n": len(q),
+            "actual_risk_exit": st(q, "actual_net_pct"),
+            "counterfactual_120m": st(q, "counterfactual_net_pct"),
+            "mean_risk_engine_advantage_pct": (
+                round(sum(float(r["risk_engine_advantage_pct"]) for r in q) / len(q), 4)
+                if q else None
+            ),
+        }
+
+    return {
+        **MODE_INFO,
+        "status": "OK",
+        "panel": "V59_COUNTERFACTUAL_EXIT_ANALYSIS",
+        "research_only": True,
+        "trading": False,
+        "orders": False,
+        "read_only_analysis": True,
+        "strategy_changed": False,
+        "entry_rules_changed": False,
+        "risk_exit_rules_changed": False,
+        "benchmark": "Prospective HARD_STOP/TRAILING_STOP actual result versus same entry held to original 120m due time.",
+        "pending_count": len(pending),
+        "completed_count": len(done),
+        "overall": {
+            "actual_risk_exit": st(done, "actual_net_pct"),
+            "counterfactual_120m": st(done, "counterfactual_net_pct"),
+            "mean_risk_engine_advantage_pct": (
+                round(sum(float(r["risk_engine_advantage_pct"]) for r in done) / len(done), 4)
+                if done else None
+            ),
+        },
+        "by_actual_exit_reason": by_reason,
+        "pending": pending[-20:],
+        "recent_completed": done[-20:],
+        "pre_v59_early_exits_not_tracked_count": len(old_untracked),
+        "pre_v59_early_exits_not_tracked_keys": old_untracked[-20:],
+        "data_integrity_note": "Prospective only; no historical benchmark price is fabricated. V59 does not change entry or exit behavior.",
+        "last_scan_runtime": V32_LAST_SCAN,
+        "generated_utc": utc_now(),
     }
