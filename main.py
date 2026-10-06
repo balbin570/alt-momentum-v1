@@ -11654,3 +11654,79 @@ async def v57_status():
         "note": "Unrecoverable overdue pre-V55 legacy positions are removed from active-open state without inventing P/L and recorded in an audit quarantine. V55 entry/risk rules are unchanged.",
         "generated_utc": utc_now(),
     }
+
+
+def v58_safe_stats(values):
+    vals = [float(x) for x in values if x is not None]
+    if not vals:
+        return {"n":0,"wins":0,"losses":0,"win_rate_pct":None,"mean_net_pct":None,
+                "median_net_pct":None,"profit_factor":None,"sum_net_pct":0.0,
+                "best_net_pct":None,"worst_net_pct":None}
+    a = sorted(vals); n = len(a); m = n // 2
+    median = a[m] if n % 2 else (a[m-1] + a[m]) / 2
+    wins = sum(x > 0 for x in vals); losses = sum(x < 0 for x in vals)
+    gp = sum(x for x in vals if x > 0); gl = abs(sum(x for x in vals if x < 0))
+    pf = gp / gl if gl > 0 else ("INF" if gp > 0 else None)
+    return {
+        "n":n,"wins":wins,"losses":losses,"win_rate_pct":round(100*wins/n,2),
+        "mean_net_pct":round(sum(vals)/n,4),"median_net_pct":round(median,4),
+        "profit_factor":round(pf,4) if isinstance(pf,(int,float)) else pf,
+        "sum_net_pct":round(sum(vals),4),"best_net_pct":round(max(vals),4),
+        "worst_net_pct":round(min(vals),4)
+    }
+
+@app.get("/v58-analysis")
+async def v58_analysis():
+    closed_all = list(V32_STATE.get("closed", []))
+    v55_closed = [p for p in closed_all
+                  if p.get("execution_version") == V55_EXECUTION_VERSION
+                  and p.get("net_pct") is not None]
+    v55_open = [p for p in V32_STATE.get("open", {}).values()
+                if p.get("execution_version") == V55_EXECUTION_VERSION]
+
+    by_reason = {}
+    for reason in ("HARD_STOP","TRAILING_STOP","TIME_STOP_120M"):
+        q = [p for p in v55_closed if p.get("exit_reason") == reason]
+        by_reason[reason] = v58_safe_stats([p.get("net_pct") for p in q])
+
+    def avg(field):
+        v = [float(p[field]) for p in v55_closed if p.get(field) is not None]
+        return round(sum(v)/len(v),4) if v else None
+
+    return {
+        **MODE_INFO,
+        "status":"OK",
+        "panel":"V58_READ_ONLY_ANALYSIS",
+        "research_only":True,
+        "trading":False,
+        "orders":False,
+        "read_only":True,
+        "strategy_changed":False,
+        "entry_rules_changed":False,
+        "risk_exit_rules_changed":False,
+        "v56_universe_cleanup_retained":True,
+        "v57_legacy_quarantine_retained":True,
+        "v55_forward":{
+            "closed_count":len(v55_closed),
+            "open_count":len(v55_open),
+            "overall":v58_safe_stats([p.get("net_pct") for p in v55_closed]),
+            "by_exit_reason":by_reason,
+            "mean_entry_delay_seconds":avg("entry_delay_seconds"),
+            "mean_entry_slippage_vs_candle_pct":avg("entry_slippage_vs_candle_pct"),
+            "mean_continuation_60m_pct":avg("continuation_60m_pct"),
+            "mean_relative_momentum_z":avg("relative_momentum_z")
+        },
+        "sample_guidance":{
+            "minimum_first_review_closed":30,
+            "preferred_review_closed":50,
+            "ready_for_first_review":len(v55_closed)>=30,
+            "ready_for_preferred_review":len(v55_closed)>=50
+        },
+        "data_integrity":{
+            "quarantined_legacy_excluded_from_v55_stats":True,
+            "legacy_pre_v55_excluded_from_v55_stats":True,
+            "only_execution_version":V55_EXECUTION_VERSION
+        },
+        "last_scan_runtime":V32_LAST_SCAN,
+        "generated_utc":utc_now()
+    }
