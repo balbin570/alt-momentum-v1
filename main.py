@@ -14294,3 +14294,104 @@ async def v71_start(symbols:int=Query(40,ge=20,le=50),days:int=Query(40,ge=20,le
 @app.get("/v71-status")
 async def v71_status():
     return {**MODE_INFO,"status":"OK","panel":"V71_REGIME_DIAGNOSTIC","trading":False,"orders":False,"active_strategy_changed":False,"active_risk_changed":False,"study":V71_STUDY,"generated_utc":utc_now()}
+
+
+# ============================================================
+# V72 — 4H MARKET BREADTH MONOTONICITY / BTC4H CROSS-CHECK
+# Frozen cohort: V70 BTC30>0 AND ALT breadth30>0
+# Frozen entry V66 CONFIRM_10M + TIME120.
+# Quantile buckets are descriptive; no optimized numeric cutoff.
+# ============================================================
+V72_STUDY={"status":"IDLE","progress":{},"params":None,"result":None,"error":None,"started_utc":None,"finished_utc":None}
+V72_TASK=None
+
+def v72_quantile_cuts(vals):
+    a=sorted(vals)
+    if len(a)<3:return None,None
+    return a[len(a)//3],a[(2*len(a))//3]
+
+def v72_bucket(x,q1,q2):
+    return "LOW" if x<=q1 else ("MID" if x<=q2 else "HIGH")
+
+def v72_compute(store,btc,cost,entry_slip):
+    cand=v66_candidates(store)
+    bt={int(x["open_time"]):x for x in btc};btimes=sorted(bt)
+    rows=[];busy={}
+    for tm,si,i,ch,vr in cand:
+        d=store[si];o,h,l,c,t=d["o"],d["h"],d["l"],d["c"],d["t"];breakout=c[i]
+        if i+3>=len(o) or not(c[i+1]>breakout and c[i+2]>c[i+1]):continue
+        ei=i+3;et=t[ei]
+        if busy.get(si,0)>et:continue
+        xi=min(len(o)-1,ei+24);ep=o[ei]*(1+entry_slip/100);net=((o[xi]/ep)-1)*100-cost;busy[si]=t[xi]
+        bp=bisect.bisect_right(btimes,et)-1
+        if bp<48:continue
+        b30=v69_pct(float(bt[btimes[bp-6]]["close"]),float(bt[btimes[bp]]["close"]))
+        b4=v69_pct(float(bt[btimes[bp-48]]["close"]),float(bt[btimes[bp]]["close"]))
+        a30=[];a4=[]
+        for sj,dd in store.items():
+            k=bisect.bisect_right(dd["t"],et)-1
+            if k>=48:
+                a30.append(v69_pct(dd["c"][k-6],dd["c"][k]))
+                a4.append(v69_pct(dd["c"][k-48],dd["c"][k]))
+        if not a30 or not a4:continue
+        br30=sum(a30)/len(a30);br4=sum(a4)/len(a4)
+        if not(b30>0 and br30>0):continue
+        day=datetime.fromtimestamp(et/1000,tz=timezone.utc).strftime("%Y-%m-%d")
+        rows.append({"net":net,"day":day,"btc4":b4,"breadth4":br4})
+    qA=v72_quantile_cuts([r["breadth4"] for r in rows]);qB=v72_quantile_cuts([r["btc4"] for r in rows])
+    for r in rows:
+        r["alt_bucket"]=v72_bucket(r["breadth4"],*qA);r["btc_bucket"]=v72_bucket(r["btc4"],*qB)
+    def pack(rr):
+        st=v69_stats(rr)
+        days=sorted(set(r["day"] for r in rr));cut=days[len(days)//2] if days else None
+        st["first_half"]=v69_stats([r for r in rr if cut and r["day"]<cut])
+        st["second_half"]=v69_stats([r for r in rr if cut and r["day"]>=cut])
+        st["mean_alt_breadth4h"]=v71_mean([r["breadth4"] for r in rr])
+        st["mean_btc4h"]=v71_mean([r["btc4"] for r in rr])
+        return st
+    alt={b:pack([r for r in rows if r["alt_bucket"]==b]) for b in ("LOW","MID","HIGH")}
+    btcg={b:pack([r for r in rows if r["btc_bucket"]==b]) for b in ("LOW","MID","HIGH")}
+    cross={}
+    for a in ("LOW","MID","HIGH"):
+        for b in ("LOW","MID","HIGH"):
+            cross[a+"_ALT__"+b+"_BTC"]=pack([r for r in rows if r["alt_bucket"]==a and r["btc_bucket"]==b])
+    return len(cand),len(rows),{"alt_breadth4h_tertiles":alt,"btc4h_tertiles":btcg,"cross_3x3":cross,
+      "descriptive_cutpoints":{"alt_breadth4h_q33":round(qA[0],5),"alt_breadth4h_q67":round(qA[1],5),
+      "btc4h_q33":round(qB[0],5),"btc4h_q67":round(qB[1],5)}}
+
+async def v72_run(n_symbols,days,entry_slip,cost):
+    V72_STUDY.update(status="RUNNING",progress={"stage":"universe"},params={"symbols":n_symbols,"days":days,"entry_slip_pct":entry_slip,"cost_pct":cost},result=None,error=None,started_utc=utc_now(),finished_utc=None)
+    try:
+      async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
+        uni=await build_universe(client);syms=[u["symbol"] for u in uni if u["symbol"]!="BTCUSDT"][:n_symbols];sem=asyncio.Semaphore(6)
+        async def fetch(sym):
+          async with sem:
+            try:return sym,await get_5m_candles_days(client,sym,days),None
+            except Exception as e:return sym,None,str(e)
+        aa,cc,ee,store={},{},{},{};errs=[];done=0
+        for st in range(0,len(syms),6):
+          for sym,candles,err in await asyncio.gather(*[fetch(x) for x in syms[st:st+6]]):
+            done+=1;V72_STUDY["progress"]={"stage":"fetch_alts","done":done,"total":len(syms)}
+            if err or not candles or len(candles)<500:errs.append({"symbol":sym,"error":err or "insufficient"});continue
+            si=len(store);await asyncio.to_thread(v61_extract_symbol,sym,si,candles,aa,cc,ee,store)
+            store[si]["c"]=array("d",[x["close"] for x in candles]);store[si]["v"]=array("d",[x.get("volume",0.0) for x in candles])
+        V72_STUDY["progress"]={"stage":"fetch_btc"};btc=await get_5m_candles_days(client,"BTCUSDT",days+1)
+      V72_STUDY["progress"]={"stage":"tertiles"}
+      raw,n,res=await asyncio.to_thread(v72_compute,store,btc,cost,entry_slip)
+      V72_STUDY.update(status="DONE",progress={"stage":"done"},finished_utc=utc_now(),result={
+       "cohort":"FROZEN_V70_BTC30_POSITIVE_AND_ALT_BREADTH30_POSITIVE","entry":"FROZEN_V66_CONFIRM_10M","exit":"TIME120_CONTROL",
+       "raw_breakouts":raw,"cohort_trades":n,"analysis":res,
+       "guardrails":["Descriptive tertiles only; cutpoints are NOT strategy thresholds.","No threshold mining.","Entry/exit/cohort frozen.","Research only; no orders.","Active V61/V55/FAST_3S unchanged."],
+       "data":{"symbols_used":len(store),"symbols_failed":errs[:20]}})
+    except Exception as e:V72_STUDY.update(status="ERROR",error=f"{type(e).__name__}: {e}",finished_utc=utc_now())
+
+@app.get("/v72-start")
+async def v72_start(symbols:int=Query(40,ge=20,le=50),days:int=Query(40,ge=20,le=40),entry_slip_pct:float=Query(.10,ge=0,le=1),cost_pct:float=Query(.15,ge=0,le=1)):
+    global V72_TASK
+    if V72_TASK is not None and not V72_TASK.done():return {"status":"ALREADY_RUNNING","progress":V72_STUDY.get("progress")}
+    V72_TASK=asyncio.create_task(v72_run(symbols,days,entry_slip_pct,cost_pct))
+    return {"status":"STARTED","paper_only":True,"study":"ALT_BREADTH4H_MONOTONICITY_AND_BTC4H_CROSSCHECK"}
+
+@app.get("/v72-status")
+async def v72_status():
+    return {**MODE_INFO,"status":"OK","panel":"V72_BREADTH4H_MONOTONICITY","trading":False,"orders":False,"active_strategy_changed":False,"active_risk_changed":False,"study":V72_STUDY,"generated_utc":utc_now()}
