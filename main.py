@@ -14398,6 +14398,28 @@ async def v72_status():
     return {**MODE_INFO,"status":"OK","panel":"V72_BREADTH4H_MONOTONICITY","trading":False,"orders":False,"active_strategy_changed":False,"active_risk_changed":False,"study":V72_STUDY,"generated_utc":utc_now()}
 
 
+
+async def v73_fetch_window(client, symbol, start_ms, end_ms):
+    """Fetch only the requested completed 5m historical window."""
+    out={}
+    cursor=end_ms
+    max_pages=40
+    for _ in range(max_pages):
+        raw=await get_json(client,"/api/v3/klines",params={
+            "symbol":symbol,"interval":"5m","limit":1000,"endTime":cursor
+        })
+        if not raw: break
+        oldest=int(raw[0][0])
+        for k in raw:
+            ot=int(k[0]); ct=int(k[6])
+            if start_ms <= ot < end_ms and ct < end_ms:
+                out[ot]={"open_time":ot,"open":float(k[1]),"high":float(k[2]),"low":float(k[3]),
+                         "close":float(k[4]),"volume":float(k[5]),"close_time":ct}
+        if oldest <= start_ms: break
+        cursor=oldest-1
+        await asyncio.sleep(0.01)
+    return sorted(out.values(),key=lambda x:x["open_time"])
+
 # ============================================================
 # V73 — COMBINED OOS MID-ZONE VALIDATION
 # One run: older non-overlapping window + frozen V72 zone +
@@ -14459,27 +14481,24 @@ async def v73_run(n_symbols,history_days,oos_days,entry_slip,cost):
       # Freeze OOS end BEFORE fetching: older window excludes most recent 40d discovery sample.
       cutoff=datetime.now(timezone.utc)-timedelta(days=40)
       cutoff_ms=int(cutoff.timestamp()*1000)
-      fetch_days=history_days+45
+      # Exact older window only: OOS days + ~2 days warm-up, ending 40d ago.
+      window_start_ms=cutoff_ms-int((oos_days+3)*24*60*60*1000)
       async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
-        uni=await build_universe(client);syms=[u["symbol"] for u in uni if u["symbol"]!="BTCUSDT"][:n_symbols];sem=asyncio.Semaphore(6)
+        uni=await build_universe(client);syms=[u["symbol"] for u in uni if u["symbol"]!="BTCUSDT"][:n_symbols];sem=asyncio.Semaphore(10)
         async def fetch(sym):
           async with sem:
-            try:return sym,await get_5m_candles_days(client,sym,fetch_days),None
+            try:return sym,await v73_fetch_window(client,sym,window_start_ms,cutoff_ms),None
             except Exception as e:return sym,None,str(e)
         aa,cc,ee,store={},{},{},{};errs=[];done=0
         for st in range(0,len(syms),6):
           for sym,candles,err in await asyncio.gather(*[fetch(x) for x in syms[st:st+6]]):
             done+=1;V73_STUDY["progress"]={"stage":"fetch_alts","done":done,"total":len(syms)}
             if err or not candles or len(candles)<500:errs.append({"symbol":sym,"error":err or "insufficient"});continue
-            # restrict to requested older OOS horizon plus warmup, ending before discovery window
-            candles=[x for x in candles if int(x["open_time"])<cutoff_ms]
             if len(candles)<500:errs.append({"symbol":sym,"error":"insufficient older data"});continue
-            keep=oos_days*288+600;candles=candles[-keep:]
             si=len(store);await asyncio.to_thread(v61_extract_symbol,sym,si,candles,aa,cc,ee,store)
             store[si]["c"]=array("d",[x["close"] for x in candles]);store[si]["v"]=array("d",[x.get("volume",0.0) for x in candles])
         V73_STUDY["progress"]={"stage":"fetch_btc"}
-        btc=await get_5m_candles_days(client,"BTCUSDT",fetch_days)
-        btc=[x for x in btc if int(x["open_time"])<cutoff_ms][-((oos_days*288)+600):]
+        btc=await v73_fetch_window(client,"BTCUSDT",window_start_ms,cutoff_ms)
       V73_STUDY["progress"]={"stage":"oos_validation"}
       raw,base,altmid,mid=await asyncio.to_thread(v73_compute,store,btc,cost,entry_slip,cutoff_ms)
       def retention(x):return round(100*len(x)/len(base),2) if base else None
@@ -14507,4 +14526,4 @@ async def v73_start(symbols:int=Query(40,ge=20,le=50),history_days:int=Query(100
 
 @app.get("/v73-status")
 async def v73_status():
-    return {**MODE_INFO,"status":"OK","panel":"V73_OOS_MIDZONE_VALIDATION","trading":False,"orders":False,"active_strategy_changed":False,"active_risk_changed":False,"study":V73_STUDY,"generated_utc":utc_now()}
+    return {**MODE_INFO,"status":"OK","panel":"V73.2_FAST_OOS_MIDZONE_VALIDATION","trading":False,"orders":False,"active_strategy_changed":False,"active_risk_changed":False,"study":V73_STUDY,"generated_utc":utc_now()}
