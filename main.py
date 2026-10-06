@@ -5990,6 +5990,7 @@ V47_EXECUTION_VERSION = "V47_SEEN_KEY_FIX"
 V47_STARTED_UTC = utc_now()
 V47_SEEN_KEYS = {"V27": set(), "V32": set()}
 V48_LAST_V32_RESULT = {"result": None, "captured_utc": None}
+V51_V32_SCAN_HISTORY = []
 V43_STARTED_UTC = utc_now()
 
 async def apply_live_entry(client, pos, candle_open_price, hold_ms):
@@ -8631,6 +8632,20 @@ async def v32_run_once():
         # V48: retain the exact latest automatic/manual scan result for read-only visibility.
         V48_LAST_V32_RESULT["result"] = result
         V48_LAST_V32_RESULT["captured_utc"] = utc_now()
+        _v51_captured = V48_LAST_V32_RESULT["captured_utc"]
+        _v51_funnel = result.get("entry_funnel_v46") or {}
+        V51_V32_SCAN_HISTORY.append({
+            "captured_utc": _v51_captured,
+            "status": result.get("status"),
+            "universe_size": result.get("universe_size"),
+            "eligible_rows_seen": result.get("eligible_rows_seen"),
+            "top1_rows_seen": result.get("top1_rows_seen"),
+            "entry_funnel": _v51_funnel,
+            "new_entries": result.get("new_entries", []),
+            "newly_closed_count": len(result.get("newly_closed", [])),
+            "fetch_errors_count": len(result.get("fetch_errors", [])),
+        })
+        del V51_V32_SCAN_HISTORY[:-20]
         # V43 reliability: persist state before external notification.
         if V21_DB_URL:
             v32_save_state()
@@ -8644,6 +8659,12 @@ async def v32_run_once():
         err = {"status": "ERROR", "error": str(e)}
         V48_LAST_V32_RESULT["result"] = err
         V48_LAST_V32_RESULT["captured_utc"] = utc_now()
+        V51_V32_SCAN_HISTORY.append({
+            "captured_utc": V48_LAST_V32_RESULT["captured_utc"],
+            "status": "ERROR",
+            "error": str(e),
+        })
+        del V51_V32_SCAN_HISTORY[:-20]
         return err
     finally:
         V32_LAST_SCAN["finished_utc"] = utc_now()
@@ -11160,5 +11181,44 @@ async def v50_status():
         "historical_entry_open_time_preserved": True,
         "delay_reference": "actionable_time_ms = observation checkpoint candle close_time + 1ms",
         "note": "Completed-candle forward timing correction only; frozen strategy thresholds unchanged.",
+        "generated_utc": utc_now(),
+    }
+
+
+@app.get("/v51-status")
+async def v51_status():
+    history = list(V51_V32_SCAN_HISTORY)
+    attempted = 0
+    delay_rejected = 0
+    spread_rejected = 0
+    accepted = 0
+    fresh = 0
+    for row in history:
+        f = row.get("entry_funnel") or {}
+        fresh += int(f.get("fresh_last_10m", 0) or 0)
+        attempted += int(f.get("quote_or_entry_attempted", 0) or 0)
+        delay_rejected += int(f.get("rejected_delay_gt_120s", 0) or 0)
+        spread_rejected += int(f.get("rejected_spread", 0) or 0)
+        accepted += int(f.get("accepted_entries", 0) or 0)
+
+    return {
+        **MODE_INFO,
+        "status": "OK",
+        "panel": "V51_V32_LAST_20_SCAN_HISTORY",
+        "research_only": True,
+        "trading": False,
+        "orders": False,
+        "strategy_thresholds_changed": False,
+        "late_entry_guard_seconds": V43_MAX_ENTRY_DELAY_SECONDS,
+        "history_count": len(history),
+        "aggregate_last_20": {
+            "fresh_candidates": fresh,
+            "quote_or_entry_attempted": attempted,
+            "rejected_delay_gt_120s": delay_rejected,
+            "rejected_spread": spread_rejected,
+            "accepted_entries": accepted,
+        },
+        "history": history,
+        "note": "Read-only RAM history. Keeps the last 20 completed V32 scans so an entry/rejection cannot disappear on the next scan.",
         "generated_utc": utc_now(),
     }
