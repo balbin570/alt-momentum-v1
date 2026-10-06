@@ -5993,6 +5993,16 @@ V48_LAST_V32_RESULT = {"result": None, "captured_utc": None}
 V51_V32_SCAN_HISTORY = []
 V43_STARTED_UTC = utc_now()
 
+# =========================
+# V55 RISK EXIT ENGINE
+# =========================
+# Entry strategy is unchanged. These are fixed prospective risk-management rules,
+# not fitted/optimized from the current forward cohort.
+V55_EXECUTION_VERSION = "V55_RISK_EXIT_ENGINE"
+V55_HARD_STOP_PCT = 3.0
+V55_TRAIL_ACTIVATE_PCT = 2.0
+V55_TRAIL_DISTANCE_PCT = 1.5
+
 async def apply_live_entry(client, pos, candle_open_price, hold_ms):
     """
     Paper girisini gercekte alinabilecek fiyata cevirir.
@@ -8622,7 +8632,16 @@ async def v32_scan_once():
             }
             entry_funnel["quote_or_entry_attempted"] += 1
             ok_entry, skip_reason = await apply_live_entry(client, pos, price, V32_HOLD_MS)
-            pos["execution_version"] = "V53_CAUSAL_CHECKPOINT_OPEN"
+            pos["execution_version"] = V55_EXECUTION_VERSION
+            pos["risk_engine"] = {
+                "hard_stop_pct": V55_HARD_STOP_PCT,
+                "trail_activate_pct": V55_TRAIL_ACTIVATE_PCT,
+                "trail_distance_pct": V55_TRAIL_DISTANCE_PCT,
+                "max_hold_minutes": 120,
+            }
+            pos["peak_bid"] = pos.get("live_bid") or pos.get("entry_price")
+            pos["peak_gain_pct"] = round(pct_change(pos["entry_price"], pos["peak_bid"]), 4)
+            pos["trailing_active"] = False
             if not ok_entry:
                 reason_text = str(skip_reason or "")
                 if "entry delay" in reason_text:
@@ -8643,12 +8662,74 @@ async def v32_scan_once():
             entry_funnel["accepted_entries"] += 1
 
         newly_closed = []
-        # Close logic uses completed candles only, preserving the existing paper exit rule.
         for sym, pos in list(V32_STATE["open"].items()):
             candles_all = good.get(sym)
             if not candles_all:
                 continue
             candles = candles_all[:-1]
+
+            # V55 applies only prospectively to positions opened by V55.
+            if pos.get("execution_version") == V55_EXECUTION_VERSION:
+                q = await live_quote(client, sym)
+                now_ms = alt_now_ms()
+                exit_price = None
+                exit_reason = None
+
+                if q:
+                    bid = float(q["bid"])
+                    peak = max(float(pos.get("peak_bid") or pos["entry_price"]), bid)
+                    pos["peak_bid"] = peak
+                    pos["peak_gain_pct"] = round(pct_change(pos["entry_price"], peak), 4)
+
+                    if pos["peak_gain_pct"] >= V55_TRAIL_ACTIVATE_PCT:
+                        pos["trailing_active"] = True
+
+                    hard_stop_price = float(pos["entry_price"]) * (1.0 - V55_HARD_STOP_PCT / 100.0)
+                    pos["hard_stop_price"] = hard_stop_price
+
+                    if bid <= hard_stop_price:
+                        exit_price = bid
+                        exit_reason = "HARD_STOP"
+                    elif pos.get("trailing_active"):
+                        trail_stop = peak * (1.0 - V55_TRAIL_DISTANCE_PCT / 100.0)
+                        pos["trailing_stop_price"] = trail_stop
+                        if bid <= trail_stop:
+                            exit_price = bid
+                            exit_reason = "TRAILING_STOP"
+
+                    if exit_price is None and now_ms >= int(pos["exit_due_time"]):
+                        exit_price = bid
+                        exit_reason = "TIME_STOP_120M"
+
+                # Quote failure fallback: preserve the max-120m close ability.
+                if exit_price is None and now_ms >= int(pos["exit_due_time"]):
+                    exit_candle = next((c for c in candles if c["open_time"] >= pos["exit_due_time"]), None)
+                    if exit_candle is not None:
+                        exit_price = exit_candle["open"]
+                        exit_reason = "TIME_STOP_120M_FALLBACK"
+
+                if exit_price is None:
+                    continue
+
+                gross = pct_change(pos["entry_price"], exit_price)
+                net = gross - V32_COST_PCT
+                closed = {
+                    **pos,
+                    "status": "CLOSED_PAPER",
+                    "exit_open_time": now_ms,
+                    "exit_price": exit_price,
+                    "gross_pct": round(gross, 4),
+                    "cost_pct": V32_COST_PCT,
+                    "net_pct": round(net, 4),
+                    "exit_reason": exit_reason,
+                    "exit_execution_version": V55_EXECUTION_VERSION,
+                }
+                V32_STATE["closed"].append(closed)
+                del V32_STATE["open"][sym]
+                newly_closed.append(closed)
+                continue
+
+            # Legacy V53 and earlier positions: do not retroactively change their exit rule.
             exit_candle = next((c for c in candles if c["open_time"] >= pos["exit_due_time"]), None)
             if exit_candle is None:
                 continue
@@ -8657,7 +8738,8 @@ async def v32_scan_once():
             net = gross - V32_COST_PCT
             closed = {**pos, "status": "CLOSED_PAPER", "exit_open_time": exit_candle["open_time"],
                       "exit_price": exit_price, "gross_pct": round(gross, 4),
-                      "cost_pct": V32_COST_PCT, "net_pct": round(net, 4)}
+                      "cost_pct": V32_COST_PCT, "net_pct": round(net, 4),
+                      "exit_reason": "LEGACY_TIME_STOP_120M"}
             closed.update(shadow_stop_results(candles, closed, exit_candle, V32_COST_PCT))
             V32_STATE["closed"].append(closed)
             del V32_STATE["open"][sym]
@@ -8670,7 +8752,7 @@ async def v32_scan_once():
             "eligible_rows_seen": len(eligible), "top1_rows_seen": len(top1_rows),
             "entry_funnel_v46": entry_funnel, "new_entries": new_entries,
             "newly_closed": newly_closed, "fetch_errors": errors,
-            "execution_architecture": "V53_CAUSAL_CHECKPOINT_OPEN",
+            "execution_architecture": V55_EXECUTION_VERSION,
         }
 
 async def v32_notify(result):
@@ -11375,5 +11457,45 @@ async def v54_status():
         "last_scan_runtime": V32_LAST_SCAN,
         "db_error": db_error,
         "note": "V53 signal logic unchanged. V54 persists V32 seen keys/state plus the latest scan heartbeat/history across Render restarts.",
+        "generated_utc": utc_now(),
+    }
+
+
+@app.get("/v55-status")
+async def v55_status():
+    open_v55 = [p for p in V32_STATE.get("open", {}).values()
+                if p.get("execution_version") == V55_EXECUTION_VERSION]
+    closed_v55 = [p for p in V32_STATE.get("closed", [])
+                  if p.get("execution_version") == V55_EXECUTION_VERSION]
+    reasons = {}
+    for p in closed_v55:
+        r = p.get("exit_reason", "UNKNOWN")
+        reasons[r] = reasons.get(r, 0) + 1
+
+    return {
+        **MODE_INFO,
+        "status": "OK",
+        "panel": "V55_RISK_EXIT_ENGINE",
+        "research_only": True,
+        "trading": False,
+        "orders": False,
+        "entry_strategy_thresholds_changed": False,
+        "entry_architecture": "V53_CAUSAL_CHECKPOINT_OPEN",
+        "risk_exit_rules": {
+            "hard_stop_pct": V55_HARD_STOP_PCT,
+            "trailing_activation_gain_pct": V55_TRAIL_ACTIVATE_PCT,
+            "trailing_distance_from_peak_pct": V55_TRAIL_DISTANCE_PCT,
+            "maximum_hold_minutes": 120,
+            "paper_exit_price": "live bid when available",
+        },
+        "legacy_v53_positions_untouched": True,
+        "v55_open_count": len(open_v55),
+        "v55_closed_count": len(closed_v55),
+        "v55_exit_reasons": reasons,
+        "v55_open_positions": open_v55,
+        "last_scan_runtime": V32_LAST_SCAN,
+        "persistent_seen_keys": len(V32_STATE.get("seen_signal_keys", set())),
+        "db_configured": bool(V21_DB_URL),
+        "note": "Prospective V55 only: same frozen V53 entry logic; hard stop + activated trailing stop + 120m maximum hold. Existing V53 positions keep their legacy exit rule.",
         "generated_utc": utc_now(),
     }
