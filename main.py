@@ -13771,3 +13771,76 @@ async def v66_start(symbols:int=Query(30,ge=20,le=50),days:int=Query(30,ge=20,le
     V66_TASK=asyncio.create_task(v66_run(symbols,days,entry_slip_pct,cost_pct));return {'status':'STARTED','paper_only':True,'models':['BASE_IMMEDIATE','CONFIRM_5M','CONFIRM_10M','CONFIRM_5M_FAILURE_EXIT','CONFIRM_10M_FAILURE_EXIT']}
 @app.get('/v66-status')
 async def v66_status():return {**MODE_INFO,'status':'OK','panel':'V66_BREAKOUT_FAILURE_TEST','trading':False,'orders':False,'active_strategy_changed':False,'active_risk_changed':False,'study':V66_STUDY,'generated_utc':utc_now()}
+
+
+# ============================================================
+# V67 — CONFIRM_10M POST-ENTRY WINNER/LOSER DIAGNOSTIC
+# Frozen entry: +0.50% 5m breakout, volume >=1.20x, 10m confirmation.
+# Exit label/control: TIME120. Diagnostic only; no strategy change.
+# ============================================================
+V67_STUDY={"status":"IDLE","progress":{},"params":None,"result":None,"error":None,"started_utc":None,"finished_utc":None}
+V67_TASK=None
+V67_HORIZONS=[5,10,15,20,30]
+
+def v67_summ(a):
+    a=[float(x) for x in a if x is not None and math.isfinite(float(x))]
+    return {'n':len(a),'mean':round(sum(a)/len(a),5) if a else None,'median':round(statistics.median(a),5) if a else None}
+
+def v67_compute(store,cost,entry_slip):
+    cand=v66_candidates(store);rows=[];busy={}
+    for tm,si,i,ch,vr in cand:
+        d=store[si];o,h,l,c,t=d['o'],d['h'],d['l'],d['c'],d['t'];breakout=c[i]
+        if i+3>=len(o) or not (c[i+1]>breakout and c[i+2]>c[i+1]):continue
+        ei=i+3;et=t[ei]
+        if busy.get(si,0)>et:continue
+        cfg={'name':'TIME_ONLY_120m','stop':None,'act':None,'dist':None,'hold':120}
+        sim=v61_simulate(o,h,l,ei,cfg,entry_slip,entry_slip,0.0,cost)
+        if sim is None:continue
+        net,reason,xi=sim;busy[si]=t[min(xi,len(t)-1)];ep=o[ei]*(1+entry_slip/100)
+        r={'net':float(net),'winner':net>0,'day':datetime.fromtimestamp(et/1000,tz=timezone.utc).strftime('%Y-%m-%d'),'breakout_chg':ch,'breakout_vr':vr}
+        for mins in V67_HORIZONS:
+            bars=mins//5;end=min(len(o)-1,ei+bars-1);seg_h=h[ei:end+1];seg_l=l[ei:end+1]
+            last=c[end];r[f'ret_{mins}m']=((last/ep)-1)*100;r[f'mfe_{mins}m']=((max(seg_h)/ep)-1)*100;r[f'mae_{mins}m']=((min(seg_l)/ep)-1)*100
+            r[f'above_breakout_{mins}m']=1.0 if last>=breakout else 0.0;r[f'new_high_{mins}m']=1.0 if max(seg_h)>max(h[max(0,i-5):i+1]) else 0.0
+        rows.append(r)
+    features=['breakout_chg','breakout_vr']+[f'{x}_{m}m' for m in V67_HORIZONS for x in ('ret','mfe','mae','above_breakout','new_high')]
+    groups={}
+    for name,pred in [('WINNERS',lambda r:r['winner']),('LOSERS',lambda r:not r['winner'])]:
+        rr=[r for r in rows if pred(r)];groups[name]={'n':len(rr),'mean_final_net':round(sum(r['net'] for r in rr)/len(rr),5) if rr else None,'features':{f:v67_summ([r.get(f) for r in rr]) for f in features}}
+    dif={f:{'winner_mean':groups['WINNERS']['features'][f]['mean'],'loser_mean':groups['LOSERS']['features'][f]['mean']} for f in features}
+    for f,v in dif.items():
+        a,b=v['winner_mean'],v['loser_mean'];v['difference']=round(a-b,5) if a is not None and b is not None else None
+    days=sorted(set(r['day'] for r in rows));cut=days[len(days)//2] if days else None
+    temporal={}
+    for lab,rr in [('FIRST_HALF',[r for r in rows if cut and r['day']<cut]),('SECOND_HALF',[r for r in rows if cut and r['day']>=cut])]:
+        temporal[lab]={'n':len(rr),'win_rate_pct':round(100*sum(r['winner'] for r in rr)/len(rr),2) if rr else None,
+          'mean_net_pct':round(sum(r['net'] for r in rr)/len(rr),5) if rr else None}
+    return len(cand),len(rows),groups,dif,temporal
+
+async def v67_run(n_symbols,days,entry_slip,cost):
+    V67_STUDY.update(status='RUNNING',progress={'stage':'universe'},params={'symbols':n_symbols,'days':days,'entry_slip_pct':entry_slip,'cost_pct':cost},result=None,error=None,started_utc=utc_now(),finished_utc=None)
+    try:
+      async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
+        uni=await build_universe(client);syms=[u['symbol'] for u in uni if u['symbol']!='BTCUSDT'][:n_symbols];sem=asyncio.Semaphore(6)
+        async def fetch(sym):
+          async with sem:
+            try:return sym,await get_5m_candles_days(client,sym,days),None
+            except Exception as e:return sym,None,str(e)
+        aa,cc,ee,store={},{},{},{};errs=[];done=0
+        for st in range(0,len(syms),6):
+          for sym,candles,err in await asyncio.gather(*[fetch(x) for x in syms[st:st+6]]):
+            done+=1;V67_STUDY['progress']={'stage':'fetch','done':done,'total':len(syms)}
+            if err or not candles or len(candles)<400:errs.append({'symbol':sym,'error':err or 'insufficient'});continue
+            si=len(store);await asyncio.to_thread(v61_extract_symbol,sym,si,candles,aa,cc,ee,store)
+            store[si]['c']=array('d',[x['close'] for x in candles]);store[si]['v']=array('d',[x.get('volume',0.0) for x in candles])
+      V67_STUDY['progress']={'stage':'diagnostic'};raw,n,groups,dif,temp=await asyncio.to_thread(v67_compute,store,cost,entry_slip)
+      V67_STUDY.update(status='DONE',progress={'stage':'done'},finished_utc=utc_now(),result={'entry':'FROZEN_V66_CONFIRM_10M','exit_label':'TIME120_CONTROL','raw_breakouts':raw,'analyzed_trades':n,'winner_loser':groups,'feature_differences':dif,'temporal_summary':temp,'data':{'symbols_used':len(store),'symbols_failed':errs[:20]},'guardrails':['Diagnostic only.','No exit rule or threshold is selected in V67.','Any apparent early separator must be frozen and validated separately before forward use.','Active V61/V55/FAST_3S unchanged.']})
+    except Exception as e:V67_STUDY.update(status='ERROR',error=f'{type(e).__name__}: {e}',finished_utc=utc_now())
+
+@app.get('/v67-start')
+async def v67_start(symbols:int=Query(40,ge=20,le=50),days:int=Query(40,ge=20,le=40),entry_slip_pct:float=Query(.10,ge=0,le=1),cost_pct:float=Query(.15,ge=0,le=1)):
+    global V67_TASK
+    if V67_TASK is not None and not V67_TASK.done():return {'status':'ALREADY_RUNNING','progress':V67_STUDY.get('progress')}
+    V67_TASK=asyncio.create_task(v67_run(symbols,days,entry_slip_pct,cost_pct));return {'status':'STARTED','paper_only':True,'entry':'FROZEN_V66_CONFIRM_10M','horizons_minutes':V67_HORIZONS}
+@app.get('/v67-status')
+async def v67_status():return {**MODE_INFO,'status':'OK','panel':'V67_POST_ENTRY_DIAGNOSTIC','trading':False,'orders':False,'active_strategy_changed':False,'active_risk_changed':False,'study':V67_STUDY,'generated_utc':utc_now()}
