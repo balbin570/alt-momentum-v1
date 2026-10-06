@@ -10998,8 +10998,29 @@ async def v49_timing_diagnostic():
                 continue
             all_rows.extend(relative_candidates_forward_live(candles, symbol))
 
-        ranked = rank_cross_section_v12(all_rows)
-        alt_snaps = compute_alt_market_snapshots_v18(good)
+        by_time = {}
+        for e in all_rows:
+            by_time.setdefault(e["signal_time_ms"], []).append(e)
+        ranked = []
+        for group in by_time.values():
+            if len(group) < 5:
+                continue
+            ordered = sorted(group, key=lambda x: x["relative_momentum_z"])
+            n = len(ordered)
+            for idx, e in enumerate(ordered):
+                row = dict(e)
+                row["cross_section_percentile"] = idx / (n - 1) if n > 1 else 1.0
+                row["cohort_size"] = n
+                ranked.append(row)
+        alt_snaps = {}
+        for sym, candles in good.items():
+            if sym == "BTCUSDT":
+                continue
+            for i in range(6, len(candles)):
+                t = candles[i]["close_time"]
+                alt_snaps.setdefault(t, []).append(
+                    pct_change(candles[i - 6]["close"], candles[i]["close"])
+                )
 
         eligible = []
         for e in ranked:
@@ -11009,13 +11030,14 @@ async def v49_timing_diagnostic():
                 continue
             if e.get("behavior") != "CONTINUED_UP":
                 continue
-            alt = alt_snaps.get(e.get("signal_time_ms"))
-            if not alt:
+            vals = alt_snaps.get(e.get("signal_time_ms"), [])
+            if not vals:
                 continue
-            if float(alt.get("mean_30m_pct", 999)) >= V32_ALT_MEAN_30M_MAX:
+            alt_mean = mean(vals)
+            if alt_mean >= 0.5:
                 continue
             row = dict(e)
-            row["alt_market_mean_30m_pct"] = float(alt.get("mean_30m_pct"))
+            row["alt_market_mean_30m_pct"] = alt_mean
             eligible.append(row)
 
         # Same V32 Top1 rule per original signal timestamp.
