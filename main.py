@@ -14421,15 +14421,16 @@ async def v73_fetch_window(client, symbol, start_ms, end_ms):
     return sorted(out.values(),key=lambda x:x["open_time"])
 
 # ============================================================
-# V73.3 — RESUMABLE OOS MID-ZONE VALIDATION
-# Strategy/research rules unchanged from V73.2.
-# Operational change only: durable PostgreSQL checkpoint/result storage.
+# V73.4 — TRUE RESUME OOS MID-ZONE VALIDATION
+# Operational durability only. Frozen research rules are unchanged.
+# Per-symbol candles are persisted to PostgreSQL so a Render restart resumes
+# from the first unfinished symbol instead of restarting the study.
 # ============================================================
 V73_STUDY={"status":"IDLE","progress":{},"params":None,"result":None,"error":None,"started_utc":None,"finished_utc":None}
 V73_TASK=None
 V73_ALT_LO=0.26294; V73_ALT_HI=1.12931
 V73_BTC_LO=0.02413; V73_BTC_HI=0.39814
-V73_RUN_KEY="V73_3_FROZEN_OOS_40_100_60"
+V73_RUN_KEY="V73_4_FROZEN_OOS_TRUE_RESUME"
 
 def v73_db_init():
     if not V21_DB_URL:return False
@@ -14437,6 +14438,10 @@ def v73_db_init():
       with conn.cursor() as cur:
         cur.execute("""CREATE TABLE IF NOT EXISTS alt_v73_research_state(
           run_key TEXT PRIMARY KEY, payload JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS alt_v73_symbol_cache(
+          run_key TEXT NOT NULL, symbol TEXT NOT NULL, payload JSONB NOT NULL,
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          PRIMARY KEY(run_key,symbol))""")
       conn.commit()
     return True
 
@@ -14459,6 +14464,40 @@ def v73_db_load():
         cur.execute("SELECT payload FROM alt_v73_research_state WHERE run_key=%s",(V73_RUN_KEY,))
         r=cur.fetchone()
     return r[0] if r else None
+
+def v73_cache_put(symbol,candles):
+    if not V21_DB_URL:return False
+    with v21_db_connect() as conn:
+      with conn.cursor() as cur:
+        cur.execute("""INSERT INTO alt_v73_symbol_cache(run_key,symbol,payload,updated_at)
+          VALUES(%s,%s,%s::jsonb,NOW()) ON CONFLICT(run_key,symbol) DO UPDATE
+          SET payload=EXCLUDED.payload,updated_at=NOW()""",
+          (V73_RUN_KEY,symbol,json.dumps(candles,default=str)))
+      conn.commit()
+    return True
+
+def v73_cache_get(symbol):
+    if not V21_DB_URL:return None
+    with v21_db_connect() as conn:
+      with conn.cursor() as cur:
+        cur.execute("SELECT payload FROM alt_v73_symbol_cache WHERE run_key=%s AND symbol=%s",(V73_RUN_KEY,symbol))
+        r=cur.fetchone()
+    return r[0] if r else None
+
+def v73_cache_symbols():
+    if not V21_DB_URL:return set()
+    with v21_db_connect() as conn:
+      with conn.cursor() as cur:
+        cur.execute("SELECT symbol FROM alt_v73_symbol_cache WHERE run_key=%s",(V73_RUN_KEY,))
+        return {r[0] for r in cur.fetchall()}
+
+def v73_cache_clear():
+    if not V21_DB_URL:return
+    with v21_db_connect() as conn:
+      with conn.cursor() as cur:
+        cur.execute("DELETE FROM alt_v73_symbol_cache WHERE run_key=%s",(V73_RUN_KEY,))
+        cur.execute("DELETE FROM alt_v73_research_state WHERE run_key=%s",(V73_RUN_KEY,))
+      conn.commit()
 
 def v73_stats_blocks(rows,nblocks=4):
     st=v69_stats(rows);days=sorted(set(r["day"] for r in rows));blocks=[]
@@ -14491,45 +14530,77 @@ def v73_compute(store,btc,cost,entry_slip,cutoff_ms):
     altmid=[r for r in rows if V73_ALT_LO<=r["breadth4"]<=V73_ALT_HI]
     return len(cand),rows,altmid,mid
 
-async def v73_run(n_symbols,history_days,oos_days,entry_slip,cost):
+
+async def v73_run(n_symbols,history_days,oos_days,entry_slip,cost,resume=True):
     global V73_STUDY
-    started=utc_now()
+    try:v73_db_init()
+    except Exception:pass
+    old=None
+    try:old=v73_db_load()
+    except Exception:pass
+    started=(old or {}).get("started_utc") or utc_now()
     V73_STUDY={"status":"RUNNING","progress":{"stage":"universe","done":0,"total":n_symbols},
       "params":{"symbols":n_symbols,"history_days":history_days,"oos_days":oos_days,"entry_slip_pct":entry_slip,"cost_pct":cost},
       "result":None,"error":None,"started_utc":started,"finished_utc":None}
     try:v73_db_save()
     except Exception:pass
     try:
-      cutoff=datetime.now(timezone.utc)-timedelta(days=40);cutoff_ms=int(cutoff.timestamp()*1000)
+      # Fixed historical boundary for this frozen validation. Persist it so restart
+      # cannot slide the OOS window forward.
+      meta=(old or {}).get("resume_meta") or {}
+      cutoff_iso=meta.get("cutoff_utc")
+      cutoff=datetime.fromisoformat(cutoff_iso) if cutoff_iso else datetime.now(timezone.utc)-timedelta(days=40)
+      cutoff_ms=int(cutoff.timestamp()*1000)
       window_start_ms=cutoff_ms-int((oos_days+3)*24*60*60*1000)
+      V73_STUDY["resume_meta"]={"cutoff_utc":cutoff.isoformat()}
+      v73_db_save()
+
       async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
         uni=await build_universe(client);syms=[u["symbol"] for u in uni if u["symbol"]!="BTCUSDT"][:n_symbols]
-        # Each batch is deliberately small. After each batch, progress is persisted.
-        aa,cc,ee,store={},{},{},{};errs=[];done=0
-        for st in range(0,len(syms),4):
-          batch=syms[st:st+4]
-          async def one(sym):
-            try:return sym,await v73_fetch_window(client,sym,window_start_ms,cutoff_ms),None
-            except Exception as e:return sym,None,str(e)
-          vals=await asyncio.gather(*[one(x) for x in batch])
-          for sym,candles,err in vals:
-            done+=1
-            if err or not candles or len(candles)<500:errs.append({"symbol":sym,"error":err or "insufficient"});continue
-            si=len(store);await asyncio.to_thread(v61_extract_symbol,sym,si,candles,aa,cc,ee,store)
-            store[si]["c"]=array("d",[x["close"] for x in candles]);store[si]["v"]=array("d",[x.get("volume",0.0) for x in candles])
-          V73_STUDY["progress"]={"stage":"fetch_alts","done":done,"total":len(syms)}
-          try:v73_db_save()
-          except Exception:pass
-        V73_STUDY["progress"]={"stage":"fetch_btc","done":done,"total":len(syms)}
-        try:v73_db_save()
-        except Exception:pass
-        btc=await v73_fetch_window(client,"BTCUSDT",window_start_ms,cutoff_ms)
-      V73_STUDY["progress"]={"stage":"oos_validation","done":done,"total":len(syms)}
-      try:v73_db_save()
-      except Exception:pass
+        cached=v73_cache_symbols() if resume else set()
+        # Load/fetch each symbol independently. A completed symbol is durable.
+        for idx,sym in enumerate(syms,1):
+          if sym in cached:
+            V73_STUDY["progress"]={"stage":"fetch_alts","done":idx,"total":len(syms),"resumed":True,"symbol":sym}
+            continue
+          candles=None;last_err=None
+          for attempt in range(2):
+            try:
+              candles=await asyncio.wait_for(v73_fetch_window(client,sym,window_start_ms,cutoff_ms),timeout=75)
+              if candles and len(candles)>=500:break
+              last_err="insufficient"
+            except Exception as e:last_err=f"{type(e).__name__}: {e}"
+          # Persist failures too, so one bad symbol cannot block the run forever.
+          payload=candles if candles and len(candles)>=500 else {"_failed":True,"error":last_err or "insufficient"}
+          v73_cache_put(sym,payload)
+          V73_STUDY["progress"]={"stage":"fetch_alts","done":idx,"total":len(syms),"resumed":bool(cached),"symbol":sym}
+          v73_db_save()
+
+        # BTC is also durable under a reserved cache key.
+        btc=v73_cache_get("__BTCUSDT__")
+        if not isinstance(btc,list):
+          V73_STUDY["progress"]={"stage":"fetch_btc","done":len(syms),"total":len(syms)};v73_db_save()
+          btc=await asyncio.wait_for(v73_fetch_window(client,"BTCUSDT",window_start_ms,cutoff_ms),timeout=90)
+          if not btc or len(btc)<500:raise RuntimeError("BTC older OOS data insufficient")
+          v73_cache_put("__BTCUSDT__",btc)
+
+      # Rebuild the in-memory arrays from durable symbol cache, then compute.
+      V73_STUDY["progress"]={"stage":"rebuild_cache","done":0,"total":len(syms)};v73_db_save()
+      aa,cc,ee,store={},{},{},{};errs=[]
+      for idx,sym in enumerate(syms,1):
+        candles=v73_cache_get(sym)
+        if not isinstance(candles,list) or len(candles)<500:
+          err=candles.get("error") if isinstance(candles,dict) else "missing cache"
+          errs.append({"symbol":sym,"error":err});continue
+        si=len(store);await asyncio.to_thread(v61_extract_symbol,sym,si,candles,aa,cc,ee,store)
+        store[si]["c"]=array("d",[x["close"] for x in candles]);store[si]["v"]=array("d",[x.get("volume",0.0) for x in candles])
+        if idx%5==0:
+          V73_STUDY["progress"]={"stage":"rebuild_cache","done":idx,"total":len(syms)};v73_db_save()
+
+      V73_STUDY["progress"]={"stage":"oos_validation","done":len(syms),"total":len(syms)};v73_db_save()
       raw,base,altmid,mid=await asyncio.to_thread(v73_compute,store,btc,cost,entry_slip,cutoff_ms)
       def retention(x):return round(100*len(x)/len(base),2) if base else None
-      V73_STUDY.update(status="DONE",progress={"stage":"done","done":done,"total":len(syms)},finished_utc=utc_now(),result={
+      V73_STUDY.update(status="DONE",progress={"stage":"done","done":len(syms),"total":len(syms)},finished_utc=utc_now(),result={
         "validation_type":"OLDER_NON_OVERLAPPING_OOS","discovery_window_excluded":"most recent 40 days","oos_end_utc":cutoff.isoformat(),
         "frozen_entry":"V66_CONFIRM_10M","frozen_exit":"TIME120","base_cohort":"V70_BTC30_POS_AND_ALT_BREADTH30_POS",
         "frozen_v72_zone":{"alt_breadth4h":[V73_ALT_LO,V73_ALT_HI],"btc4h":[V73_BTC_LO,V73_BTC_HI]},
@@ -14537,7 +14608,7 @@ async def v73_run(n_symbols,history_days,oos_days,entry_slip,cost):
         "ALT4H_MID_ONLY":{**v73_stats_blocks(altmid),"retention_pct":retention(altmid)},
         "ALT4H_MID_AND_BTC4H_MID":{**v73_stats_blocks(mid),"retention_pct":retention(mid)},
         "data":{"symbols_used":len(store),"symbols_failed":errs[:20]},
-        "guardrails":["Frozen V72 cutpoints applied unchanged to older OOS.","No threshold search in OOS.","Chronological 4-block stability included.","Current top-volume universe implies survivorship bias.","Research only; no orders.","Active V61/V55/FAST_3S unchanged."]})
+        "guardrails":["Frozen V72 cutpoints applied unchanged to older OOS.","No threshold search in OOS.","Chronological 4-block stability included.","Current top-volume universe implies survivorship bias.","Research only; no orders.","Active V61/V55/FAST_3S unchanged.","V73.4 persistence changes execution of research only, not strategy rules."]})
       v73_db_save()
     except Exception as e:
       V73_STUDY.update(status="ERROR",error=f"{type(e).__name__}: {e}",finished_utc=utc_now())
@@ -14547,24 +14618,23 @@ async def v73_run(n_symbols,history_days,oos_days,entry_slip,cost):
 @app.get("/v73-start")
 async def v73_start(symbols:int=Query(40,ge=20,le=50),history_days:int=Query(100,ge=80,le=140),oos_days:int=Query(60,ge=40,le=90),entry_slip_pct:float=Query(.10,ge=0,le=1),cost_pct:float=Query(.15,ge=0,le=1)):
     global V73_TASK,V73_STUDY
-    # Restore durable result/status after a Render restart.
     try:
       old=v73_db_load()
       if old and old.get("status")=="DONE":
-        V73_STUDY=old;return {"status":"DONE_ALREADY","paper_only":True,"study":"OLDER_OOS_MIDZONE_VALIDATION","progress":old.get("progress")}
+        V73_STUDY=old;return {"status":"DONE_ALREADY","paper_only":True,"progress":old.get("progress")}
     except Exception:pass
     if V73_TASK is not None and not V73_TASK.done():return {"status":"ALREADY_RUNNING","progress":V73_STUDY.get("progress")}
-    V73_TASK=asyncio.create_task(v73_run(symbols,history_days,oos_days,entry_slip_pct,cost_pct))
-    return {"status":"STARTED","paper_only":True,"study":"OLDER_OOS_MIDZONE_VALIDATION","frozen_zone":{"alt4h":[V73_ALT_LO,V73_ALT_HI],"btc4h":[V73_BTC_LO,V73_BTC_HI]}}
+    V73_TASK=asyncio.create_task(v73_run(symbols,history_days,oos_days,entry_slip_pct,cost_pct,True))
+    return {"status":"STARTED_OR_RESUMED","paper_only":True,"study":"OLDER_OOS_MIDZONE_VALIDATION",
+      "frozen_zone":{"alt4h":[V73_ALT_LO,V73_ALT_HI],"btc4h":[V73_BTC_LO,V73_BTC_HI]}}
 
 @app.get("/v73-status")
 async def v73_status():
     global V73_STUDY
-    # If process restarted, show the last durable checkpoint instead of false IDLE.
     if V73_STUDY.get("status")=="IDLE":
       try:
         old=v73_db_load()
         if old:V73_STUDY=old
       except Exception:pass
-    return {**MODE_INFO,"status":"OK","panel":"V73.3_RESUMABLE_OOS_MIDZONE_VALIDATION","trading":False,"orders":False,
+    return {**MODE_INFO,"status":"OK","panel":"V73.4_TRUE_RESUME_OOS_MIDZONE_VALIDATION","trading":False,"orders":False,
       "active_strategy_changed":False,"active_risk_changed":False,"study":V73_STUDY,"generated_utc":utc_now()}
