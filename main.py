@@ -13633,7 +13633,15 @@ async def v65_run(n_symbols,days,entry_slip,cost):
     V65_STUDY.update(status='RUNNING',progress={'stage':'time_sync'},params={'symbols':n_symbols,'days':days,'entry_slip_pct':entry_slip,'cost_pct':cost},result=None,error=None,started_utc=utc_now(),finished_utc=None)
     try:
       async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
-        off=await get_binance_time_offset(client);uni=await build_universe(client);syms=[u['symbol'] for u in uni if u['symbol']!='BTCUSDT'][:n_symbols]
+        try:
+            off=await get_binance_time_offset(client)
+            time_sync_status='OK'
+            time_sync_error=None
+        except Exception as exc:
+            off=0
+            time_sync_status='UNAVAILABLE_NON_BLOCKING'
+            time_sync_error=f'{type(exc).__name__}: {exc}'
+        uni=await build_universe(client);syms=[u['symbol'] for u in uni if u['symbol']!='BTCUSDT'][:n_symbols]
         sem=asyncio.Semaphore(6)
         async def fetch(sym):
           async with sem:
@@ -13653,7 +13661,7 @@ async def v65_run(n_symbols,days,entry_slip,cost):
         return len(pb),len(bo),v65_compare(pb,store,entry_slip,cost),v65_compare(bo,store,entry_slip,cost)
       npb,nbo,spb,sbo=await asyncio.to_thread(calc)
       V65_STUDY.update(status='DONE',progress={'stage':'done'},finished_utc=utc_now(),result={
-        'binance_time_sync':{'offset_ms':off,'synced_utc':V65_TIME_SYNC_UTC},
+        'binance_time_sync':{'status':time_sync_status,'offset_ms':off,'synced_utc':V65_TIME_SYNC_UTC,'error':time_sync_error},
         'forward_execution_design':'completed signal candle -> immediate live bookTicker ASK; no extra 5m wait in forward paper execution',
         'comparison':{
           'V62_PULLBACK_REACCEL_TIME120':{'raw_signals':npb,'stats':spb},
@@ -13676,4 +13684,4 @@ async def v65_combined_status():
 @app.get('/v65-time-sync')
 async def v65_time_sync():
     try:off=await get_binance_time_offset();return {'status':'OK','offset_ms':off,'synced_utc':V65_TIME_SYNC_UTC}
-    except Exception as e:return {'status':'ERROR','error':str(e)}
+    except Exception as e:return {'status':'UNAVAILABLE_NON_BLOCKING','offset_ms':0,'error':str(e),'note':'Render cannot access Binance /time; research/backtest may continue without server-time offset.'}
