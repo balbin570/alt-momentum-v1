@@ -11864,3 +11864,109 @@ async def v59_analysis():
         "last_scan_runtime": V32_LAST_SCAN,
         "generated_utc": utc_now(),
     }
+
+
+# ============================================================
+# V60 - READ-ONLY ENTRY QUALITY / OVEREXTENSION RESEARCH
+# No trading-rule changes. Uses only CLOSED V55 forward trades.
+# Predeclared descriptive bands; not optimized thresholds.
+# ============================================================
+
+def v60_band(x, cuts, labels):
+    if x is None:
+        return "MISSING"
+    x = float(x)
+    for cut, label in zip(cuts, labels):
+        if x < cut:
+            return label
+    return labels[-1]
+
+def v60_group(rows, field, cuts, labels):
+    groups = {label: [] for label in labels}
+    groups["MISSING"] = []
+    for r in rows:
+        groups[v60_band(r.get(field), cuts, labels)].append(r)
+    out = {}
+    for label, q in groups.items():
+        if not q:
+            continue
+        out[label] = {
+            **v58_safe_stats([r.get("net_pct") for r in q]),
+            "mean_z": round(sum(float(r["relative_momentum_z"]) for r in q if r.get("relative_momentum_z") is not None) /
+                            max(1, sum(r.get("relative_momentum_z") is not None for r in q)), 4),
+            "mean_continuation_60m_pct": round(sum(float(r["continuation_60m_pct"]) for r in q if r.get("continuation_60m_pct") is not None) /
+                                               max(1, sum(r.get("continuation_60m_pct") is not None for r in q)), 4),
+        }
+    return out
+
+@app.get("/v60-entry-quality")
+async def v60_entry_quality():
+    rows = [
+        p for p in V32_STATE.get("closed", [])
+        if p.get("execution_version") == V55_EXECUTION_VERSION
+        and p.get("net_pct") is not None
+    ]
+
+    z_groups = v60_group(
+        rows, "relative_momentum_z",
+        [2.0, 3.0, 5.0],
+        ["Z_1_TO_LT2", "Z_2_TO_LT3", "Z_3_TO_LT5", "Z_5_PLUS"]
+    )
+    cont_groups = v60_group(
+        rows, "continuation_60m_pct",
+        [1.5, 3.0, 5.0],
+        ["CONT_LT1_5", "CONT_1_5_TO_LT3", "CONT_3_TO_LT5", "CONT_5_PLUS"]
+    )
+
+    cells = {}
+    for r in rows:
+        zb = v60_band(r.get("relative_momentum_z"), [2.0,3.0,5.0],
+                      ["Z_1_TO_LT2","Z_2_TO_LT3","Z_3_TO_LT5","Z_5_PLUS"])
+        cb = v60_band(r.get("continuation_60m_pct"), [1.5,3.0,5.0],
+                      ["CONT_LT1_5","CONT_1_5_TO_LT3","CONT_3_TO_LT5","CONT_5_PLUS"])
+        cells.setdefault(f"{zb}__{cb}", []).append(r)
+
+    matrix = {
+        k: v58_safe_stats([r.get("net_pct") for r in q])
+        for k, q in cells.items()
+    }
+
+    winners = [r for r in rows if float(r.get("net_pct",0)) > 0]
+    losers = [r for r in rows if float(r.get("net_pct",0)) <= 0]
+
+    def means(q):
+        def avg(field):
+            vals=[float(r[field]) for r in q if r.get(field) is not None]
+            return round(sum(vals)/len(vals),4) if vals else None
+        return {
+            "n":len(q),
+            "mean_z":avg("relative_momentum_z"),
+            "mean_continuation_60m_pct":avg("continuation_60m_pct"),
+            "mean_percentile":avg("cross_section_percentile"),
+            "mean_alt_market_30m_pct":avg("alt_market_mean_30m_pct"),
+            "mean_entry_delay_seconds":avg("entry_delay_seconds"),
+            "mean_slippage_pct":avg("entry_slippage_vs_candle_pct"),
+        }
+
+    return {
+        **MODE_INFO,
+        "status":"OK",
+        "panel":"V60_READ_ONLY_ENTRY_QUALITY_RESEARCH",
+        "research_only":True,
+        "trading":False,
+        "orders":False,
+        "strategy_changed":False,
+        "risk_rules_changed":False,
+        "sample_size":len(rows),
+        "overall":v58_safe_stats([r.get("net_pct") for r in rows]),
+        "winner_vs_loser_features":{
+            "winners":means(winners),
+            "losers":means(losers)
+        },
+        "z_bands":z_groups,
+        "continuation_bands":cont_groups,
+        "z_x_continuation_cells":matrix,
+        "guardrail":"Descriptive only. Bands were declared before viewing V60 output. Do not promote a filter from a tiny cell. Require larger forward sample and repeated directional pattern.",
+        "next_review_at_closed":[30,50,100],
+        "generated_utc":utc_now()
+    }
