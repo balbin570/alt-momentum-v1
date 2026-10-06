@@ -6164,39 +6164,117 @@ def v20_public_state():
     }
 
 
-async def v20_scan_once():
-    """
-    Scan current completed candles for the exact frozen Candidate B.
-    A signal is entered only once, at the current/next available 5m OPEN
-    after the completed 60m continuation observation.
-    """
-    async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
-        universe = await build_universe(client)
-        # V23: scan the entire eligible dynamic Binance USDT spot universe.
-        # build_universe() keeps the existing liquidity/safety exclusions;
-        # there is no longer a top-10 cap.
 
-        semaphore = asyncio.Semaphore(30)
+# =========================
+# V44 FAST SHARED SNAPSHOT
+# =========================
+# The frozen V27/V32 strategy rules are unchanged.
+# For live forward decisions we only need enough 5m history to compute:
+# - 288-bar rolling Z history
+# - the 30m return used by Z
+# - the already-observed 60m continuation
+# 400 completed 5m candles (~33h) safely cover that requirement.
+# V27 and V32 share one snapshot so the same ~300 symbols are not downloaded twice.
+
+V44_SNAPSHOT_CANDLES = 400
+V44_SNAPSHOT_TTL_SECONDS = 45
+V44_FETCH_CONCURRENCY = 60
+_V44_SNAPSHOT_LOCK = None
+_V44_SNAPSHOT = {
+    "ts": 0.0,
+    "good": None,
+    "errors": [],
+    "universe_count": 0,
+    "fetch_seconds": None,
+    "snapshot_utc": None,
+}
+V44_METRICS = {
+    "v27_last_scan_seconds": None,
+    "v27_last_scan_utc": None,
+    "v32_last_scan_seconds": None,
+    "v32_last_scan_utc": None,
+}
+
+
+async def v44_market_snapshot(client):
+    import time as _t
+    global _V44_SNAPSHOT_LOCK
+
+    if _V44_SNAPSHOT_LOCK is None:
+        _V44_SNAPSHOT_LOCK = asyncio.Lock()
+
+    async with _V44_SNAPSHOT_LOCK:
+        now = _t.time()
+        if (
+            _V44_SNAPSHOT["good"] is not None
+            and now - _V44_SNAPSHOT["ts"] < V44_SNAPSHOT_TTL_SECONDS
+        ):
+            return (
+                _V44_SNAPSHOT["good"],
+                list(_V44_SNAPSHOT["errors"]),
+                _V44_SNAPSHOT["universe_count"],
+                True,
+            )
+
+        started = _t.perf_counter()
+        universe = await build_universe(client)
+        semaphore = asyncio.Semaphore(V44_FETCH_CONCURRENCY)
 
         async def fetch(item):
             async with semaphore:
                 try:
-                    # Need enough history for 24h z-score + post-signal observation.
-                    candles = await get_5m_candles_days(client, item["symbol"], 3)
+                    candles = await get_completed_5m_candles(
+                        client,
+                        item["symbol"],
+                        limit=V44_SNAPSHOT_CANDLES,
+                    )
                     return item["symbol"], candles, None
                 except Exception as e:
                     return item["symbol"], None, str(e)
 
         fetched = await asyncio.gather(*[fetch(x) for x in universe])
         good = {sym: c for sym, c, err in fetched if c}
-        errors = [{"symbol": sym, "error": err} for sym, c, err in fetched if err]
+        errors = [
+            {"symbol": sym, "error": err}
+            for sym, c, err in fetched
+            if err
+        ]
+
+        # BTC is required by V27 even if universe filtering ever excludes it.
+        if "BTCUSDT" not in good:
+            try:
+                good["BTCUSDT"] = await get_completed_5m_candles(
+                    client, "BTCUSDT", limit=V44_SNAPSHOT_CANDLES
+                )
+            except Exception as e:
+                errors.append({"symbol": "BTCUSDT", "error": str(e)})
+
+        elapsed = _t.perf_counter() - started
+        _V44_SNAPSHOT.update({
+            "ts": _t.time(),
+            "good": good,
+            "errors": errors,
+            "universe_count": len(universe),
+            "fetch_seconds": round(elapsed, 3),
+            "snapshot_utc": utc_now(),
+        })
+        return good, list(errors), len(universe), False
+
+
+async def v20_scan_once():
+    """
+    Scan current completed candles for the exact frozen Candidate B.
+    A signal is entered only once, at the current/next available 5m OPEN
+    after the completed 60m continuation observation.
+    """
+    import time as _t
+    scan_started = _t.perf_counter()
+    async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
+        good, errors, universe_count, snapshot_cache_hit = await v44_market_snapshot(client)
 
         btc = good.get("BTCUSDT")
         if btc is None:
-            try:
-                btc = await get_5m_candles_days(client, "BTCUSDT", 3)
-            except Exception as e:
-                return {"status": "ERROR", "error": f"BTC fetch failed: {e}"}
+            return {"status": "ERROR", "error": "BTC missing from V44 shared snapshot"}
 
         # Generate candidate observations for all selected alts.
         raw = []
@@ -6343,6 +6421,9 @@ async def v20_scan_once():
             V20_STATE["closed"].append(closed)
             del V20_STATE["open"][sym]
             newly_closed.append(closed)
+
+        V44_METRICS["v27_last_scan_seconds"] = round(_t.perf_counter() - scan_started, 3)
+        V44_METRICS["v27_last_scan_utc"] = utc_now()
 
         return {
             "status": "OK",
@@ -8274,21 +8355,10 @@ def v32_public_state():
     }
 
 async def v32_scan_once():
-    async with httpx.AsyncClient(timeout=httpx.Timeout(180.0)) as client:
-        universe = await build_universe(client)
-        semaphore = asyncio.Semaphore(30)
-
-        async def fetch(item):
-            async with semaphore:
-                try:
-                    candles = await get_5m_candles_days(client, item["symbol"], 3)
-                    return item["symbol"], candles, None
-                except Exception as e:
-                    return item["symbol"], None, str(e)
-
-        fetched = await asyncio.gather(*[fetch(x) for x in universe])
-        good = {sym: c for sym, c, err in fetched if c}
-        errors = [{"symbol": sym, "error": err} for sym, c, err in fetched if err]
+    import time as _t
+    scan_started = _t.perf_counter()
+    async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
+        good, errors, universe_count, snapshot_cache_hit = await v44_market_snapshot(client)
 
         raw = []
         for sym, candles in good.items():
@@ -8449,6 +8519,9 @@ async def v32_scan_once():
             V32_STATE["closed"].append(closed)
             del V32_STATE["open"][sym]
             newly_closed.append(closed)
+
+        V44_METRICS["v32_last_scan_seconds"] = round(_t.perf_counter() - scan_started, 3)
+        V44_METRICS["v32_last_scan_utc"] = utc_now()
 
         return {
             "status": "OK",
@@ -10518,6 +10591,50 @@ async def v43_status():
             "Only rows tagged V43_LOW_LATENCY belong to the clean V43 execution "
             "cohort. Pre-V43 open/closed rows remain in PostgreSQL but are not "
             "counted in these latency statistics."
+        ),
+        "generated_utc": utc_now(),
+    }
+
+
+# =========================
+# V44 STATUS
+# =========================
+@app.get("/v44-status")
+async def v44_status():
+    import time as _t
+    age = None
+    if _V44_SNAPSHOT["good"] is not None:
+        age = round(max(0.0, _t.time() - _V44_SNAPSHOT["ts"]), 2)
+
+    return {
+        **MODE_INFO,
+        "status": "OK",
+        "panel": "V44_FAST_SHARED_MARKET_SNAPSHOT",
+        "research_only": True,
+        "trading": False,
+        "orders": False,
+        "strategy_thresholds_changed": False,
+        "v43_late_entry_guard_still_active_seconds": V43_MAX_ENTRY_DELAY_SECONDS,
+        "snapshot": {
+            "candles_per_symbol": V44_SNAPSHOT_CANDLES,
+            "approx_history_hours": round(V44_SNAPSHOT_CANDLES * 5 / 60, 1),
+            "fetch_concurrency": V44_FETCH_CONCURRENCY,
+            "ttl_seconds": V44_SNAPSHOT_TTL_SECONDS,
+            "universe_count": _V44_SNAPSHOT["universe_count"],
+            "symbols_fetched_ok": (
+                len(_V44_SNAPSHOT["good"])
+                if _V44_SNAPSHOT["good"] is not None else 0
+            ),
+            "error_count": len(_V44_SNAPSHOT["errors"]),
+            "fetch_seconds": _V44_SNAPSHOT["fetch_seconds"],
+            "snapshot_utc": _V44_SNAPSHOT["snapshot_utc"],
+            "snapshot_age_seconds": age,
+        },
+        "scan_timing": dict(V44_METRICS),
+        "design": (
+            "V27 and V32 share one 400-candle snapshot. This replaces separate "
+            "3-day full-universe downloads; entry thresholds and ranking rules "
+            "are unchanged."
         ),
         "generated_utc": utc_now(),
     }
