@@ -6190,7 +6190,7 @@ def v20_public_state():
 # V27 and V32 share one snapshot so the same ~300 symbols are not downloaded twice.
 
 V44_SNAPSHOT_CANDLES = 400
-V44_SNAPSHOT_TTL_SECONDS = 45
+V44_SNAPSHOT_TTL_SECONDS = 10
 V44_FETCH_CONCURRENCY = 60
 _V44_SNAPSHOT_LOCK = None
 _V44_SNAPSHOT = {
@@ -8290,8 +8290,7 @@ V32_LAST_SCAN = {
 V32_AUTO_TASK = None
 V32_COST_PCT = 0.15
 V32_HOLD_MS = 120 * 60 * 1000
-V32_SCAN_INTERVAL_SECONDS = 60
-
+V32_SCAN_INTERVAL_SECONDS = 30
 def v32_db_init():
     if not V21_DB_URL:
         return
@@ -11220,5 +11219,23 @@ async def v51_status():
         },
         "history": history,
         "note": "Read-only RAM history. Keeps the last 20 completed V32 scans so an entry/rejection cannot disappear on the next scan.",
+        "generated_utc": utc_now(),
+    }
+
+
+@app.get("/v52-status")
+async def v52_status():
+    return {
+        **MODE_INFO,
+        "status": "OK",
+        "panel": "V52_LOW_LATENCY_CADENCE",
+        "research_only": True,
+        "trading": False,
+        "orders": False,
+        "strategy_thresholds_changed": False,
+        "late_entry_guard_seconds": V43_MAX_ENTRY_DELAY_SECONDS,
+        "v32_scan_interval_seconds": V32_SCAN_INTERVAL_SECONDS,
+        "shared_snapshot_ttl_seconds": V44_SNAPSHOT_TTL_SECONDS,
+        "note": "Execution cadence only: V32 30s cycle and 10s snapshot TTL. Signal thresholds and 120s guard unchanged.",
         "generated_utc": utc_now(),
     }
