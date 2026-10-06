@@ -8323,6 +8323,7 @@ V32_STATE = {
     "seen_signal_keys": set(),
     "started_utc": utc_now(),
 }
+V57_LEGACY_QUARANTINE = []
 V32_LAST_SCAN = {
     "status": "NOT_RUN",
     "started_utc": None,
@@ -8723,6 +8724,17 @@ async def v32_scan_once():
                     V32_STATE["closed"].append(closed)
                     del V32_STATE["open"][sym]
                     newly_closed.append(closed)
+                else:
+                    quarantined = {
+                        **pos,
+                        "status": "QUARANTINED_LEGACY_ORPHAN",
+                        "quarantined_utc": utc_now(),
+                        "quarantine_reason": "OVERDUE_LEGACY_NO_RECOVERABLE_EXIT_CANDLE",
+                        "excluded_from_closed_pnl": True,
+                        "quarantine_version": "V57_LEGACY_QUARANTINE",
+                    }
+                    V57_LEGACY_QUARANTINE.append(quarantined)
+                    del V32_STATE["open"][sym]
                 continue
 
             if not candles_all:
@@ -11605,5 +11617,40 @@ async def v56_status():
         "last_scan_runtime": V32_LAST_SCAN,
         "db_configured": bool(V21_DB_URL),
         "note": "V56 changes only universe hygiene and overdue legacy cleanup. V55 hard stop/trailing/time-stop rules remain unchanged.",
+        "generated_utc": utc_now(),
+    }
+
+
+@app.get("/v57-status")
+async def v57_status():
+    now_ms = alt_now_ms()
+    overdue_legacy = []
+    for p in V32_STATE.get("open", {}).values():
+        if p.get("execution_version") != V55_EXECUTION_VERSION and now_ms >= int(p.get("exit_due_time", 0)):
+            overdue_legacy.append({
+                "symbol": p.get("symbol"),
+                "key": p.get("key"),
+                "exit_due_time": p.get("exit_due_time"),
+            })
+
+    return {
+        **MODE_INFO,
+        "status": "OK",
+        "panel": "V57_LEGACY_QUARANTINE",
+        "research_only": True,
+        "trading": False,
+        "orders": False,
+        "entry_strategy_thresholds_changed": False,
+        "v55_risk_rules_changed": False,
+        "v56_universe_exclusions_retained": ["AMD", "AMDB", "MVLL", "MVLLB"],
+        "overdue_legacy_open_count": len(overdue_legacy),
+        "overdue_legacy_open_positions": overdue_legacy,
+        "runtime_quarantine_count": len(V57_LEGACY_QUARANTINE),
+        "runtime_quarantine": V57_LEGACY_QUARANTINE[-20:],
+        "v32_open_count": len(V32_STATE.get("open", {})),
+        "v32_closed_count": len(V32_STATE.get("closed", [])),
+        "last_scan_runtime": V32_LAST_SCAN,
+        "db_configured": bool(V21_DB_URL),
+        "note": "Unrecoverable overdue pre-V55 legacy positions are removed from active-open state without inventing P/L and recorded in an audit quarantine. V55 entry/risk rules are unchanged.",
         "generated_utc": utc_now(),
     }
