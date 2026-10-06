@@ -5988,6 +5988,7 @@ V43_MAX_ENTRY_DELAY_SECONDS = 120
 V47_EXECUTION_VERSION = "V47_SEEN_KEY_FIX"
 V47_STARTED_UTC = utc_now()
 V47_SEEN_KEYS = {"V27": set(), "V32": set()}
+V48_LAST_V32_RESULT = {"result": None, "captured_utc": None}
 V43_STARTED_UTC = utc_now()
 
 async def apply_live_entry(client, pos, candle_open_price, hold_ms):
@@ -8619,6 +8620,9 @@ async def v32_run_once():
     V32_LAST_SCAN["error"] = None
     try:
         result = await v32_scan_once()
+        # V48: retain the exact latest automatic/manual scan result for read-only visibility.
+        V48_LAST_V32_RESULT["result"] = result
+        V48_LAST_V32_RESULT["captured_utc"] = utc_now()
         # V43 reliability: persist state before external notification.
         if V21_DB_URL:
             v32_save_state()
@@ -8629,7 +8633,10 @@ async def v32_run_once():
     except Exception as e:
         V32_LAST_SCAN["status"] = "ERROR"
         V32_LAST_SCAN["error"] = str(e)
-        return {"status": "ERROR", "error": str(e)}
+        err = {"status": "ERROR", "error": str(e)}
+        V48_LAST_V32_RESULT["result"] = err
+        V48_LAST_V32_RESULT["captured_utc"] = utc_now()
+        return err
     finally:
         V32_LAST_SCAN["finished_utc"] = utc_now()
 
@@ -10923,5 +10930,39 @@ async def v47_status():
             "is consumed only after a terminal live-entry decision. Strategy "
             "thresholds and the <=120s guard are unchanged."
         ),
+        "generated_utc": utc_now(),
+    }
+
+
+@app.get("/v48-status")
+async def v48_status():
+    r = V48_LAST_V32_RESULT.get("result") or {}
+    funnel = r.get("entry_funnel_v46")
+    return {
+        **MODE_INFO,
+        "status": "OK",
+        "panel": "V48_AUTO_SCAN_VISIBILITY",
+        "research_only": True,
+        "trading": False,
+        "orders": False,
+        "strategy_thresholds_changed": False,
+        "late_entry_guard_seconds": V43_MAX_ENTRY_DELAY_SECONDS,
+        "spread_max_pct": SPREAD_MAX_PCT,
+        "v47_seen_counts": {
+            "v27": len(V47_SEEN_KEYS["V27"]),
+            "v32": len(V47_SEEN_KEYS["V32"]),
+        },
+        "last_v32_scan": {
+            "captured_utc": V48_LAST_V32_RESULT.get("captured_utc"),
+            "scan_status": r.get("status"),
+            "universe_size": r.get("universe_size"),
+            "eligible_rows_seen": r.get("eligible_rows_seen"),
+            "top1_rows_seen": r.get("top1_rows_seen"),
+            "entry_funnel": funnel,
+            "new_entries_count": len(r.get("new_entries") or []),
+            "new_entries": r.get("new_entries") or [],
+            "fetch_errors": r.get("fetch_errors") or [],
+        },
+        "note": "Read-only latest V32 scan visibility, including automatic scans. Strategy and paper execution rules unchanged.",
         "generated_utc": utc_now(),
     }
