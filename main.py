@@ -8438,15 +8438,54 @@ async def v32_scan_once():
         )
         freshness_ms = 10 * 60 * 1000
 
+        entry_funnel = {
+            "top1_total": len(top1_rows),
+            "fresh_last_10m": 0,
+            "rejected_not_fresh": 0,
+            "rejected_seen_key": 0,
+            "rejected_symbol_already_open": 0,
+            "rejected_cooldown": 0,
+            "rejected_missing_entry_candle": 0,
+            "quote_or_entry_attempted": 0,
+            "rejected_delay_gt_120s": 0,
+            "rejected_spread": 0,
+            "rejected_other_entry_reason": 0,
+            "accepted_entries": 0,
+            "rejection_samples": [],
+        }
+
+        def _v46_reject(kind, e, reason=None, pos=None):
+            entry_funnel[kind] += 1
+            if len(entry_funnel["rejection_samples"]) < 25:
+                row = {
+                    "symbol": e.get("symbol"),
+                    "entry_open_time": e.get("entry_open_time"),
+                    "z": round(float(e.get("relative_momentum_z", 0.0)), 4),
+                    "percentile": round(float(e.get("cross_section_percentile", 0.0)), 4),
+                    "continuation_60m_pct": round(float(e.get("wait_end_change_pct", 0.0)), 4),
+                    "stage": kind,
+                }
+                if reason:
+                    row["reason"] = reason
+                if pos and pos.get("entry_delay_seconds") is not None:
+                    row["entry_delay_seconds"] = pos.get("entry_delay_seconds")
+                if pos and pos.get("spread_pct") is not None:
+                    row["spread_pct"] = pos.get("spread_pct")
+                entry_funnel["rejection_samples"].append(row)
+
         new_entries = []
         for e in top1_rows:
             if newest_open_ms - e["entry_open_time"] > freshness_ms:
+                _v46_reject("rejected_not_fresh", e, "older than 10m freshness window")
                 continue
+            entry_funnel["fresh_last_10m"] += 1
 
             key = f'{e["symbol"]}:{e["entry_open_time"]}'
             if key in V32_STATE["seen_signal_keys"]:
+                _v46_reject("rejected_seen_key", e, "key already processed")
                 continue
             if e["symbol"] in V32_STATE["open"]:
+                _v46_reject("rejected_symbol_already_open", e, "symbol already open")
                 continue
 
             # Same-symbol 60m cooldown from the last V32 entry.
@@ -8457,6 +8496,7 @@ async def v32_scan_once():
             if e["symbol"] in V32_STATE["open"]:
                 prior_times.append(int(V32_STATE["open"][e["symbol"]].get("entry_open_time", 0)))
             if prior_times and e["entry_open_time"] - max(prior_times) < 60 * 60 * 1000:
+                _v46_reject("rejected_cooldown", e, "same-symbol cooldown <60m")
                 continue
 
             candles = good.get(e["symbol"], [])
@@ -8465,6 +8505,7 @@ async def v32_scan_once():
                 None
             )
             if price is None:
+                _v46_reject("rejected_missing_entry_candle", e, "entry candle open not found")
                 continue
 
             pos = {
@@ -8482,8 +8523,16 @@ async def v32_scan_once():
                 "alt_market_mean_30m_pct": round(e["alt_market_mean_30m_pct"], 4),
                 "status": "OPEN_PAPER",
             }
+            entry_funnel["quote_or_entry_attempted"] += 1
             ok_entry, skip_reason = await apply_live_entry(client, pos, price, V32_HOLD_MS)
             if not ok_entry:
+                reason_text = str(skip_reason or "")
+                if "entry delay" in reason_text:
+                    _v46_reject("rejected_delay_gt_120s", e, reason_text, pos)
+                elif "spread" in reason_text:
+                    _v46_reject("rejected_spread", e, reason_text, pos)
+                else:
+                    _v46_reject("rejected_other_entry_reason", e, reason_text, pos)
                 alt_log_skip(V32_STATE, pos, skip_reason)
                 V32_STATE["seen_signal_keys"].add(key)
                 continue
@@ -8491,6 +8540,7 @@ async def v32_scan_once():
             V32_STATE["seen_signal_keys"].add(key)
             V32_STATE["open"][e["symbol"]] = pos
             new_entries.append(pos)
+            entry_funnel["accepted_entries"] += 1
 
         newly_closed = []
         for sym, pos in list(V32_STATE["open"].items()):
@@ -8529,6 +8579,7 @@ async def v32_scan_once():
             "symbols_fetched": len(good),
             "eligible_rows_seen": len(eligible),
             "top1_rows_seen": len(top1_rows),
+            "entry_funnel_v46": entry_funnel,
             "new_entries": new_entries,
             "newly_closed": newly_closed,
             "fetch_errors": errors,
@@ -10821,5 +10872,23 @@ async def v45_diagnostic():
             "Read-only diagnostic: no paper positions are opened or closed here. "
             "The <=120s live-entry guard remains in the real V27/V32 scanners."
         ),
+        "generated_utc": utc_now(),
+    }
+
+
+@app.get("/v46-status")
+async def v46_status():
+    return {
+        **MODE_INFO,
+        "status": "OK",
+        "panel": "V46_ENTRY_REJECTION_FUNNEL",
+        "research_only": True,
+        "trading": False,
+        "orders": False,
+        "strategy_thresholds_changed": False,
+        "late_entry_guard_seconds": V43_MAX_ENTRY_DELAY_SECONDS,
+        "spread_max_pct": SPREAD_MAX_PCT,
+        "diagnostic_location": "/v32-scan-now -> entry_funnel_v46",
+        "note": "V46 adds counters only; V27/V32 strategy decisions are unchanged.",
         "generated_utc": utc_now(),
     }
