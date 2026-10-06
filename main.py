@@ -1,4 +1,19 @@
 # ============================================================
+# ALT-MOMENTUM-V1 / V61 (paper-only)
+# V60 uzerine eklenenler (giris/cikis KURALLARI DEGISMEDI):
+#  1) Hizli stop izleyici (3 sn): sert stop/trailing artik tarama dongusunu (~60 sn)
+#     beklemiyor. Ayni V55 kurallari, ayni kayit yapisi; stop_monitor=FAST_3S ile etiketli.
+#  2) Giris baglami kaydi (ctx_*): 60dk zirveye uzaklik, aralik konumu, hacim orani,
+#     5m ATR, BTC 30dk/60dk/4s getirisi. Sonraki analizler icin.
+#  3) Cikis tanisi: stop_overshoot_pct, hold_minutes, stop_monitor.
+#  4) /v61-stop-review: gercek mumlarla 120dk karsi-olgusal, MAE/MFE, BTC baglami,
+#     kume/ust uste islem analizi, tekrar giris listesi (state'e dokunmaz).
+#  5) /v61-event-study-start + /v61-event-study: gecmis veride (varsayilan 60 sembol,
+#     45 gun) kuralin replikasi, erken giris ve rastgele-giris kiyasi, cikis izgarasi,
+#     gun-bazli bootstrap guven araligi.
+#  6) Telegram cikis mesajina neden; giris mesajina stop seviyesi.
+# ============================================================
+# ============================================================
 # ALT-MOMENTUM-V1  --  tek dosya, V42 operasyonel guncelleme
 # Orijinal V1-V41 arastirma/forward kodu korunmustur. Eklenenler:
 #  1) Canli giris fiyati (bookTicker ask) + spread filtresi + gecikme kaydi
@@ -6160,6 +6175,8 @@ def alt_exit_text(title, p):
         f"Giris: {p['entry_price']} | Cikis: {p['exit_price']}",
         f"Brut: {p['gross_pct']}% | Maliyet: {p['cost_pct']}% | NET: {p['net_pct']}%",
     ]
+    if p.get("exit_reason"):
+        lines.append(f"Neden: {p['exit_reason']}")
     if p.get("mae_pct") is not None:
         lines.append(f"En kotu: {p['mae_pct']}% | En iyi: {p['mfe_pct']}%")
         lines.append(f"%2 stop olsaydi: {p.get('shadow_stop_2_net_pct')}% | %3 stop olsaydi: {p.get('shadow_stop_3_net_pct')}%")
@@ -8672,6 +8689,7 @@ async def v32_scan_once():
             entry_funnel["quote_or_entry_attempted"] += 1
             ok_entry, skip_reason = await apply_live_entry(client, pos, price, V32_HOLD_MS)
             pos["execution_version"] = V55_EXECUTION_VERSION
+            pos.update(v61_entry_context(good.get(e["symbol"]), good.get("BTCUSDT"), int(e["entry_open_time"]), pos.get("entry_price") or price))
             pos["risk_engine"] = {
                 "hard_stop_pct": V55_HARD_STOP_PCT,
                 "trail_activate_pct": V55_TRAIL_ACTIVATE_PCT,
@@ -8750,6 +8768,8 @@ async def v32_scan_once():
             # V55 applies only prospectively to positions opened by V55.
             if pos.get("execution_version") == V55_EXECUTION_VERSION:
                 q = await live_quote(client, sym)
+                if V32_STATE["open"].get(sym) is not pos:
+                    continue  # V61: hizli izleyici bu pozisyonu zaten kapatti
                 now_ms = alt_now_ms()
                 exit_price = None
                 exit_reason = None
@@ -8803,6 +8823,7 @@ async def v32_scan_once():
                     "exit_reason": exit_reason,
                     "exit_execution_version": V55_EXECUTION_VERSION,
                 }
+                closed.update(v61_exit_diagnostics(closed, "SCAN"))
                 V32_STATE["closed"].append(closed)
                 del V32_STATE["open"][sym]
                 newly_closed.append(closed)
@@ -8847,6 +8868,7 @@ async def v32_notify(result):
                 f"Z: {p['relative_momentum_z']} | yuzdelik: {p['cross_section_percentile']} (kohort: {p.get('cohort_size')})",
                 f"60dk devam: {p['continuation_60m_pct']}%",
                 f"ALT ort 30dk: {p['alt_market_mean_30m_pct']}%",
+                f"Sert stop: {p['entry_price'] * (1 - V55_HARD_STOP_PCT / 100):.6g} (-%{V55_HARD_STOP_PCT}) | trailing: +%{V55_TRAIL_ACTIVATE_PCT} sonrasi tepeden %{V55_TRAIL_DISTANCE_PCT}",
             ],
             open_count,
         )
@@ -11970,3 +11992,864 @@ async def v60_entry_quality():
         "next_review_at_closed":[30,50,100],
         "generated_utc":utc_now()
     }
+
+
+# ============================================================
+# V61
+# ============================================================
+import bisect
+import random
+from array import array
+
+V61_ADMIN_KEY = os.getenv("V61_ADMIN_KEY", "").strip()
+V61_FAST_ENABLED = os.getenv("V61_FAST_STOP_MONITOR", "1") == "1"
+V61_FAST_INTERVAL_SECONDS = float(os.getenv("V61_FAST_STOP_INTERVAL_SECONDS", "3"))
+V61_FAST = {
+    "enabled": V61_FAST_ENABLED,
+    "interval_seconds": V61_FAST_INTERVAL_SECONDS,
+    "started_utc": None, "last_tick_utc": None, "ticks": 0, "errors": 0,
+    "last_error": None, "positions_watched": 0, "closed_by_watcher": 0,
+    "last_quote_latency_ms": None, "recent_closes": [],
+}
+V61_FAST_TASK = None
+
+
+def _v61_check_key(key):
+    if V61_ADMIN_KEY and key != V61_ADMIN_KEY:
+        raise HTTPException(status_code=403, detail="Yetkisiz: key gerekli.")
+
+
+# ---------------- giris baglami / cikis tanisi ----------------
+def v61_entry_context(candles, btc_candles, entry_open_ms, entry_price):
+    """Girisin verildigi ANDA bilinen bilgiler (ileri bakma yok)."""
+    out = {}
+    try:
+        if not candles:
+            return out
+        prior = [c for c in candles if c["open_time"] < entry_open_ms]
+        if len(prior) < 60:
+            return out
+        last12, last3 = prior[-12:], prior[-3:]
+        prev = prior[-51:-3]
+        hi = max(c["high"] for c in last12)
+        lo = min(c["low"] for c in last12)
+        ep = float(entry_price)
+        out["ctx_dist_from_60m_high_pct"] = round(pct_change(hi, ep), 4)
+        out["ctx_range_pos_60m"] = round((ep - lo) / (hi - lo), 4) if hi > lo else None
+        v_recent = sum(c["volume"] for c in last3) / 3.0
+        v_base = (sum(c["volume"] for c in prev) / len(prev)) if prev else 0.0
+        out["ctx_vol_ratio_15m_vs_4h"] = round(v_recent / v_base, 3) if v_base > 0 else None
+        out["ctx_up_candles_of_12"] = sum(1 for c in last12 if c["close"] > c["open"])
+        trs = [(c["high"] - c["low"]) / c["close"] * 100 for c in last12 if c["close"] > 0]
+        out["ctx_range_pct_5m_avg_1h"] = round(sum(trs) / len(trs), 4) if trs else None
+        out["ctx_ret_30m_pct"] = round(pct_change(prior[-7]["close"], prior[-1]["close"]), 4)
+        out["ctx_ret_60m_pct"] = round(pct_change(prior[-13]["close"], prior[-1]["close"]), 4)
+        if len(prior) >= 49:
+            out["ctx_ret_4h_pct"] = round(pct_change(prior[-49]["close"], prior[-1]["close"]), 4)
+        if btc_candles:
+            bp = [c for c in btc_candles if c["open_time"] < entry_open_ms]
+            if len(bp) >= 49:
+                out["ctx_btc_30m_pct"] = round(pct_change(bp[-7]["close"], bp[-1]["close"]), 4)
+                out["ctx_btc_60m_pct"] = round(pct_change(bp[-13]["close"], bp[-1]["close"]), 4)
+                out["ctx_btc_4h_pct"] = round(pct_change(bp[-49]["close"], bp[-1]["close"]), 4)
+    except Exception:
+        pass
+    return out
+
+
+def v61_exit_diagnostics(closed, monitor):
+    out = {"stop_monitor": monitor}
+    try:
+        entry = float(closed["entry_price"])
+        ep = float(closed["exit_price"])
+        t0 = int(closed.get("entry_live_ms") or closed.get("entry_open_time") or 0)
+        t1 = int(closed.get("exit_open_time") or 0)
+        if t0 and t1 >= t0:
+            out["hold_minutes"] = round((t1 - t0) / 60000.0, 2)
+        reason = closed.get("exit_reason")
+        if reason == "HARD_STOP":
+            lvl = float(closed.get("hard_stop_price") or entry * (1 - V55_HARD_STOP_PCT / 100.0))
+            out["stop_overshoot_pct"] = round((lvl - ep) / entry * 100.0, 4)
+        elif reason == "TRAILING_STOP" and closed.get("trailing_stop_price"):
+            lvl = float(closed["trailing_stop_price"])
+            out["stop_overshoot_pct"] = round((lvl - ep) / entry * 100.0, 4)
+    except Exception:
+        pass
+    return out
+
+
+# ---------------- hizli stop izleyici ----------------
+async def v61_fast_stop_once(client):
+    open_pos = {
+        sym: p for sym, p in V32_STATE["open"].items()
+        if p.get("execution_version") == V55_EXECUTION_VERSION
+    }
+    V61_FAST["positions_watched"] = len(open_pos)
+    if not open_pos:
+        return []
+
+    import time as _t
+    t0 = _t.perf_counter()
+    syms = list(open_pos)
+    raw = await get_json(
+        client, "/api/v3/ticker/bookTicker",
+        params={"symbols": json.dumps(syms, separators=(",", ":"))},
+    )
+    V61_FAST["last_quote_latency_ms"] = round((_t.perf_counter() - t0) * 1000, 1)
+    quotes = {d["symbol"]: d for d in raw}
+    now_ms = alt_now_ms()
+    closed_now = []
+
+    for sym, pos in open_pos.items():
+        if V32_STATE["open"].get(sym) is not pos:
+            continue
+        d = quotes.get(sym)
+        if not d:
+            continue
+        bid = float(d["bidPrice"])
+        if bid <= 0:
+            continue
+        entry = float(pos["entry_price"])
+        peak = max(float(pos.get("peak_bid") or entry), bid)
+        pos["peak_bid"] = peak
+        pos["peak_gain_pct"] = round(pct_change(entry, peak), 4)
+        if pos["peak_gain_pct"] >= V55_TRAIL_ACTIVATE_PCT:
+            pos["trailing_active"] = True
+        hard = entry * (1.0 - V55_HARD_STOP_PCT / 100.0)
+        pos["hard_stop_price"] = hard
+
+        reason = None
+        if bid <= hard:
+            reason = "HARD_STOP"
+        elif pos.get("trailing_active"):
+            ts = peak * (1.0 - V55_TRAIL_DISTANCE_PCT / 100.0)
+            pos["trailing_stop_price"] = ts
+            if bid <= ts:
+                reason = "TRAILING_STOP"
+        if reason is None:
+            continue   # zaman stop'u mevcut tarama dongusunde kalir (kural ayni)
+
+        gross = pct_change(entry, bid)
+        net = gross - V32_COST_PCT
+        closed = {
+            **pos,
+            "status": "CLOSED_PAPER",
+            "exit_open_time": now_ms,
+            "exit_price": bid,
+            "gross_pct": round(gross, 4),
+            "cost_pct": V32_COST_PCT,
+            "net_pct": round(net, 4),
+            "exit_reason": reason,
+            "exit_execution_version": V55_EXECUTION_VERSION,
+        }
+        closed.update(v61_exit_diagnostics(closed, "FAST_3S"))
+        v59_register_counterfactual(closed)
+        V32_STATE["closed"].append(closed)
+        del V32_STATE["open"][sym]
+        closed_now.append(closed)
+
+    if closed_now:
+        V61_FAST["closed_by_watcher"] += len(closed_now)
+        V61_FAST["recent_closes"] = (V61_FAST["recent_closes"] + [
+            {"symbol": c["symbol"], "reason": c["exit_reason"], "net_pct": c["net_pct"],
+             "stop_overshoot_pct": c.get("stop_overshoot_pct"), "utc": utc_now()}
+            for c in closed_now
+        ])[-20:]
+        try:
+            if V21_DB_URL:
+                v32_save_state()          # once kayit, sonra bildirim
+        except Exception as exc:
+            V61_FAST["last_error"] = f"save: {exc}"
+        for c in closed_now:
+            await alt_safe_send(
+                alt_exit_text("ALT V32 PAPER CIKIS (hizli stop izleyici)", c), "EXIT", c["symbol"]
+            )
+    return closed_now
+
+
+async def v61_fast_loop():
+    V61_FAST["started_utc"] = utc_now()
+    await asyncio.sleep(20)
+    while True:
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(8.0)) as client:
+                for _ in range(200):
+                    try:
+                        await v61_fast_stop_once(client)
+                        V61_FAST["ticks"] += 1
+                    except Exception as exc:
+                        V61_FAST["errors"] += 1
+                        V61_FAST["last_error"] = str(exc)
+                    V61_FAST["last_tick_utc"] = utc_now()
+                    await asyncio.sleep(V61_FAST_INTERVAL_SECONDS)
+        except Exception as exc:
+            V61_FAST["errors"] += 1
+            V61_FAST["last_error"] = str(exc)
+            await asyncio.sleep(5)
+
+
+@app.on_event("startup")
+async def v61_startup():
+    global V61_FAST_TASK
+    if V61_FAST_ENABLED and V61_FAST_TASK is None:
+        V61_FAST_TASK = asyncio.create_task(v61_fast_loop())
+
+
+@app.get("/v61-status")
+async def v61_status():
+    return {
+        **MODE_INFO,
+        "status": "OK",
+        "panel": "V61_STATUS",
+        "entry_rules_changed": False,
+        "risk_rules_changed": False,
+        "fast_stop_monitor": {k: v for k, v in V61_FAST.items()},
+        "stop_rules": {
+            "hard_stop_pct": V55_HARD_STOP_PCT,
+            "trail_activate_pct": V55_TRAIL_ACTIVATE_PCT,
+            "trail_distance_pct": V55_TRAIL_DISTANCE_PCT,
+            "time_stop_minutes": 120,
+        },
+        "note": "V55 satirlarinda stop_monitor alani FAST_3S (hizli izleyici) ya da SCAN (~60 sn tarama) ya da yok (V61 oncesi). Karsilastirirken bu alana gore ayir.",
+        "generated_utc": utc_now(),
+    }
+
+
+# ============================================================
+# /v61-stop-review  (salt-okunur, state'e DOKUNMAZ)
+# ============================================================
+V61_REVIEW_CACHE = {}
+
+
+async def v61_fetch_window(client, symbol, start_ms, bars):
+    raw = await get_json(
+        client, "/api/v3/klines",
+        params={"symbol": symbol, "interval": "5m", "startTime": int(start_ms), "limit": int(min(bars, 200))},
+    )
+    now_ms = alt_now_ms()
+    out = []
+    for k in raw:
+        if int(k[6]) < now_ms:
+            out.append({
+                "open_time": int(k[0]), "open": float(k[1]), "high": float(k[2]),
+                "low": float(k[3]), "close": float(k[4]), "volume": float(k[5]),
+                "close_time": int(k[6]),
+            })
+    return out
+
+
+async def v61_review_trade(client, p):
+    key = p.get("key")
+    if key in V61_REVIEW_CACHE:
+        return V61_REVIEW_CACHE[key]
+
+    sym = p["symbol"]
+    entry = float(p["entry_price"])
+    t_entry = int(p.get("entry_live_ms") or p["entry_open_time"])
+    open_bar = int(p["entry_open_time"])
+    due = int(p["exit_due_time"])
+    t_exit = int(p["exit_open_time"])
+    bars = int((max(due, t_exit) - open_bar) / 300000) + 6
+
+    row = {
+        "key": key, "symbol": sym, "exit_reason": p.get("exit_reason"),
+        "entry_utc": datetime.fromtimestamp(t_entry / 1000, tz=timezone.utc).strftime("%m-%d %H:%M:%S"),
+        "actual_net_pct": p.get("net_pct"),
+        "hold_minutes": p.get("hold_minutes") or round((t_exit - t_entry) / 60000.0, 1),
+        "stop_monitor": p.get("stop_monitor", "LEGACY"),
+        "stop_overshoot_pct": p.get("stop_overshoot_pct"),
+        "peak_gain_pct": p.get("peak_gain_pct"),
+        "entry_delay_seconds": p.get("entry_delay_seconds"),
+        "spread_pct": p.get("spread_pct"),
+        "z": p.get("relative_momentum_z"),
+        "continuation_60m_pct": p.get("continuation_60m_pct"),
+    }
+    if row["stop_overshoot_pct"] is None and p.get("exit_reason") == "HARD_STOP" and p.get("hard_stop_price"):
+        row["stop_overshoot_pct"] = round((float(p["hard_stop_price"]) - float(p["exit_price"])) / entry * 100.0, 4)
+
+    try:
+        win = await v61_fetch_window(client, sym, open_bar, bars)
+        btc = await v61_fetch_window(client, "BTCUSDT", open_bar, bars)
+    except Exception as exc:
+        row["error"] = str(exc)
+        return row
+
+    held = [c for c in win if c["close_time"] > t_entry and c["open_time"] < t_exit]
+    full = [c for c in win if c["close_time"] > t_entry and c["open_time"] < due]
+    if held:
+        row["mae_during_hold_pct"] = round(pct_change(entry, min(c["low"] for c in held)), 4)
+        row["mfe_during_hold_pct"] = round(pct_change(entry, max(c["high"] for c in held)), 4)
+    if full:
+        low_c = min(full, key=lambda c: c["low"])
+        row["mae_to_due_pct"] = round(pct_change(entry, low_c["low"]), 4)
+        row["mfe_to_due_pct"] = round(pct_change(entry, max(c["high"] for c in full)), 4)
+        row["minutes_to_lowest"] = round((low_c["open_time"] - t_entry) / 60000.0, 1)
+
+    cf = next((c for c in win if c["open_time"] >= due), None)
+    if cf is not None and p.get("exit_reason") in ("HARD_STOP", "TRAILING_STOP"):
+        cf_net = pct_change(entry, cf["open"]) - V32_COST_PCT
+        row["counterfactual_120m_net_pct"] = round(cf_net, 4)
+        row["stop_advantage_pct"] = round(float(p["net_pct"]) - cf_net, 4)   # + ise stop yardim etti
+        after = [c for c in win if c["close_time"] > t_exit and c["open_time"] < due]
+        if after:
+            row["post_exit_low_pct_vs_exit"] = round(pct_change(float(p["exit_price"]), min(c["low"] for c in after)), 4)
+            row["post_exit_high_pct_vs_exit"] = round(pct_change(float(p["exit_price"]), max(c["high"] for c in after)), 4)
+
+    b_in = [c for c in btc if c["close_time"] > t_entry]
+    b_done = [c for c in btc if c["close_time"] <= t_exit]
+    if b_in and b_done:
+        ref = b_in[0]["open"]
+        row["btc_pct_during_hold"] = round(pct_change(ref, b_done[-1]["close"]), 4)
+        b_hold = [c for c in btc if c["close_time"] > t_entry and c["open_time"] < t_exit]
+        if b_hold:
+            row["btc_mae_during_hold_pct"] = round(pct_change(ref, min(c["low"] for c in b_hold)), 4)
+
+    for k in ("ctx_dist_from_60m_high_pct", "ctx_range_pos_60m", "ctx_vol_ratio_15m_vs_4h",
+              "ctx_up_candles_of_12", "ctx_range_pct_5m_avg_1h", "ctx_ret_30m_pct",
+              "ctx_ret_60m_pct", "ctx_btc_30m_pct", "ctx_btc_60m_pct"):
+        if p.get(k) is not None:
+            row[k] = p[k]
+
+    if cf is not None or p.get("exit_reason") not in ("HARD_STOP", "TRAILING_STOP"):
+        V61_REVIEW_CACHE[key] = row
+    return row
+
+
+@app.get("/v61-stop-review")
+async def v61_stop_review():
+    closed = [
+        p for p in V32_STATE.get("closed", [])
+        if p.get("execution_version") == V55_EXECUTION_VERSION and p.get("net_pct") is not None
+    ]
+    closed.sort(key=lambda p: int(p.get("entry_live_ms") or p.get("entry_open_time") or 0))
+    closed = closed[-80:]
+
+    rows = []
+    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
+        for p in closed:
+            rows.append(await v61_review_trade(client, p))
+
+    by_key = {p.get("key"): p for p in closed}
+
+    # --- ust uste binme ve kume ---
+    spans = []
+    for r in rows:
+        p = by_key.get(r["key"], {})
+        a = int(p.get("entry_live_ms") or p.get("entry_open_time") or 0)
+        b = int(p.get("exit_open_time") or a)
+        spans.append((a, b))
+    for i, r in enumerate(rows):
+        a, b = spans[i]
+        r["overlapping_other_trades"] = sum(
+            1 for j, (c, d) in enumerate(spans) if j != i and c < b and d > a
+        )
+
+    hours = {}
+    for r in rows:
+        h = r["entry_utc"][:8]   # "MM-DD HH"
+        hours.setdefault(h, []).append(r)
+    by_entry_hour = {
+        h: {
+            "n": len(v),
+            "mean_net_pct": round(sum(float(x["actual_net_pct"]) for x in v) / len(v), 4),
+            "hard_stops": sum(1 for x in v if x["exit_reason"] == "HARD_STOP"),
+            "symbols": [x["symbol"] for x in v],
+        }
+        for h, v in sorted(hours.items())
+    }
+    total_hs = sum(1 for r in rows if r["exit_reason"] == "HARD_STOP")
+    top_hour_hs = max((v["hard_stops"] for v in by_entry_hour.values()), default=0)
+
+    # --- ayni sembol tekrar giris ---
+    by_sym = {}
+    for r in rows:
+        by_sym.setdefault(r["symbol"], []).append(r)
+    reentries = []
+    for sym, lst in by_sym.items():
+        if len(lst) < 2:
+            continue
+        seq = []
+        prev_exit = None
+        for r in lst:
+            p = by_key.get(r["key"], {})
+            a = int(p.get("entry_live_ms") or p.get("entry_open_time") or 0)
+            seq.append({
+                "entry_utc": r["entry_utc"], "reason": r["exit_reason"], "net_pct": r["actual_net_pct"],
+                "gap_min_since_prev_exit": round((a - prev_exit) / 60000.0, 1) if prev_exit else None,
+            })
+            prev_exit = int(p.get("exit_open_time") or a)
+        reentries.append({"symbol": sym, "sequence": seq})
+
+    # --- cikis nedenine gore ---
+    by_reason = {}
+    for reason in ("HARD_STOP", "TRAILING_STOP", "TIME_STOP_120M"):
+        q = [r for r in rows if r["exit_reason"] == reason]
+        entry = {"actual": v58_safe_stats([r["actual_net_pct"] for r in q])}
+        cf = [r for r in q if r.get("counterfactual_120m_net_pct") is not None]
+        if cf:
+            entry["counterfactual_120m"] = v58_safe_stats([r["counterfactual_120m_net_pct"] for r in cf])
+            entry["n_with_counterfactual"] = len(cf)
+            entry["stop_helped_count"] = sum(1 for r in cf if r["stop_advantage_pct"] > 0)
+            entry["stop_hurt_count"] = sum(1 for r in cf if r["stop_advantage_pct"] < 0)
+            entry["sum_stop_advantage_pct"] = round(sum(r["stop_advantage_pct"] for r in cf), 4)
+        by_reason[reason] = entry
+
+    hs = [r for r in rows if r["exit_reason"] == "HARD_STOP" and r.get("stop_overshoot_pct") is not None]
+    overshoot = {
+        "n": len(hs),
+        "mean_pct": round(sum(r["stop_overshoot_pct"] for r in hs) / len(hs), 4) if hs else None,
+        "max_pct": round(max(r["stop_overshoot_pct"] for r in hs), 4) if hs else None,
+        "by_monitor": {
+            m: {
+                "n": len([r for r in hs if r["stop_monitor"] == m]),
+                "mean_pct": round(sum(r["stop_overshoot_pct"] for r in hs if r["stop_monitor"] == m)
+                                  / max(1, len([r for r in hs if r["stop_monitor"] == m])), 4),
+            }
+            for m in sorted({r["stop_monitor"] for r in hs})
+        },
+    }
+
+    # --- BTC baglami ---
+    def avg(lst, f):
+        v = [r[f] for r in lst if r.get(f) is not None]
+        return round(sum(v) / len(v), 4) if v else None
+    hs_rows = [r for r in rows if r["exit_reason"] == "HARD_STOP"]
+    other = [r for r in rows if r["exit_reason"] != "HARD_STOP"]
+    btc_ctx = {
+        "hard_stop_trades": {"n": len(hs_rows), "mean_btc_pct_during_hold": avg(hs_rows, "btc_pct_during_hold"),
+                             "mean_btc_mae_pct": avg(hs_rows, "btc_mae_during_hold_pct")},
+        "other_trades": {"n": len(other), "mean_btc_pct_during_hold": avg(other, "btc_pct_during_hold"),
+                         "mean_btc_mae_pct": avg(other, "btc_mae_during_hold_pct")},
+    }
+
+    # --- giris baglami (sadece V61 sonrasi satirlar) ---
+    ctx_rows = [r for r in rows if r.get("ctx_range_pos_60m") is not None]
+    win = [r for r in ctx_rows if float(r["actual_net_pct"]) > 0]
+    lose = [r for r in ctx_rows if float(r["actual_net_pct"]) <= 0]
+    ctx_fields = ["ctx_dist_from_60m_high_pct", "ctx_range_pos_60m", "ctx_vol_ratio_15m_vs_4h",
+                  "ctx_up_candles_of_12", "ctx_range_pct_5m_avg_1h", "ctx_ret_30m_pct",
+                  "ctx_ret_60m_pct", "ctx_btc_30m_pct", "ctx_btc_60m_pct"]
+    ctx_compare = {
+        "n_with_context": len(ctx_rows),
+        "winners": {"n": len(win), **{f: avg(win, f) for f in ctx_fields}},
+        "losers": {"n": len(lose), **{f: avg(lose, f) for f in ctx_fields}},
+        "note": "ctx_* alanlari V61'den sonra acilan islemlerde var; eski islemlerde bos.",
+    }
+
+    # --- butunluk ---
+    integrity = []
+    for r in rows:
+        base = r["symbol"][:-4] if r["symbol"].endswith("USDT") else r["symbol"]
+        if base in V26_NON_ALT_BASE_EXCLUSIONS:
+            integrity.append({"symbol": r["symbol"], "entry_utc": r["entry_utc"],
+                              "issue": "Sembol su an dislanan non-alt listesinde; V56 oncesi giris olabilir. V55 istatistiklerinden cikarmayi dusun."})
+
+    entry_times = [spans[i][0] for i in range(len(rows)) if spans[i][0]]
+    return {
+        **MODE_INFO,
+        "status": "OK",
+        "panel": "V61_STOP_REVIEW",
+        "read_only": True,
+        "strategy_changed": False,
+        "sample": {
+            "closed_v55": len(rows),
+            "first_entry_utc": datetime.fromtimestamp(min(entry_times) / 1000, tz=timezone.utc).isoformat() if entry_times else None,
+            "last_entry_utc": datetime.fromtimestamp(max(entry_times) / 1000, tz=timezone.utc).isoformat() if entry_times else None,
+            "distinct_entry_hours": len(by_entry_hour),
+            "distinct_entry_days": len({h[:5] for h in by_entry_hour}),
+        },
+        "overall": v58_safe_stats([r["actual_net_pct"] for r in rows]),
+        "by_exit_reason": by_reason,
+        "hard_stop_overshoot": overshoot,
+        "clustering": {
+            "by_entry_hour": by_entry_hour,
+            "hard_stops_total": total_hs,
+            "hard_stops_in_busiest_hour": top_hour_hs,
+            "max_overlapping_trades": max((r["overlapping_other_trades"] for r in rows), default=0),
+        },
+        "same_symbol_reentries": reentries,
+        "btc_context": btc_ctx,
+        "entry_context_comparison": ctx_compare,
+        "integrity_flags": integrity,
+        "trades": rows,
+        "how_to_read": [
+            "stop_advantage_pct > 0: stop 120 dk beklemekten iyiydi; < 0: stop zarar ettirdi.",
+            "stop_helped_count vs stop_hurt_count: stopun yardim ettigi/zarar ettirdigi islem sayisi.",
+            "mae_to_due_pct: giristen 120 dk'ya kadarki en kotu seviye; mfe_to_due_pct en iyi seviye.",
+            "overlapping_other_trades yuksekse sonuclar bagimsiz gozlem degildir.",
+            "Betimleyicidir; kucuk orneklerden filtre cikarma.",
+        ],
+        "generated_utc": utc_now(),
+    }
+
+
+# ============================================================
+# /v61-event-study  (gecmis veri, arka plan gorevi, paper-only)
+# ============================================================
+V61_STUDY = {"status": "IDLE", "progress": {}, "params": None, "result": None,
+             "error": None, "started_utc": None, "finished_utc": None}
+V61_STUDY_TASK = None
+
+V61_EXIT_CONFIGS = [
+    {"name": "V55_stop3.0_trail2.0/1.5_120m", "stop": 3.0, "act": 2.0, "dist": 1.5, "hold": 120},
+    {"name": "TIME_ONLY_120m", "stop": None, "act": None, "dist": None, "hold": 120},
+    {"name": "stop3.0_notrail_120m", "stop": 3.0, "act": None, "dist": None, "hold": 120},
+    {"name": "stop2.0_trail2.0/1.5_120m", "stop": 2.0, "act": 2.0, "dist": 1.5, "hold": 120},
+    {"name": "stop5.0_trail3.0/2.0_120m", "stop": 5.0, "act": 3.0, "dist": 2.0, "hold": 120},
+    {"name": "V55_stop3.0_trail2.0/1.5_60m", "stop": 3.0, "act": 2.0, "dist": 1.5, "hold": 60},
+]
+
+
+def v61_simulate(opens, highs, lows, entry_idx, cfg, entry_slip, exit_slip, stop_slip, cost):
+    """
+    5m mumlarla yol simulasyonu (muhafazakar):
+    - Stop dokunusu mum low'una gore; mum acilisi seviyenin altindaysa acilista cikilir.
+    - Ayni mumda trailing icin once high (zirve) sonra low varsayilir.
+    Doner: (net_pct, reason, exit_idx) ya da None (veri yetmiyor).
+    """
+    n = len(opens)
+    exit_bar = entry_idx + cfg["hold"] // 5
+    if exit_bar >= n:
+        return None
+    entry = opens[entry_idx] * (1.0 + entry_slip / 100.0)
+    stop_level = entry * (1.0 - cfg["stop"] / 100.0) if cfg["stop"] else None
+    peak = entry
+    trailing = False
+    for j in range(entry_idx, exit_bar):
+        lo, hi, op = lows[j], highs[j], opens[j]
+        if stop_level is not None and lo <= stop_level:
+            px = min(stop_level, op) * (1.0 - stop_slip / 100.0)
+            return ((px / entry - 1.0) * 100.0 - cost, "HARD_STOP", j)
+        if cfg["act"]:
+            prev_peak, prev_trailing = peak, trailing
+            if hi > peak:
+                peak = hi
+            if peak >= entry * (1.0 + cfg["act"] / 100.0):
+                trailing = True
+            if trailing:
+                ts = peak * (1.0 - cfg["dist"] / 100.0)
+                if lo <= ts:
+                    # mum acilisi onceki zirveye gore zaten seviyenin altindaysa acilista cikilir
+                    if prev_trailing and op <= prev_peak * (1.0 - cfg["dist"] / 100.0):
+                        px = op
+                    else:
+                        px = ts
+                    px *= (1.0 - stop_slip / 100.0)
+                    return ((px / entry - 1.0) * 100.0 - cost, "TRAILING_STOP", j)
+    px = opens[exit_bar] * (1.0 - exit_slip / 100.0)
+    return ((px / entry - 1.0) * 100.0 - cost, "TIME_STOP", exit_bar)
+
+
+def v61_stats(trades, rng):
+    """trades: list of (net, day, reason). Gun-bazli bootstrap guven araligi."""
+    nets = [t[0] for t in trades]
+    n = len(nets)
+    if n == 0:
+        return {"n": 0}
+    wins = [x for x in nets if x > 0]
+    losses = [x for x in nets if x <= 0]
+    gp, gl = sum(wins), abs(sum(losses))
+    srt = sorted(nets)
+    med = srt[n // 2] if n % 2 else (srt[n // 2 - 1] + srt[n // 2]) / 2
+    days = {}
+    for net, day, _ in trades:
+        d = days.setdefault(day, [0.0, 0])
+        d[0] += net
+        d[1] += 1
+    dl = list(days.values())
+    ci = None
+    if len(dl) >= 5:
+        means = []
+        for _ in range(1000):
+            samp = [dl[rng.randrange(len(dl))] for _ in dl]
+            c = sum(x[1] for x in samp)
+            means.append(sum(x[0] for x in samp) / c if c else 0.0)
+        means.sort()
+        ci = [round(means[24], 3), round(means[974], 3)]
+    reasons = {}
+    for _, _, r in trades:
+        reasons[r] = reasons.get(r, 0) + 1
+    return {
+        "n": n, "n_days": len(dl),
+        "mean_net_pct": round(sum(nets) / n, 4),
+        "median_net_pct": round(med, 4),
+        "win_rate_pct": round(100.0 * len(wins) / n, 1),
+        "profit_factor": round(gp / gl, 3) if gl > 0 else None,
+        "mean_win_pct": round(gp / len(wins), 3) if wins else None,
+        "mean_loss_pct": round(-gl / len(losses), 3) if losses else None,
+        "mean_net_ci95_day_bootstrap": ci,
+        "exit_reasons": reasons,
+    }
+
+
+def v61_extract_symbol(sym, sym_idx, candles, alt_acc, conf_by_slot, early_by_slot, store):
+    n = len(candles)
+    store[sym_idx] = {
+        "sym": sym, "n": n,
+        "t": array("q", [c["open_time"] for c in candles]),
+        "o": array("d", [c["open"] for c in candles]),
+        "h": array("d", [c["high"] for c in candles]),
+        "l": array("d", [c["low"] for c in candles]),
+    }
+    for i in range(6, n):
+        ct = candles[i]["close_time"]
+        ch = pct_change(candles[i - 6]["close"], candles[i]["close"])
+        a = alt_acc.get(ct)
+        if a is None:
+            alt_acc[ct] = [ch, 1]
+        else:
+            a[0] += ch
+            a[1] += 1
+
+    ret30, mus, sigmas = precompute_rolling_volatility_v12(candles, 288)
+    for i in range(294, n - 1):
+        m = ret30[i]
+        if m is None or m <= 0:
+            continue
+        mu, sg = mus[i], sigmas[i]
+        if mu is None or sg is None or sg <= 0:
+            continue
+        early_by_slot.setdefault(candles[i]["close_time"], []).append(((m - mu) / sg, sym_idx, i + 1))
+
+    for r in relative_candidates_forward_live(candles, sym):
+        conf_by_slot.setdefault(r["signal_time_ms"], []).append((
+            r["relative_momentum_z"], sym_idx, r["behavior"] == "CONTINUED_UP",
+            r["wait_end_change_pct"], r["entry_open_time"],
+        ))
+
+
+def v61_build_entries(conf_by_slot, early_by_slot, alt_acc, store):
+    """Her varyant icin [(entry_time_ms, sym_idx, entry_idx)] listesi."""
+    def alt_ok(slot):
+        a = alt_acc.get(slot)
+        return a is not None and (a[0] / a[1]) < 0.5
+
+    variants = {k: [] for k in (
+        "CONF_TOP1_MAXCONT_(V32_replika)", "CONF_TOP1_MINCONT", "CONF_TOP1_MAXZ", "CONF_ALL",
+        "EARLY_TOP1_MAXZ", "EARLY_ALL",
+    )}
+
+    def entry_idx_for(sym_idx, t_ms):
+        arr = store[sym_idx]["t"]
+        k = bisect.bisect_left(arr, t_ms)
+        return k if k < len(arr) and arr[k] == t_ms else None
+
+    for slot, rows in conf_by_slot.items():
+        if len(rows) < 5 or not alt_ok(slot):
+            continue
+        ordered = sorted(rows, key=lambda x: x[0])
+        nn = len(ordered)
+        elig = []
+        for idx, r in enumerate(ordered):
+            pct = idx / (nn - 1)
+            if r[0] >= 1.0 and pct >= 0.8 and r[2]:
+                elig.append((r, pct))
+        if not elig:
+            continue
+
+        def mk(r):
+            ei = entry_idx_for(r[1], r[4])
+            return (r[4], r[1], ei) if ei is not None else None
+
+        top_max = max(elig, key=lambda x: (x[0][3], x[0][0], x[1]))[0]
+        top_min = min(elig, key=lambda x: (x[0][3], -x[0][0]))[0]
+        top_z = max(elig, key=lambda x: (x[0][0], x[1]))[0]
+        for name, r in (("CONF_TOP1_MAXCONT_(V32_replika)", top_max), ("CONF_TOP1_MINCONT", top_min),
+                        ("CONF_TOP1_MAXZ", top_z)):
+            e = mk(r)
+            if e:
+                variants[name].append(e)
+        for r, _ in elig:
+            e = mk(r)
+            if e:
+                variants["CONF_ALL"].append(e)
+
+    for slot, rows in early_by_slot.items():
+        if len(rows) < 5 or not alt_ok(slot):
+            continue
+        ordered = sorted(rows, key=lambda x: x[0])
+        nn = len(ordered)
+        elig = [(r, idx / (nn - 1)) for idx, r in enumerate(ordered) if r[0] >= 1.0 and idx / (nn - 1) >= 0.8]
+        if not elig:
+            continue
+        best = max(elig, key=lambda x: (x[0][0], x[1]))[0]
+        for name, picks in (("EARLY_TOP1_MAXZ", [best]), ("EARLY_ALL", [r for r, _ in elig])):
+            for r in picks:
+                arr = store[r[1]]["t"]
+                if r[2] < len(arr):
+                    variants[name].append((arr[r[2]], r[1], r[2]))
+
+    for v in variants.values():
+        v.sort(key=lambda x: x[0])
+    return variants
+
+
+def v61_run_variants(variants, store, entry_slip, exit_slip, stop_slip, cost, n_random, btc_day):
+    rng = random.Random(61)
+    result = {"variants": {}, "baseline_random_entries": {}, "v32_replica_by_day": {}}
+
+    def day_of(ms):
+        return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+
+    for vname, entries in variants.items():
+        result["variants"][vname] = {"n_signals": len(entries)}
+        for cfg in V61_EXIT_CONFIGS:
+            busy = {}
+            trades = []
+            for t_ms, si, ei in entries:
+                if busy.get(si, 0) > t_ms:
+                    continue
+                d = store[si]
+                sim = v61_simulate(d["o"], d["h"], d["l"], ei, cfg, entry_slip, exit_slip, stop_slip, cost)
+                if sim is None:
+                    continue
+                net, reason, xi = sim
+                busy[si] = d["t"][min(xi, d["n"] - 1)]
+                trades.append((net, day_of(t_ms), reason))
+            result["variants"][vname][cfg["name"]] = v61_stats(trades, rng)
+            if vname.startswith("CONF_TOP1_MAXCONT") and cfg["name"].startswith("V55_stop3.0_trail2.0/1.5_120m"):
+                by_day = {}
+                for net, day, _ in trades:
+                    x = by_day.setdefault(day, [0.0, 0])
+                    x[0] += net
+                    x[1] += 1
+                result["v32_replica_by_day"] = [
+                    {"day": day, "n": x[1], "mean_net_pct": round(x[0] / x[1], 3),
+                     "btc_day_pct": btc_day.get(day)}
+                    for day, x in sorted(by_day.items())
+                ]
+
+    # rastgele giris tabani: ayni cikis + maliyet modeliyle sinyalsiz giris
+    syms = list(store.keys())
+    for cfg in V61_EXIT_CONFIGS:
+        trades = []
+        hold_bars = cfg["hold"] // 5
+        tries = 0
+        while len(trades) < n_random and tries < n_random * 4:
+            tries += 1
+            si = rng.choice(syms)
+            d = store[si]
+            if d["n"] < 294 + hold_bars + 5:
+                continue
+            ei = rng.randrange(294, d["n"] - hold_bars - 2)
+            sim = v61_simulate(d["o"], d["h"], d["l"], ei, cfg, entry_slip, exit_slip, stop_slip, cost)
+            if sim is None:
+                continue
+            trades.append((sim[0], day_of(d["t"][ei]), sim[1]))
+        result["baseline_random_entries"][cfg["name"]] = v61_stats(trades, rng)
+    return result
+
+
+async def v61_study_run(n_symbols, days, entry_slip, stop_slip, cost):
+    V61_STUDY.update(status="RUNNING", started_utc=utc_now(), finished_utc=None, error=None,
+                     result=None, progress={"stage": "universe"})
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
+            uni = await build_universe(client)
+            syms = [u["symbol"] for u in uni if u["symbol"] != "BTCUSDT"][:n_symbols]
+            sem = asyncio.Semaphore(6)
+
+            async def fetch(sym):
+                async with sem:
+                    await asyncio.sleep(0.05)
+                    try:
+                        return sym, await get_5m_candles_days(client, sym, days), None
+                    except Exception as exc:
+                        return sym, None, str(exc)
+
+            alt_acc, conf_by_slot, early_by_slot, store = {}, {}, {}, {}
+            errors = []
+            done = 0
+            # Bellek icin 6'serli partiler: bir parti islenip silinmeden yenisi cekilmez.
+            for start in range(0, len(syms), 6):
+                batch = await asyncio.gather(*[fetch(x) for x in syms[start:start + 6]])
+                for sym, candles, err in batch:
+                    done += 1
+                    V61_STUDY["progress"] = {"stage": "fetch+features", "done": done, "total": len(syms)}
+                    if err or not candles or len(candles) < 400:
+                        errors.append({"symbol": sym, "error": err or "yetersiz veri"})
+                        continue
+                    await asyncio.to_thread(
+                        v61_extract_symbol, sym, len(store), candles, alt_acc, conf_by_slot, early_by_slot, store
+                    )
+                del batch, candles
+
+            btc_day = {}
+            try:
+                btc = await get_5m_candles_days(client, "BTCUSDT", days)
+                first, last = {}, {}
+                for c in btc:
+                    dkey = datetime.fromtimestamp(c["open_time"] / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+                    first.setdefault(dkey, c["open"])
+                    last[dkey] = c["close"]
+                btc_day = {k: round(pct_change(first[k], last[k]), 2) for k in first}
+            except Exception:
+                pass
+
+        if not store:
+            raise RuntimeError("Hicbir sembol icin veri alinamadi.")
+
+        V61_STUDY["progress"] = {"stage": "simulate"}
+
+        def compute():
+            variants = v61_build_entries(conf_by_slot, early_by_slot, alt_acc, store)
+            return v61_run_variants(variants, store, entry_slip, entry_slip, stop_slip, cost, 3000, btc_day)
+
+        res = await asyncio.to_thread(compute)
+        t_all = [store[i]["t"][0] for i in store] + [store[i]["t"][-1] for i in store]
+        res["data"] = {
+            "symbols_used": len(store), "symbols_failed": errors[:20],
+            "bars_per_symbol_approx": int(sum(store[i]["n"] for i in store) / len(store)),
+            "period_utc": [
+                datetime.fromtimestamp(min(t_all) / 1000, tz=timezone.utc).isoformat(),
+                datetime.fromtimestamp(max(t_all) / 1000, tz=timezone.utc).isoformat(),
+            ],
+            "btc_day_pct": btc_day,
+        }
+        res["assumptions"] = {
+            "entry_slippage_pct": entry_slip, "exit_slippage_pct": entry_slip,
+            "stop_extra_slippage_pct": stop_slip, "round_trip_cost_pct": cost,
+            "same_symbol_one_position_at_a_time": True,
+            "alt_filter": "tum evren 30dk ortalama degisim < %0.5 (V32 ile ayni)",
+            "signal_rule": "z>=1, yuzdelik>=0.80 (CONF_*: + CONTINUED_UP onayi; EARLY_*: onay yok, sonraki mum acilisinda giris)",
+            "intra_bar_order": "muhafazakar: sert stop low'a gore, trailing icin once high sonra low",
+        }
+        res["caveats"] = [
+            "Sembol listesi BUGUNKU 24s hacme gore secildi (hayatta kalma yanliligi): sonuclar iyimser olabilir.",
+            "Gecmis bid/ask yok; slipaj/yayilma sabit varsayimlarla modellendi (assumptions'a bak, parametreleri degistirip tekrar calistir).",
+            "Kisa donem (varsayilan 45 gun) tek bir rejim olabilir; n_days ve CI'ya bak, n_days kucukse sonuc zayiftir.",
+            "baseline_random_entries: sinyalsiz rastgele giriste ayni cikis/maliyet modeli. Sinyal bunu belirgin gecmiyorsa kenar yok demektir.",
+            "Cok sayida varyant x cikis denendi: en iyi gorunen hucreyi secmek cok-karsilastirma yanliligidir. Once V32_replika satirina ve baseline'a bak.",
+        ]
+        V61_STUDY.update(status="DONE", result=res, finished_utc=utc_now(), progress={"stage": "done"})
+    except Exception as exc:
+        V61_STUDY.update(status="ERROR", error=str(exc), finished_utc=utc_now())
+
+
+@app.get("/v61-event-study-start")
+async def v61_event_study_start(
+    symbols: int = Query(default=50, ge=20, le=80),
+    days: int = Query(default=40, ge=14, le=60),
+    entry_slip_pct: float = Query(default=0.10, ge=0.0, le=1.0),
+    stop_slip_pct: float = Query(default=0.30, ge=0.0, le=2.0),
+    cost_pct: float = Query(default=0.15, ge=0.0, le=1.0),
+    key: str = "",
+):
+    global V61_STUDY_TASK
+    _v61_check_key(key)
+    if V61_STUDY["status"] == "RUNNING":
+        return {"status": "ALREADY_RUNNING", "progress": V61_STUDY["progress"]}
+    V61_STUDY["params"] = {"symbols": symbols, "days": days, "entry_slip_pct": entry_slip_pct,
+                           "stop_slip_pct": stop_slip_pct, "cost_pct": cost_pct}
+    V61_STUDY_TASK = asyncio.create_task(v61_study_run(symbols, days, entry_slip_pct, stop_slip_pct, cost_pct))
+    return {"status": "STARTED", "params": V61_STUDY["params"],
+            "next": "Birkac dakika sonra /v61-event-study sonucu oku."}
+
+
+@app.get("/v61-event-study")
+async def v61_event_study():
+    return {**MODE_INFO, "panel": "V61_EVENT_STUDY", "research_only": True,
+            "study_status": V61_STUDY["status"], "progress": V61_STUDY["progress"],
+            "params": V61_STUDY["params"], "started_utc": V61_STUDY["started_utc"],
+            "finished_utc": V61_STUDY["finished_utc"], "error": V61_STUDY["error"],
+            "result": V61_STUDY["result"]}
