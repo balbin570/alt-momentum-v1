@@ -8525,7 +8525,7 @@ async def v32_scan_once():
 
         return {
             "status": "OK",
-            "universe_size": len(universe),
+            "universe_size": universe_count,
             "symbols_fetched": len(good),
             "eligible_rows_seen": len(eligible),
             "top1_rows_seen": len(top1_rows),
@@ -10635,6 +10635,191 @@ async def v44_status():
             "V27 and V32 share one 400-candle snapshot. This replaces separate "
             "3-day full-universe downloads; entry thresholds and ranking rules "
             "are unchanged."
+        ),
+        "generated_utc": utc_now(),
+    }
+
+
+# =========================
+# V45 READ-ONLY FUNNEL DIAGNOSTIC
+# =========================
+V45_VERSION = "V45_DIAGNOSTIC_FIX"
+
+
+def _v45_rank_rows(good):
+    raw = []
+    for sym, candles in good.items():
+        if sym == "BTCUSDT":
+            continue
+        rows = relative_candidates_forward_live(candles, sym)
+        if rows:
+            raw.extend(rows)
+
+    by_time = {}
+    for e in raw:
+        by_time.setdefault(e["signal_time_ms"], []).append(e)
+
+    ranked = []
+    for group in by_time.values():
+        if len(group) < 5:
+            continue
+        ordered = sorted(group, key=lambda x: x["relative_momentum_z"])
+        n = len(ordered)
+        for idx, e in enumerate(ordered):
+            row = dict(e)
+            row["cross_section_percentile"] = idx / (n - 1) if n > 1 else 1.0
+            row["cohort_size"] = n
+            ranked.append(row)
+    return raw, ranked
+
+
+def _v45_alt_snapshots(good):
+    snapshots = {}
+    for sym, candles in good.items():
+        if sym == "BTCUSDT":
+            continue
+        for i in range(6, len(candles)):
+            t = candles[i]["close_time"]
+            snapshots.setdefault(t, []).append(
+                pct_change(candles[i - 6]["close"], candles[i]["close"])
+            )
+    return snapshots
+
+
+def _v45_recent(rows, newest_open_ms, minutes=10):
+    freshness_ms = minutes * 60 * 1000
+    return [
+        e for e in rows
+        if newest_open_ms - e["entry_open_time"] <= freshness_ms
+    ]
+
+
+@app.get("/v45-diagnostic")
+async def v45_diagnostic():
+    import time as _t
+    started = _t.perf_counter()
+
+    async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
+        good, errors, universe_count, cache_hit = await v44_market_snapshot(client)
+
+    btc = good.get("BTCUSDT")
+    raw, ranked = _v45_rank_rows(good)
+    snapshots = _v45_alt_snapshots(good)
+
+    newest_open_ms = max(
+        (c[-1]["open_time"] for c in good.values() if c),
+        default=0,
+    )
+
+    z_ok = [e for e in ranked if e["relative_momentum_z"] >= 1.0]
+    top20_ok = [e for e in z_ok if e["cross_section_percentile"] >= 0.80]
+    continued_ok = [e for e in top20_ok if e["behavior"] == "CONTINUED_UP"]
+
+    alt_ok = []
+    for e in continued_ok:
+        vals = snapshots.get(e["signal_time_ms"], [])
+        if not vals:
+            continue
+        alt_mean = mean(vals)
+        if alt_mean < 0.5:
+            row = dict(e)
+            row["alt_market_mean_30m_pct"] = alt_mean
+            alt_ok.append(row)
+
+    v27_btc_ok = []
+    if btc:
+        for e in alt_ok:
+            reg = btc_regime_at_v17(btc, e["signal_time_ms"])
+            if reg and reg["btc_trend"] == "BTC_BULL":
+                row = dict(e)
+                row["btc_4h_pct"] = reg["btc_4h_pct"]
+                row["btc_24h_pct"] = reg["btc_24h_pct"]
+                v27_btc_ok.append(row)
+
+    v27_recent = _v45_recent(v27_btc_ok, newest_open_ms)
+    v32_recent_pre_top1 = _v45_recent(alt_ok, newest_open_ms)
+
+    # Exact V32 Top1 per original signal timestamp.
+    cohort = {}
+    for e in alt_ok:
+        cohort.setdefault(e["signal_time_ms"], []).append(e)
+
+    v32_top1 = []
+    for group in cohort.values():
+        ordered = sorted(
+            group,
+            key=lambda x: (
+                x.get("wait_end_change_pct", 0.0),
+                x.get("relative_momentum_z", 0.0),
+                x.get("cross_section_percentile", 0.0),
+            ),
+            reverse=True,
+        )
+        if ordered:
+            v32_top1.append(ordered[0])
+
+    v32_recent = _v45_recent(v32_top1, newest_open_ms)
+
+    def sample(rows, limit=10):
+        out = []
+        for e in sorted(rows, key=lambda x: x["entry_open_time"], reverse=True)[:limit]:
+            out.append({
+                "symbol": e["symbol"],
+                "entry_open_time": e["entry_open_time"],
+                "z": round(e["relative_momentum_z"], 4),
+                "percentile": round(e["cross_section_percentile"], 4),
+                "continuation_60m_pct": round(e["wait_end_change_pct"], 4),
+                "alt_mean_30m_pct": (
+                    round(e["alt_market_mean_30m_pct"], 4)
+                    if "alt_market_mean_30m_pct" in e else None
+                ),
+            })
+        return out
+
+    return {
+        **MODE_INFO,
+        "status": "OK",
+        "panel": V45_VERSION,
+        "research_only": True,
+        "trading": False,
+        "orders": False,
+        "strategy_thresholds_changed": False,
+        "v32_len_function_bug_fixed": True,
+        "lookback": {
+            "candles_per_symbol": V44_SNAPSHOT_CANDLES,
+            "note": (
+                "400 completed 5m candles are retained because the frozen Z calculation "
+                "uses a 288-bar rolling window plus 30m/60m observation bars; this is "
+                "sufficient for live forward detection and preserves V44 speed."
+            ),
+        },
+        "snapshot": {
+            "universe_count": universe_count,
+            "symbols_fetched_ok": len(good),
+            "fetch_errors": len(errors),
+            "cache_hit": cache_hit,
+        },
+        "funnel_all_observable_rows": {
+            "raw_relative_rows": len(raw),
+            "ranked_rows": len(ranked),
+            "z_ge_1": len(z_ok),
+            "top20_percentile": len(top20_ok),
+            "continued_up": len(continued_ok),
+            "alt_mean_lt_0_5": len(alt_ok),
+            "v27_btc_bull": len(v27_btc_ok),
+            "v32_top1": len(v32_top1),
+        },
+        "fresh_last_10m": {
+            "v27_after_all_strategy_filters": len(v27_recent),
+            "v32_before_top1": len(v32_recent_pre_top1),
+            "v32_after_top1": len(v32_recent),
+        },
+        "recent_v27_candidates": sample(v27_recent),
+        "recent_v32_candidates": sample(v32_recent),
+        "diagnostic_seconds": round(_t.perf_counter() - started, 3),
+        "note": (
+            "Read-only diagnostic: no paper positions are opened or closed here. "
+            "The <=120s live-entry guard remains in the real V27/V32 scanners."
         ),
         "generated_utc": utc_now(),
     }
