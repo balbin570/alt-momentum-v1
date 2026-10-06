@@ -13337,3 +13337,103 @@ async def v62_shadow_status():
         "trading":False,"orders":False,"active_strategy_changed":False,
         "active_risk_changed":False,"v61_fast_3s_changed":False,
         "study":V62_STUDY,"generated_utc":utc_now()}
+
+
+# ============================================================
+# V63 — PULLBACK/REACCEL EXIT VALIDATION (RESEARCH ONLY)
+# Entry is frozen from V62. No active V61/V55/FAST_3S changes.
+# Predeclared exits: TIME120, hard -3%, catastrophe -5%, late trailing.
+# ============================================================
+V63_STUDY={"status":"IDLE","progress":{},"params":None,"result":None,"error":None,
+           "started_utc":None,"finished_utc":None}
+V63_TASK=None
+
+V63_EXITS=[
+    {"name":"TIME_ONLY_120m","stop":None,"act":None,"dist":None,"hold":120},
+    {"name":"HARD_STOP_3_TIME120","stop":3.0,"act":None,"dist":None,"hold":120},
+    {"name":"CATASTROPHE_STOP_5_TIME120","stop":5.0,"act":None,"dist":None,"hold":120},
+    {"name":"HARD3_LATE_TRAIL_ACT3_DIST2_TIME120","stop":3.0,"act":3.0,"dist":2.0,"hold":120},
+]
+
+
+def v63_compare(entries,store,entry_slip,stop_slip,cost):
+    rng=random.Random(63); out={}
+    for cfg in V63_EXITS:
+        busy={}; trades=[]
+        for t_ms,si,ei in entries:
+            if busy.get(si,0)>t_ms: continue
+            sim=v61_simulate(store[si]['o'],store[si]['h'],store[si]['l'],ei,cfg,
+                             entry_slip,entry_slip,stop_slip,cost)
+            if sim is None: continue
+            net,reason,xi=sim
+            busy[si]=store[si]['t'][min(xi,store[si]['n']-1)]
+            day=datetime.fromtimestamp(t_ms/1000,tz=timezone.utc).strftime('%Y-%m-%d')
+            trades.append((net,day,reason))
+        out[cfg['name']]=v61_stats(trades,rng)
+    return out
+
+
+async def v63_study_run(n_symbols,days,entry_slip,stop_slip,cost):
+    V63_STUDY.update(status='RUNNING',params={"symbols":n_symbols,"days":days,
+        "entry_slip_pct":entry_slip,"stop_slip_pct":stop_slip,"cost_pct":cost},
+        progress={"stage":"universe"},started_utc=utc_now(),finished_utc=None,error=None,result=None)
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
+            uni=await build_universe(client)
+            syms=[u['symbol'] for u in uni if u['symbol']!='BTCUSDT'][:n_symbols]
+            sem=asyncio.Semaphore(6)
+            async def fetch(sym):
+                async with sem:
+                    try:return sym,await get_5m_candles_days(client,sym,days),None
+                    except Exception as exc:return sym,None,str(exc)
+            alt_acc,conf_by_slot,early_by_slot,store={},{},{},{}
+            errors=[];done=0
+            for start in range(0,len(syms),6):
+                batch=await asyncio.gather(*[fetch(x) for x in syms[start:start+6]])
+                for sym,candles,err in batch:
+                    done+=1;V63_STUDY['progress']={"stage":"fetch+features","done":done,"total":len(syms)}
+                    if err or not candles or len(candles)<400:
+                        errors.append({"symbol":sym,"error":err or 'yetersiz veri'});continue
+                    si=len(store)
+                    await asyncio.to_thread(v61_extract_symbol,sym,si,candles,alt_acc,conf_by_slot,early_by_slot,store)
+            if not store:raise RuntimeError('Hicbir sembol icin veri alinamadi.')
+        V63_STUDY['progress']={"stage":"simulate"}
+        def compute():
+            base=v61_build_entries(conf_by_slot,early_by_slot,alt_acc,store)
+            frozen=v62_pullback_reaccel_entries(base['EARLY_TOP1_MAXZ'],store)
+            return len(frozen),v63_compare(frozen,store,entry_slip,stop_slip,cost)
+        n_sig,res=await asyncio.to_thread(compute)
+        V63_STUDY.update(status='DONE',progress={"stage":"done"},finished_utc=utc_now(),result={
+            "entry":"V62_FROZEN_PULLBACK_REACCEL_TOP1",
+            "entry_rules":{"source":"EARLY_TOP1_MAXZ","pullback_min_pct":V62_PULLBACK_MIN_PCT,
+                "pullback_max_pct":V62_PULLBACK_MAX_PCT,"window_minutes":V62_PULLBACK_WINDOW_BARS*5,
+                "reacceleration":"bullish 5m close > previous 5m high; entry next 5m open"},
+            "n_signals":n_sig,"exit_comparison":res,
+            "data":{"symbols_used":len(store),"symbols_failed":errors[:20]},
+            "guardrails":["Research/shadow only; active strategy unchanged.",
+                "Entry thresholds frozen before V63 results.",
+                "Exit candidates predeclared before V63 results; do not tune to this sample.",
+                "Primary question: can a catastrophe/hard stop protect downside without destroying TIME120 edge?"]})
+    except Exception as exc:
+        V63_STUDY.update(status='ERROR',error=f'{type(exc).__name__}: {exc}',finished_utc=utc_now())
+
+
+@app.get('/v63-validation-start')
+async def v63_validation_start(symbols:int=Query(30,ge=20,le=50),days:int=Query(30,ge=20,le=40),
+    entry_slip_pct:float=Query(0.10,ge=0,le=1),stop_slip_pct:float=Query(0.30,ge=0,le=2),
+    cost_pct:float=Query(0.15,ge=0,le=1)):
+    global V63_TASK
+    if V63_TASK is not None and not V63_TASK.done():
+        return {"status":"ALREADY_RUNNING","progress":V63_STUDY.get('progress')}
+    V63_TASK=asyncio.create_task(v63_study_run(symbols,days,entry_slip_pct,stop_slip_pct,cost_pct))
+    return {"status":"STARTED","paper_only":True,"active_strategy_changed":False,
+        "entry":"V62_FROZEN_PULLBACK_REACCEL_TOP1",
+        "exits":[x['name'] for x in V63_EXITS]}
+
+
+@app.get('/v63-validation-status')
+async def v63_validation_status():
+    return {**MODE_INFO,"status":"OK","panel":"V63_PULLBACK_EXIT_VALIDATION",
+        "trading":False,"orders":False,"active_strategy_changed":False,
+        "active_risk_changed":False,"v61_fast_3s_changed":False,
+        "study":V63_STUDY,"generated_utc":utc_now()}
