@@ -13562,6 +13562,8 @@ async def v64_diagnostic_status():
       'study':V64_STUDY,'generated_utc':utc_now()}
 
 
+BINANCE_BASE = "https://api.binance.com"
+
 # ============================================================
 # V65 — COMBINED EARLY BREAKOUT CHALLENGER (PAPER/RESEARCH ONLY)
 # Adds: Binance server-time offset, immediate live ASK forward helper,
