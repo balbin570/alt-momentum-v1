@@ -10976,7 +10976,7 @@ async def v49_timing_diagnostic():
     started_utc = utc_now()
     now_ms = int(time.time() * 1000)
 
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+    async with httpx.AsyncClient(timeout=30.0) as client:
         t_snap0 = time.perf_counter()
         good, errors, universe_count, cache_hit = await v44_market_snapshot(client)
         t_snap1 = time.perf_counter()
