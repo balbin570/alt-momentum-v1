@@ -13396,6 +13396,7 @@ async def v63_study_run(n_symbols,days,entry_slip,stop_slip,cost):
                         errors.append({"symbol":sym,"error":err or 'yetersiz veri'});continue
                     si=len(store)
                     await asyncio.to_thread(v61_extract_symbol,sym,si,candles,alt_acc,conf_by_slot,early_by_slot,store)
+                    store[si]['c']=array('d',[c['close'] for c in candles])
             if not store:raise RuntimeError('Hicbir sembol icin veri alinamadi.')
         V63_STUDY['progress']={"stage":"simulate"}
         def compute():
