@@ -13845,3 +13845,113 @@ async def v67_start(symbols:int=Query(40,ge=20,le=50),days:int=Query(40,ge=20,le
     V67_TASK=asyncio.create_task(v67_run(symbols,days,entry_slip_pct,cost_pct));return {'status':'STARTED','paper_only':True,'entry':'FROZEN_V66_CONFIRM_10M','horizons_minutes':V67_HORIZONS}
 @app.get('/v67-status')
 async def v67_status():return {**MODE_INFO,'status':'OK','panel':'V67_POST_ENTRY_DIAGNOSTIC','trading':False,'orders':False,'active_strategy_changed':False,'active_risk_changed':False,'study':V67_STUDY,'generated_utc':utc_now()}
+
+
+# ============================================================
+# V68 — FROZEN CONFIRM_10M + MOMENTUM FAILURE EXIT VALIDATION
+# Entry unchanged from V66/V67.
+# Predeclared exit challengers only; no threshold mining.
+# ============================================================
+V68_STUDY={"status":"IDLE","progress":{},"params":None,"result":None,"error":None,"started_utc":None,"finished_utc":None}
+V68_TASK=None
+
+def v68_trade(o,h,l,c,t,ei,breakout,cost,entry_slip,rule):
+    ep=o[ei]*(1+entry_slip/100)
+    due=min(len(o)-1,ei+24)
+    xi=due; reason="TIME_STOP_120M"
+    check_bars=None
+    if rule=="EXIT_15M_NEGATIVE": check_bars=3
+    elif rule in ("EXIT_20M_NEGATIVE","EXIT_20M_BELOW_BREAKOUT","EXIT_20M_NEG_AND_BELOW_BREAKOUT"): check_bars=4
+    if check_bars is not None:
+        ci=ei+check_bars-1
+        if ci < len(c):
+            ret=((c[ci]/ep)-1)*100
+            below=c[ci] < breakout
+            fire=(rule=="EXIT_15M_NEGATIVE" and ret<0) or \
+                 (rule=="EXIT_20M_NEGATIVE" and ret<0) or \
+                 (rule=="EXIT_20M_BELOW_BREAKOUT" and below) or \
+                 (rule=="EXIT_20M_NEG_AND_BELOW_BREAKOUT" and ret<0 and below)
+            if fire and ci+1 < len(o):
+                xi=ci+1; reason=rule
+    xp=o[xi]
+    net=((xp/ep)-1)*100-cost
+    return net,reason,xi
+
+def v68_stats(rows):
+    rng=random.Random(68)
+    return v61_stats([(r["net"],r["day"],r["reason"]) for r in rows],rng)
+
+def v68_compute(store,cost,entry_slip):
+    cand=v66_candidates(store)
+    names=["TIME120_CONTROL","EXIT_15M_NEGATIVE","EXIT_20M_NEGATIVE","EXIT_20M_BELOW_BREAKOUT","EXIT_20M_NEG_AND_BELOW_BREAKOUT"]
+    rows={x:[] for x in names}; busy={x:{} for x in names}
+    for tm,si,i,ch,vr in cand:
+        d=store[si];o,h,l,c,t=d["o"],d["h"],d["l"],d["c"],d["t"]; breakout=c[i]
+        if i+3>=len(o) or not (c[i+1]>breakout and c[i+2]>c[i+1]): continue
+        ei=i+3; et=t[ei]
+        for name in names:
+            if busy[name].get(si,0)>et: continue
+            if name=="TIME120_CONTROL":
+                ep=o[ei]*(1+entry_slip/100); xi=min(len(o)-1,ei+24); xp=o[xi]
+                net=((xp/ep)-1)*100-cost; reason="TIME_STOP_120M"
+            else:
+                net,reason,xi=v68_trade(o,h,l,c,t,ei,breakout,cost,entry_slip,name)
+            busy[name][si]=t[min(xi,len(t)-1)]
+            day=datetime.fromtimestamp(et/1000,tz=timezone.utc).strftime("%Y-%m-%d")
+            rows[name].append({"net":float(net),"day":day,"reason":reason})
+    out={}
+    for name,rr in rows.items():
+        st=v68_stats(rr)
+        days=sorted(set(r["day"] for r in rr)); cut=days[len(days)//2] if days else None
+        halves={}
+        for lab,sub in [("FIRST_HALF",[r for r in rr if cut and r["day"]<cut]),("SECOND_HALF",[r for r in rr if cut and r["day"]>=cut])]:
+            halves[lab]=v68_stats(sub) if sub else {"n":0}
+        st["temporal_halves"]=halves
+        out[name]=st
+    return len(cand),out
+
+async def v68_run(n_symbols,days,entry_slip,cost):
+    V68_STUDY.update(status="RUNNING",progress={"stage":"universe"},params={"symbols":n_symbols,"days":days,"entry_slip_pct":entry_slip,"cost_pct":cost},result=None,error=None,started_utc=utc_now(),finished_utc=None)
+    try:
+      async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
+        uni=await build_universe(client); syms=[u["symbol"] for u in uni if u["symbol"]!="BTCUSDT"][:n_symbols]; sem=asyncio.Semaphore(6)
+        async def fetch(sym):
+          async with sem:
+            try:return sym,await get_5m_candles_days(client,sym,days),None
+            except Exception as e:return sym,None,str(e)
+        aa,cc,ee,store={},{},{},{}; errs=[]; done=0
+        for st in range(0,len(syms),6):
+          for sym,candles,err in await asyncio.gather(*[fetch(x) for x in syms[st:st+6]]):
+            done+=1; V68_STUDY["progress"]={"stage":"fetch","done":done,"total":len(syms)}
+            if err or not candles or len(candles)<400: errs.append({"symbol":sym,"error":err or "insufficient"}); continue
+            si=len(store); await asyncio.to_thread(v61_extract_symbol,sym,si,candles,aa,cc,ee,store)
+            store[si]["c"]=array("d",[x["close"] for x in candles]); store[si]["v"]=array("d",[x.get("volume",0.0) for x in candles])
+      V68_STUDY["progress"]={"stage":"simulate"}
+      raw,res=await asyncio.to_thread(v68_compute,store,cost,entry_slip)
+      V68_STUDY.update(status="DONE",progress={"stage":"done"},finished_utc=utc_now(),result={
+        "entry":"FROZEN_V66_CONFIRM_10M",
+        "raw_breakouts":raw,
+        "models":res,
+        "rules":{
+          "control":"hold to 120m",
+          "exit_15m_negative":"at 15m checkpoint, if net mark-to-market < 0, exit next 5m open",
+          "exit_20m_negative":"at 20m checkpoint, if net mark-to-market < 0, exit next 5m open",
+          "exit_20m_below_breakout":"at 20m checkpoint, if close < original breakout close, exit next 5m open",
+          "exit_20m_neg_and_below":"at 20m checkpoint, require both negative return and below breakout"
+        },
+        "data":{"symbols_used":len(store),"symbols_failed":errs[:20]},
+        "guardrails":["Research only; no real orders.","Entry frozen.","Exit hypotheses predeclared before this validation.","Active V61/V55/FAST_3S unchanged."]
+      })
+    except Exception as e:
+      V68_STUDY.update(status="ERROR",error=f"{type(e).__name__}: {e}",finished_utc=utc_now())
+
+@app.get("/v68-start")
+async def v68_start(symbols:int=Query(40,ge=20,le=50),days:int=Query(40,ge=20,le=40),entry_slip_pct:float=Query(.10,ge=0,le=1),cost_pct:float=Query(.15,ge=0,le=1)):
+    global V68_TASK
+    if V68_TASK is not None and not V68_TASK.done(): return {"status":"ALREADY_RUNNING","progress":V68_STUDY.get("progress")}
+    V68_TASK=asyncio.create_task(v68_run(symbols,days,entry_slip_pct,cost_pct))
+    return {"status":"STARTED","paper_only":True,"entry":"FROZEN_V66_CONFIRM_10M","models":["TIME120_CONTROL","EXIT_15M_NEGATIVE","EXIT_20M_NEGATIVE","EXIT_20M_BELOW_BREAKOUT","EXIT_20M_NEG_AND_BELOW_BREAKOUT"]}
+
+@app.get("/v68-status")
+async def v68_status():
+    return {**MODE_INFO,"status":"OK","panel":"V68_MOMENTUM_FAILURE_EXIT","trading":False,"orders":False,"active_strategy_changed":False,"active_risk_changed":False,"study":V68_STUDY,"generated_utc":utc_now()}
