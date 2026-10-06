@@ -8366,21 +8366,84 @@ def v32_public_state():
         "recent_closed": closed[-20:],
     }
 
+async def v53_market_snapshot_including_current(client):
+    """V32-only snapshot including the current/in-progress 5m candle.
+    The current candle OPEN is observable at the checkpoint and is the frozen
+    historical paper-entry reference. V27 continues to use its completed-candle snapshot.
+    """
+    universe = await build_universe(client)
+    semaphore = asyncio.Semaphore(V44_FETCH_CONCURRENCY)
+
+    async def fetch(item):
+        async with semaphore:
+            try:
+                candles = await v37_get_klines_including_current(
+                    client, item["symbol"], V44_SNAPSHOT_CANDLES
+                )
+                return item["symbol"], candles, None
+            except Exception as e:
+                return item["symbol"], None, str(e)
+
+    fetched = await asyncio.gather(*[fetch(x) for x in universe])
+    good = {sym: c for sym, c, err in fetched if c}
+    errors = [{"symbol": sym, "error": err} for sym, c, err in fetched if err]
+    return good, errors, len(universe)
+
+
+def v53_latest_checkpoint_row(candles, symbol):
+    """Build the newest causal checkpoint row.
+
+    Historical V15 semantics are signal_i -> start i+1 -> checkpoint i+13.
+    Therefore, when the current/in-progress candle is entry_idx, signal_i is
+    entry_idx-13. Only the current candle OPEN is used from the in-progress bar.
+    """
+    wait_bars = V15_WAIT_MINUTES // 5
+    entry_idx = len(candles) - 1
+    signal_i = entry_idx - (wait_bars + 1)
+    if signal_i < 294 or entry_idx <= 0:
+        return None
+
+    completed = candles[:entry_idx]
+    ret30, mus, sigmas = precompute_rolling_volatility_v12(completed, 288)
+    if signal_i >= len(ret30):
+        return None
+    mom30 = ret30[signal_i]
+    mu, sigma = mus[signal_i], sigmas[signal_i]
+    if mom30 is None or mom30 <= 0 or mu is None or sigma is None or sigma <= 0:
+        return None
+
+    z = (mom30 - mu) / sigma
+    signal_close = candles[signal_i]["close"]
+    checkpoint_open = candles[entry_idx]["open"]
+    continuation = pct_change(signal_close, checkpoint_open)
+    return {
+        "symbol": symbol,
+        "signal_time_ms": candles[signal_i]["close_time"],
+        "entry_open_time": candles[entry_idx]["open_time"],
+        "momentum_30m_pct": mom30,
+        "relative_momentum_z": z,
+        "behavior": "CONTINUED_UP" if continuation >= 0.75 else "OTHER",
+        "wait_end_change_pct": continuation,
+        "checkpoint_open": checkpoint_open,
+    }
+
+
 async def v32_scan_once():
     import time as _t
     scan_started = _t.perf_counter()
     async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
-        good, errors, universe_count, snapshot_cache_hit = await v44_market_snapshot(client)
+        # V53: V32 alone uses the current/in-progress 5m OPEN. V27 is untouched.
+        good, errors, universe_count = await v53_market_snapshot_including_current(client)
 
         raw = []
         for sym, candles in good.items():
             if sym == "BTCUSDT":
                 continue
-            rows = relative_candidates_forward_live(candles, sym)
-            if rows:
-                raw.extend(rows)
+            row = v53_latest_checkpoint_row(candles, sym)
+            if row:
+                raw.append(row)
 
-        # Cross-sectional percentile at the original signal timestamp.
+        # Frozen cross-sectional percentile at the original signal timestamp.
         by_time = {}
         for e in raw:
             by_time.setdefault(e["signal_time_ms"], []).append(e)
@@ -8397,15 +8460,17 @@ async def v32_scan_once():
                 row["cohort_size"] = n
                 ranked.append(row)
 
-        # True selected-alt 30m market mean at signal timestamp.
+        # Frozen selected-alt 30m mean at the ORIGINAL signal timestamp.
         snapshots = {}
         for sym, candles in good.items():
             if sym == "BTCUSDT":
                 continue
-            for i in range(6, len(candles)):
-                t = candles[i]["close_time"]
+            # Exclude the current/in-progress candle from market-history calculations.
+            completed = candles[:-1]
+            for i in range(6, len(completed)):
+                t = completed[i]["close_time"]
                 snapshots.setdefault(t, []).append(
-                    pct_change(candles[i - 6]["close"], candles[i]["close"])
+                    pct_change(completed[i - 6]["close"], completed[i]["close"])
                 )
 
         eligible = []
@@ -8426,11 +8491,10 @@ async def v32_scan_once():
             row["alt_market_mean_30m_pct"] = alt_mean
             eligible.append(row)
 
-        # TOP1 per decision cohort using only already-observed 60m continuation.
+        # Frozen TOP1 selection per original signal cohort.
         cohort = {}
         for e in eligible:
             cohort.setdefault(e["signal_time_ms"], []).append(e)
-
         top1_rows = []
         for group in cohort.values():
             group = sorted(
@@ -8445,24 +8509,15 @@ async def v32_scan_once():
             if group:
                 top1_rows.append(group[0])
 
-        newest_open_ms = max(
-            (c[-1]["open_time"] for c in good.values() if c), default=0
-        )
+        now_ms_for_freshness = alt_now_ms()
         freshness_ms = 10 * 60 * 1000
-
         entry_funnel = {
-            "top1_total": len(top1_rows),
-            "fresh_last_10m": 0,
-            "rejected_not_fresh": 0,
-            "rejected_seen_key": 0,
-            "rejected_symbol_already_open": 0,
-            "rejected_cooldown": 0,
-            "rejected_missing_entry_candle": 0,
-            "quote_or_entry_attempted": 0,
-            "rejected_delay_gt_120s": 0,
-            "rejected_spread": 0,
-            "rejected_other_entry_reason": 0,
-            "accepted_entries": 0,
+            "top1_total": len(top1_rows), "fresh_last_10m": 0,
+            "rejected_not_fresh": 0, "rejected_seen_key": 0,
+            "rejected_symbol_already_open": 0, "rejected_cooldown": 0,
+            "rejected_missing_entry_candle": 0, "quote_or_entry_attempted": 0,
+            "rejected_delay_gt_120s": 0, "rejected_spread": 0,
+            "rejected_other_entry_reason": 0, "accepted_entries": 0,
             "rejection_samples": [],
         }
 
@@ -8470,15 +8525,13 @@ async def v32_scan_once():
             entry_funnel[kind] += 1
             if len(entry_funnel["rejection_samples"]) < 25:
                 row = {
-                    "symbol": e.get("symbol"),
-                    "entry_open_time": e.get("entry_open_time"),
+                    "symbol": e.get("symbol"), "entry_open_time": e.get("entry_open_time"),
                     "z": round(float(e.get("relative_momentum_z", 0.0)), 4),
                     "percentile": round(float(e.get("cross_section_percentile", 0.0)), 4),
                     "continuation_60m_pct": round(float(e.get("wait_end_change_pct", 0.0)), 4),
                     "stage": kind,
                 }
-                if reason:
-                    row["reason"] = reason
+                if reason: row["reason"] = reason
                 if pos and pos.get("entry_delay_seconds") is not None:
                     row["entry_delay_seconds"] = pos.get("entry_delay_seconds")
                 if pos and pos.get("spread_pct") is not None:
@@ -8487,11 +8540,10 @@ async def v32_scan_once():
 
         new_entries = []
         for e in top1_rows:
-            if newest_open_ms - e["entry_open_time"] > freshness_ms:
+            if now_ms_for_freshness - e["entry_open_time"] > freshness_ms:
                 _v46_reject("rejected_not_fresh", e, "older than 10m freshness window")
                 continue
             entry_funnel["fresh_last_10m"] += 1
-
             key = f'{e["symbol"]}:{e["entry_open_time"]}'
             if key in V47_SEEN_KEYS["V32"]:
                 _v46_reject("rejected_seen_key", e, "key already processed in V47")
@@ -8500,43 +8552,31 @@ async def v32_scan_once():
                 _v46_reject("rejected_symbol_already_open", e, "symbol already open")
                 continue
 
-            # Same-symbol 60m cooldown from the last V32 entry.
-            prior_times = []
-            for x in V32_STATE["closed"]:
-                if x.get("symbol") == e["symbol"]:
-                    prior_times.append(int(x.get("entry_open_time", 0)))
-            if e["symbol"] in V32_STATE["open"]:
-                prior_times.append(int(V32_STATE["open"][e["symbol"]].get("entry_open_time", 0)))
+            prior_times = [int(x.get("entry_open_time", 0)) for x in V32_STATE["closed"] if x.get("symbol") == e["symbol"]]
             if prior_times and e["entry_open_time"] - max(prior_times) < 60 * 60 * 1000:
                 _v46_reject("rejected_cooldown", e, "same-symbol cooldown <60m")
                 continue
 
-            candles = good.get(e["symbol"], [])
-            price = next(
-                (c["open"] for c in candles if c["open_time"] == e["entry_open_time"]),
-                None
-            )
+            price = e.get("checkpoint_open")
             if price is None:
-                _v46_reject("rejected_missing_entry_candle", e, "entry candle open not found")
+                _v46_reject("rejected_missing_entry_candle", e, "current checkpoint open not found")
                 continue
 
             pos = {
-                "key": key,
-                "strategy": "V32_TOP1_60M_NO_BTC_FORWARD_CHALLENGER",
-                "symbol": e["symbol"],
-                "signal_time_ms": e["signal_time_ms"],
-                "entry_open_time": e["entry_open_time"],
-                "entry_price": price,
+                "key": key, "strategy": "V32_TOP1_60M_NO_BTC_FORWARD_CHALLENGER",
+                "symbol": e["symbol"], "signal_time_ms": e["signal_time_ms"],
+                "entry_open_time": e["entry_open_time"], "entry_price": price,
                 "exit_due_time": e["entry_open_time"] + V32_HOLD_MS,
                 "relative_momentum_z": round(e["relative_momentum_z"], 4),
                 "cross_section_percentile": round(e["cross_section_percentile"], 4),
                 "cohort_size": e.get("cohort_size"),
                 "continuation_60m_pct": round(e["wait_end_change_pct"], 4),
                 "alt_market_mean_30m_pct": round(e["alt_market_mean_30m_pct"], 4),
-                "status": "OPEN_PAPER",
+                "status": "OPEN_PAPER", "execution_version": "V53_CAUSAL_CHECKPOINT_OPEN",
             }
             entry_funnel["quote_or_entry_attempted"] += 1
             ok_entry, skip_reason = await apply_live_entry(client, pos, price, V32_HOLD_MS)
+            pos["execution_version"] = "V53_CAUSAL_CHECKPOINT_OPEN"
             if not ok_entry:
                 reason_text = str(skip_reason or "")
                 if "entry delay" in reason_text:
@@ -8557,28 +8597,21 @@ async def v32_scan_once():
             entry_funnel["accepted_entries"] += 1
 
         newly_closed = []
+        # Close logic uses completed candles only, preserving the existing paper exit rule.
         for sym, pos in list(V32_STATE["open"].items()):
-            candles = good.get(sym)
-            if not candles:
+            candles_all = good.get(sym)
+            if not candles_all:
                 continue
-            exit_candle = next(
-                (c for c in candles if c["open_time"] >= pos["exit_due_time"]),
-                None
-            )
+            candles = candles_all[:-1]
+            exit_candle = next((c for c in candles if c["open_time"] >= pos["exit_due_time"]), None)
             if exit_candle is None:
                 continue
             exit_price = exit_candle["open"]
             gross = pct_change(pos["entry_price"], exit_price)
             net = gross - V32_COST_PCT
-            closed = {
-                **pos,
-                "status": "CLOSED_PAPER",
-                "exit_open_time": exit_candle["open_time"],
-                "exit_price": exit_price,
-                "gross_pct": round(gross, 4),
-                "cost_pct": V32_COST_PCT,
-                "net_pct": round(net, 4),
-            }
+            closed = {**pos, "status": "CLOSED_PAPER", "exit_open_time": exit_candle["open_time"],
+                      "exit_price": exit_price, "gross_pct": round(gross, 4),
+                      "cost_pct": V32_COST_PCT, "net_pct": round(net, 4)}
             closed.update(shadow_stop_results(candles, closed, exit_candle, V32_COST_PCT))
             V32_STATE["closed"].append(closed)
             del V32_STATE["open"][sym]
@@ -8586,17 +8619,12 @@ async def v32_scan_once():
 
         V44_METRICS["v32_last_scan_seconds"] = round(_t.perf_counter() - scan_started, 3)
         V44_METRICS["v32_last_scan_utc"] = utc_now()
-
         return {
-            "status": "OK",
-            "universe_size": universe_count,
-            "symbols_fetched": len(good),
-            "eligible_rows_seen": len(eligible),
-            "top1_rows_seen": len(top1_rows),
-            "entry_funnel_v46": entry_funnel,
-            "new_entries": new_entries,
-            "newly_closed": newly_closed,
-            "fetch_errors": errors,
+            "status": "OK", "universe_size": universe_count, "symbols_fetched": len(good),
+            "eligible_rows_seen": len(eligible), "top1_rows_seen": len(top1_rows),
+            "entry_funnel_v46": entry_funnel, "new_entries": new_entries,
+            "newly_closed": newly_closed, "fetch_errors": errors,
+            "execution_architecture": "V53_CAUSAL_CHECKPOINT_OPEN",
         }
 
 async def v32_notify(result):
@@ -11237,5 +11265,25 @@ async def v52_status():
         "v32_scan_interval_seconds": V32_SCAN_INTERVAL_SECONDS,
         "shared_snapshot_ttl_seconds": V44_SNAPSHOT_TTL_SECONDS,
         "note": "Execution cadence only: V32 30s cycle and 10s snapshot TTL. Signal thresholds and 120s guard unchanged.",
+        "generated_utc": utc_now(),
+    }
+
+
+@app.get("/v53-status")
+async def v53_status():
+    return {
+        **MODE_INFO,
+        "status": "OK",
+        "panel": "V53_CAUSAL_CHECKPOINT_OPEN",
+        "research_only": True,
+        "trading": False,
+        "orders": False,
+        "strategy_thresholds_changed": False,
+        "late_entry_guard_seconds": V43_MAX_ENTRY_DELAY_SECONDS,
+        "v32_scan_interval_seconds": V32_SCAN_INTERVAL_SECONDS,
+        "checkpoint_source": "current/in-progress 5m candle OPEN",
+        "historical_alignment": "signal_i -> checkpoint entry_idx = signal_i + 13",
+        "v27_untouched": True,
+        "note": "V32 forward architecture now evaluates the frozen CONTINUED_UP checkpoint from the observable current 5m OPEN; no wait for checkpoint candle close.",
         "generated_utc": utc_now(),
     }
