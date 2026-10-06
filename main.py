@@ -47,6 +47,7 @@ from statistics import mean, median
 
 import httpx
 from fastapi import FastAPI, Query
+import time
 
 app = FastAPI(title="ALT-MOMENTUM-V1")
 
