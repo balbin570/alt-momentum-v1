@@ -11024,9 +11024,9 @@ async def v49_timing_diagnostic():
 
         eligible = []
         for e in ranked:
-            if e.get("relative_momentum_z", -999) < V32_RELATIVE_Z_MIN:
+            if e.get("relative_momentum_z", -999) < 1.0:
                 continue
-            if e.get("cross_section_percentile", 0) < V32_CROSS_SECTION_MIN:
+            if e.get("cross_section_percentile", 0) < 0.80:
                 continue
             if e.get("behavior") != "CONTINUED_UP":
                 continue
