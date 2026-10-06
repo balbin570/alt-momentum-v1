@@ -12090,11 +12090,40 @@ async def v61_fast_stop_once(client):
 
     import time as _t
     t0 = _t.perf_counter()
-    syms = list(open_pos)
-    raw = await get_json(
-        client, "/api/v3/ticker/bookTicker",
-        params={"symbols": json.dumps(syms, separators=(",", ":"))},
-    )
+
+    # V61.1: Bir gecersiz/legacy sembol tum toplu bookTicker istegini 400'e
+    # dusurmesin. Ilk 400'de grubu ikiye bolerek sorunlu sembol(ler)i buluruz;
+    # bunlari sadece FAST monitor icin RAM'de atlariz. Ana scanner/state'e dokunulmaz.
+    if "invalid_quote_symbols" not in V61_FAST:
+        V61_FAST["invalid_quote_symbols"] = []
+
+    invalid = set(V61_FAST.get("invalid_quote_symbols") or [])
+    syms = [sym for sym in open_pos if sym not in invalid]
+
+    async def _fetch_bookticker_resilient(symbols):
+        if not symbols:
+            return []
+        try:
+            return await get_json(
+                client, "/api/v3/ticker/bookTicker",
+                params={"symbols": json.dumps(symbols, separators=(",", ":"))},
+            )
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code != 400:
+                raise
+            if len(symbols) == 1:
+                bad = symbols[0]
+                invalid.add(bad)
+                return []
+            mid = len(symbols) // 2
+            left, right = await asyncio.gather(
+                _fetch_bookticker_resilient(symbols[:mid]),
+                _fetch_bookticker_resilient(symbols[mid:]),
+            )
+            return left + right
+
+    raw = await _fetch_bookticker_resilient(syms)
+    V61_FAST["invalid_quote_symbols"] = sorted(invalid)
     V61_FAST["last_quote_latency_ms"] = round((_t.perf_counter() - t0) * 1000, 1)
     quotes = {d["symbol"]: d for d in raw}
     now_ms = alt_now_ms()
@@ -12204,6 +12233,7 @@ async def v61_status():
         "entry_rules_changed": False,
         "risk_rules_changed": False,
         "fast_stop_monitor": {k: v for k, v in V61_FAST.items()},
+        "fast_stop_fix": "V61.1_RESILIENT_BOOKTICKER_BAD_SYMBOL_ISOLATION",
         "stop_rules": {
             "hard_stop_pct": V55_HARD_STOP_PCT,
             "trail_activate_pct": V55_TRAIL_ACTIVATE_PCT,
