@@ -14638,3 +14638,386 @@ async def v73_status():
       except Exception:pass
     return {**MODE_INFO,"status":"OK","panel":"V73.4_TRUE_RESUME_OOS_MIDZONE_VALIDATION","trading":False,"orders":False,
       "active_strategy_changed":False,"active_risk_changed":False,"study":V73_STUDY,"generated_utc":utc_now()}
+
+
+# ============================================================
+# V74 — PROSPECTIVE PAPER: FROZEN MID-REGIME HYPOTHESIS
+# User-requested prospective application of the latest hypothesis.
+# PAPER ONLY. No exchange orders. Active V61/V55/FAST_3S remains untouched.
+#
+# Frozen entry:
+#   V66 CONFIRM_10M: breakout 5m >= +0.50%, volume ratio >= 1.20,
+#   Top1 per breakout slot, then two completed 5m closes rising above breakout.
+# Frozen regime:
+#   BTC30 > 0, ALT breadth30 > 0,
+#   ALT breadth4h in [0.26294, 1.12931],
+#   BTC4h in [0.02413, 0.39814].
+# Execution: live ASK paper entry when detected; live BID paper exit at 120m.
+# No hard stop/trailing in V74: TIME120 is the frozen validation exit.
+# ============================================================
+V74_ALT_LO=0.26294; V74_ALT_HI=1.12931
+V74_BTC_LO=0.02413; V74_BTC_HI=0.39814
+V74_SCAN_SECONDS=60
+V74_STATE={"open":[],"closed":[],"seen":[],"last_scan":None,"errors":[]}
+V74_TASK=None
+
+def v74_db_init():
+    if not V21_DB_URL:return False
+    with v21_db_connect() as conn:
+      with conn.cursor() as cur:
+        cur.execute("""CREATE TABLE IF NOT EXISTS alt_v74_paper_state(
+          id INTEGER PRIMARY KEY, payload JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())""")
+      conn.commit()
+    return True
+
+def v74_save():
+    if not V21_DB_URL:return False
+    with v21_db_connect() as conn:
+      with conn.cursor() as cur:
+        cur.execute("""INSERT INTO alt_v74_paper_state(id,payload,updated_at) VALUES(1,%s::jsonb,NOW())
+          ON CONFLICT(id) DO UPDATE SET payload=EXCLUDED.payload,updated_at=NOW()""",
+          (json.dumps(V74_STATE,default=str),))
+      conn.commit()
+    return True
+
+def v74_load():
+    global V74_STATE
+    if not V21_DB_URL:return
+    v74_db_init()
+    with v21_db_connect() as conn:
+      with conn.cursor() as cur:
+        cur.execute("SELECT payload FROM alt_v74_paper_state WHERE id=1");r=cur.fetchone()
+    if r and isinstance(r[0],dict):V74_STATE=r[0]
+
+async def v74_candles(client,sym,limit=90):
+    raw=await get_json(client,"/api/v3/klines",params={"symbol":sym,"interval":"5m","limit":limit})
+    now=alt_now_ms();out=[]
+    for k in raw or []:
+      if int(k[6])>=now:continue
+      out.append({"open_time":int(k[0]),"open":float(k[1]),"high":float(k[2]),"low":float(k[3]),
+                  "close":float(k[4]),"volume":float(k[5]),"close_time":int(k[6])})
+    return out
+
+def v74_pct(a,b):
+    return ((b/a)-1)*100 if a else 0.0
+
+async def v74_scan_once():
+    scan_utc=utc_now()
+    try:
+      async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
+        uni=await build_universe(client)
+        syms=[u["symbol"] for u in uni if u["symbol"]!="BTCUSDT"][:40]
+        sem=asyncio.Semaphore(12)
+        async def one(sym):
+          async with sem:
+            try:return sym,await asyncio.wait_for(v74_candles(client,sym,90),25),None
+            except Exception as e:return sym,None,f"{type(e).__name__}: {e}"
+        vals=await asyncio.gather(*[one(x) for x in syms])
+        data={sym:c for sym,c,e in vals if c and len(c)>=55}
+        errs=[{"symbol":sym,"error":e} for sym,c,e in vals if e]
+        btc=await v74_candles(client,"BTCUSDT",90)
+        if len(btc)<55:raise RuntimeError("BTC candles insufficient")
+
+        # First close due TIME120 positions using live BID.
+        now=alt_now_ms();still=[]
+        for p in V74_STATE.get("open",[]):
+          if now < int(p["exit_due_ms"]):
+            still.append(p);continue
+          q=await live_quote(client,p["symbol"])
+          xp=float(q["bid"]) if q else None
+          if xp is None:
+            cc=data.get(p["symbol"],[])
+            xp=float(cc[-1]["close"]) if cc else float(p["entry_price"])
+          gross=v74_pct(float(p["entry_price"]),xp);net=gross-0.15
+          p.update(exit_price=xp,exit_utc=utc_now(),exit_reason="TIME120",
+                   gross_pct=round(gross,4),cost_pct=0.15,net_pct=round(net,4),status="CLOSED")
+          V74_STATE.setdefault("closed",[]).append(p)
+        V74_STATE["open"]=still
+        V74_STATE["closed"]=V74_STATE.get("closed",[])[-500:]
+
+        # Current market regime at the causal entry checkpoint.
+        b30=v74_pct(btc[-7]["close"],btc[-1]["close"])
+        b4=v74_pct(btc[-49]["close"],btc[-1]["close"])
+        a30=[v74_pct(c[-7]["close"],c[-1]["close"]) for c in data.values() if len(c)>=49]
+        a4=[v74_pct(c[-49]["close"],c[-1]["close"]) for c in data.values() if len(c)>=49]
+        br30=sum(a30)/len(a30) if a30 else -999
+        br4=sum(a4)/len(a4) if a4 else -999
+        regime=(b30>0 and br30>0 and V74_ALT_LO<=br4<=V74_ALT_HI and V74_BTC_LO<=b4<=V74_BTC_HI)
+
+        # V66 CONFIRM10 candidate. Breakout is 3 bars before current next-open checkpoint:
+        # breakout i, confirmation i+1 and i+2 are completed; entry is now/live.
+        candidates=[]
+        for sym,c in data.items():
+          if len(c)<25:continue
+          i=len(c)-3
+          bo=c[i];ch=v74_pct(bo["open"],bo["close"])
+          av=sum(x["volume"] for x in c[i-20:i])/20
+          vr=(bo["volume"]/av) if av>0 else 0
+          if ch<0.50 or vr<1.20:continue
+          if not(c[i+1]["close"]>bo["close"] and c[i+2]["close"]>c[i+1]["close"]):continue
+          candidates.append({"symbol":sym,"breakout_time":bo["open_time"],"breakout_change_pct":ch,
+                             "volume_ratio":vr,"breakout_close":bo["close"],
+                             "confirm2_close":c[i+2]["close"]})
+        # Frozen Top1 per slot: breakout change, then volume ratio.
+        candidates=sorted(candidates,key=lambda x:(x["breakout_change_pct"],x["volume_ratio"]),reverse=True)
+        accepted=None
+        if candidates and regime:
+          e=candidates[0];key=f'{e["symbol"]}:{e["breakout_time"]}'
+          seen=set(V74_STATE.get("seen",[]))
+          already=any(p["symbol"]==e["symbol"] for p in V74_STATE.get("open",[]))
+          if key not in seen and not already:
+            q=await live_quote(client,e["symbol"])
+            if q and q["spread_pct"]<=SPREAD_MAX_PCT:
+              ep=float(q["ask"]);entry_ms=alt_now_ms()
+              p={**e,"entry_price":ep,"entry_utc":utc_now(),"entry_ms":entry_ms,
+                 "exit_due_ms":entry_ms+120*60*1000,"status":"OPEN",
+                 "execution_version":"V74_LIVE_ASK_TIME120",
+                 "spread_pct":round(float(q["spread_pct"]),4),
+                 "btc30_pct":round(b30,4),"btc4h_pct":round(b4,4),
+                 "alt_breadth30_pct":round(br30,4),"alt_breadth4h_pct":round(br4,4)}
+              V74_STATE.setdefault("open",[]).append(p);accepted=p
+            seen.add(key);V74_STATE["seen"]=list(seen)[-1000:]
+
+        V74_STATE["last_scan"]={"utc":scan_utc,"symbols":len(data),"errors":len(errs),
+          "regime_pass":regime,"btc30_pct":round(b30,4),"btc4h_pct":round(b4,4),
+          "alt_breadth30_pct":round(br30,4),"alt_breadth4h_pct":round(br4,4),
+          "confirm10_candidates":len(candidates),"accepted":accepted["symbol"] if accepted else None}
+        V74_STATE["errors"]=errs[-20:]
+        v74_save()
+        return V74_STATE["last_scan"]
+    except Exception as e:
+      V74_STATE["last_scan"]={"utc":scan_utc,"error":f"{type(e).__name__}: {e}"}
+      try:v74_save()
+      except Exception:pass
+      return V74_STATE["last_scan"]
+
+async def v74_loop():
+    while True:
+      try:await v74_scan_once()
+      except Exception:pass
+      await asyncio.sleep(V74_SCAN_SECONDS)
+
+@app.on_event("startup")
+async def v74_startup():
+    global V74_TASK
+    try:v74_load()
+    except Exception:pass
+    if V74_TASK is None:V74_TASK=asyncio.create_task(v74_loop())
+
+@app.get("/v74-scan-now")
+async def v74_scan_now():
+    return {"status":"OK","paper_only":True,"scan":await v74_scan_once()}
+
+@app.get("/v74-status")
+async def v74_status():
+    cl=V74_STATE.get("closed",[])
+    vals=[float(x.get("net_pct",0)) for x in cl]
+    wins=[x for x in vals if x>0];loss=[x for x in vals if x<0]
+    pf=(sum(wins)/abs(sum(loss))) if loss else (None if not wins else 999.0)
+    return {**MODE_INFO,"status":"OK","panel":"V74_PROSPECTIVE_MIDREGIME",
+      "trading":False,"orders":False,"active_v61_changed":False,
+      "hypothesis":{"entry":"V66_CONFIRM_10M_TOP1","exit":"TIME120",
+        "regime":"BTC30>0 & ALT30>0 & frozen ALT4h MID & frozen BTC4h MID",
+        "alt4h_zone":[V74_ALT_LO,V74_ALT_HI],"btc4h_zone":[V74_BTC_LO,V74_BTC_HI]},
+      "last_scan":V74_STATE.get("last_scan"),"open_count":len(V74_STATE.get("open",[])),
+      "closed_count":len(cl),"performance":{"mean_net_pct":round(sum(vals)/len(vals),4) if vals else None,
+        "win_rate_pct":round(100*len(wins)/len(vals),2) if vals else None,
+        "profit_factor":round(pf,4) if pf is not None else None},
+      "open":V74_STATE.get("open",[])[-20:],"recent_closed":cl[-30:],
+      "generated_utc":utc_now()}
+
+
+# ============================================================
+# V75 — COMBINED VALIDATION PANEL
+# Runs alongside V74 prospective paper strategy.
+# Combines:
+# 1) independent older OOS,
+# 2) frozen "medium heat" hypothesis,
+# 3) chronological blocks,
+# 4) trade count / PF / bootstrap CI,
+# without changing V74/V61 execution.
+# ============================================================
+V75_STATE={"status":"IDLE","progress":{},"params":None,"result":None,"error":None,"started_utc":None,"finished_utc":None}
+V75_TASK=None
+V75_RUN_KEY="V75_COMBINED_FROZEN_MIDREGIME"
+
+def v75_db_init():
+    if not V21_DB_URL:return False
+    with v21_db_connect() as conn:
+      with conn.cursor() as cur:
+        cur.execute("""CREATE TABLE IF NOT EXISTS alt_v75_validation_state(
+          run_key TEXT PRIMARY KEY,payload JSONB NOT NULL,updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS alt_v75_symbol_cache(
+          run_key TEXT NOT NULL,symbol TEXT NOT NULL,payload JSONB NOT NULL,
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),PRIMARY KEY(run_key,symbol))""")
+      conn.commit()
+    return True
+
+def v75_save():
+    if not V21_DB_URL:return
+    with v21_db_connect() as conn:
+      with conn.cursor() as cur:
+        cur.execute("""INSERT INTO alt_v75_validation_state(run_key,payload,updated_at)
+          VALUES(%s,%s::jsonb,NOW()) ON CONFLICT(run_key) DO UPDATE
+          SET payload=EXCLUDED.payload,updated_at=NOW()""",(V75_RUN_KEY,json.dumps(V75_STATE,default=str)))
+      conn.commit()
+
+def v75_load():
+    if not V21_DB_URL:return None
+    v75_db_init()
+    with v21_db_connect() as conn:
+      with conn.cursor() as cur:
+        cur.execute("SELECT payload FROM alt_v75_validation_state WHERE run_key=%s",(V75_RUN_KEY,));r=cur.fetchone()
+    return r[0] if r else None
+
+def v75_cache_put(sym,payload):
+    with v21_db_connect() as conn:
+      with conn.cursor() as cur:
+        cur.execute("""INSERT INTO alt_v75_symbol_cache(run_key,symbol,payload,updated_at)
+          VALUES(%s,%s,%s::jsonb,NOW()) ON CONFLICT(run_key,symbol) DO UPDATE
+          SET payload=EXCLUDED.payload,updated_at=NOW()""",(V75_RUN_KEY,sym,json.dumps(payload,default=str)))
+      conn.commit()
+
+def v75_cache_get(sym):
+    with v21_db_connect() as conn:
+      with conn.cursor() as cur:
+        cur.execute("SELECT payload FROM alt_v75_symbol_cache WHERE run_key=%s AND symbol=%s",(V75_RUN_KEY,sym));r=cur.fetchone()
+    return r[0] if r else None
+
+def v75_cached():
+    with v21_db_connect() as conn:
+      with conn.cursor() as cur:
+        cur.execute("SELECT symbol FROM alt_v75_symbol_cache WHERE run_key=%s",(V75_RUN_KEY,));return {x[0] for x in cur.fetchall()}
+
+def v75_ci(vals,seed=7501,nboot=1200):
+    if not vals:return [None,None]
+    import random
+    rr=random.Random(seed);n=len(vals);means=[]
+    for _ in range(nboot):
+      means.append(sum(vals[rr.randrange(n)] for __ in range(n))/n)
+    means.sort()
+    return [round(means[int(.025*(nboot-1))],4),round(means[int(.975*(nboot-1))],4)]
+
+def v75_metrics(rows):
+    vals=[float(r["net"]) for r in rows];w=[x for x in vals if x>0];l=[x for x in vals if x<0]
+    pf=(sum(w)/abs(sum(l))) if l else (999.0 if w else None)
+    return {"n":len(vals),"mean_net_pct":round(sum(vals)/len(vals),4) if vals else None,
+      "median_net_pct":round(statistics.median(vals),4) if vals else None,
+      "win_rate_pct":round(100*len(w)/len(vals),2) if vals else None,
+      "profit_factor":round(pf,4) if pf is not None else None,
+      "mean_95ci":v75_ci(vals)}
+
+def v75_blocks(rows,n=4):
+    days=sorted(set(r["day"] for r in rows));out=[]
+    for bi in range(n):
+      a=(len(days)*bi)//n;b=(len(days)*(bi+1))//n;ds=set(days[a:b]);rr=[r for r in rows if r["day"] in ds]
+      out.append({"block":bi+1,"start_day":days[a] if a<len(days) else None,
+        "end_day":days[b-1] if b>a else None,**v75_metrics(rr)})
+    return out
+
+def v75_compute(store,btc,cost,entry_slip,cutoff_ms):
+    raw,base,altmid,mid=v73_compute(store,btc,cost,entry_slip,cutoff_ms)
+    return raw,base,mid
+
+async def v75_run(symbols,history_days,oos_days,entry_slip,cost):
+    global V75_STATE
+    old=None
+    try:old=v75_load()
+    except Exception:pass
+    started=(old or {}).get("started_utc") or utc_now()
+    V75_STATE={"status":"RUNNING","progress":{"stage":"universe","done":0,"total":symbols},
+      "params":{"symbols":symbols,"history_days":history_days,"oos_days":oos_days,
+        "entry_slip_pct":entry_slip,"cost_pct":cost},
+      "result":None,"error":None,"started_utc":started,"finished_utc":None}
+    try:v75_save()
+    except Exception:pass
+    try:
+      # Independent older window: exclude latest 40d discovery period.
+      # Persist cutoff so restarts cannot move the window.
+      meta=(old or {}).get("resume_meta") or {}
+      ci=meta.get("cutoff_utc")
+      cutoff=datetime.fromisoformat(ci) if ci else datetime.now(timezone.utc)-timedelta(days=40)
+      cutoff_ms=int(cutoff.timestamp()*1000)
+      start_ms=cutoff_ms-int((oos_days+3)*86400000)
+      V75_STATE["resume_meta"]={"cutoff_utc":cutoff.isoformat()};v75_save()
+
+      async with httpx.AsyncClient(timeout=httpx.Timeout(35.0)) as client:
+        uni=await build_universe(client);syms=[u["symbol"] for u in uni if u["symbol"]!="BTCUSDT"][:symbols]
+        done_set=v75_cached()
+        for idx,sym in enumerate(syms,1):
+          if sym not in done_set:
+            candles=None;err=None
+            for attempt in range(2):
+              try:
+                candles=await asyncio.wait_for(v73_fetch_window(client,sym,start_ms,cutoff_ms),timeout=70)
+                if candles and len(candles)>=500:break
+                err="insufficient"
+              except Exception as e:err=f"{type(e).__name__}: {e}"
+            v75_cache_put(sym,candles if candles and len(candles)>=500 else {"_failed":True,"error":err})
+          V75_STATE["progress"]={"stage":"fetch_alts","done":idx,"total":len(syms),"symbol":sym};v75_save()
+        btc=v75_cache_get("__BTCUSDT__")
+        if not isinstance(btc,list):
+          V75_STATE["progress"]={"stage":"fetch_btc","done":len(syms),"total":len(syms)};v75_save()
+          btc=await asyncio.wait_for(v73_fetch_window(client,"BTCUSDT",start_ms,cutoff_ms),timeout=90)
+          if not btc or len(btc)<500:raise RuntimeError("BTC OOS data insufficient")
+          v75_cache_put("__BTCUSDT__",btc)
+
+      V75_STATE["progress"]={"stage":"rebuild","done":0,"total":len(syms)};v75_save()
+      aa,cc,ee,store={},{},{},{};failed=[]
+      for idx,sym in enumerate(syms,1):
+        c=v75_cache_get(sym)
+        if not isinstance(c,list) or len(c)<500:
+          failed.append(sym);continue
+        si=len(store);await asyncio.to_thread(v61_extract_symbol,sym,si,c,aa,cc,ee,store)
+        store[si]["c"]=array("d",[x["close"] for x in c]);store[si]["v"]=array("d",[x.get("volume",0) for x in c])
+        if idx%5==0:
+          V75_STATE["progress"]={"stage":"rebuild","done":idx,"total":len(syms)};v75_save()
+
+      V75_STATE["progress"]={"stage":"validate","done":len(syms),"total":len(syms)};v75_save()
+      raw,base,mid=await asyncio.to_thread(v75_compute,store,btc,cost,entry_slip,cutoff_ms)
+      base_m=v75_metrics(base);mid_m=v75_metrics(mid)
+      retention=round(100*len(mid)/len(base),2) if base else None
+      V75_STATE.update(status="DONE",progress={"stage":"done","done":len(syms),"total":len(syms)},finished_utc=utc_now(),
+        result={"validation":"INDEPENDENT_OLDER_OOS_FROZEN_MIDREGIME",
+          "oos_end_utc":cutoff.isoformat(),"discovery_window_excluded_days":40,
+          "frozen_hypothesis":{"entry":"V66_CONFIRM_10M_TOP1","base":"BTC30>0 & ALT breadth30>0",
+            "alt4h_zone":[V73_ALT_LO,V73_ALT_HI],"btc4h_zone":[V73_BTC_LO,V73_BTC_HI],"exit":"TIME120"},
+          "raw_breakouts":raw,
+          "BASE_V70":{**base_m,"chronological_blocks":v75_blocks(base)},
+          "FROZEN_MIDREGIME":{**mid_m,"retention_pct":retention,"chronological_blocks":v75_blocks(mid)},
+          "comparison":{"trade_retention_pct":retention,
+            "pf_delta":round((mid_m["profit_factor"] or 0)-(base_m["profit_factor"] or 0),4)},
+          "data":{"symbols_used":len(store),"symbols_failed":failed},
+          "decision_guardrail":"Do not retune the frozen 4h cutpoints from this OOS result.",
+          "prospective_companion":"V74_PROSPECTIVE_MIDREGIME continues simultaneously.",
+          "active_strategy_changed":False,"trading":False,"orders":False})
+      v75_save()
+    except Exception as e:
+      V75_STATE.update(status="ERROR",error=f"{type(e).__name__}: {e}",finished_utc=utc_now())
+      try:v75_save()
+      except Exception:pass
+
+@app.get("/v75-start")
+async def v75_start(symbols:int=Query(40,ge=20,le=50),history_days:int=Query(100,ge=80,le=140),
+  oos_days:int=Query(60,ge=40,le=90),entry_slip_pct:float=Query(.10,ge=0,le=1),cost_pct:float=Query(.15,ge=0,le=1)):
+    global V75_TASK,V75_STATE
+    old=None
+    try:old=v75_load()
+    except Exception:pass
+    if old and old.get("status")=="DONE":
+      V75_STATE=old;return {"status":"DONE_ALREADY","paper_only":True,"progress":old.get("progress")}
+    if V75_TASK is not None and not V75_TASK.done():return {"status":"ALREADY_RUNNING","progress":V75_STATE.get("progress")}
+    V75_TASK=asyncio.create_task(v75_run(symbols,history_days,oos_days,entry_slip_pct,cost_pct))
+    return {"status":"STARTED_OR_RESUMED","paper_only":True,"study":"COMBINED_OLDER_OOS_MIDREGIME"}
+
+@app.get("/v75-status")
+async def v75_status():
+    global V75_STATE
+    if V75_STATE.get("status")=="IDLE":
+      try:
+        old=v75_load()
+        if old:V75_STATE=old
+      except Exception:pass
+    return {**MODE_INFO,"status":"OK","panel":"V75_COMBINED_OOS_MIDREGIME_VALIDATION",
+      "trading":False,"orders":False,"v74_prospective_continues":True,
+      "active_strategy_changed":False,"study":V75_STATE,"generated_utc":utc_now()}
