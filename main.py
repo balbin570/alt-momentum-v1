@@ -5985,6 +5985,9 @@ async def live_quote(client, symbol):
 # after its theoretical checkpoint.
 V43_EXECUTION_VERSION = "V43_LOW_LATENCY"
 V43_MAX_ENTRY_DELAY_SECONDS = 120
+V47_EXECUTION_VERSION = "V47_SEEN_KEY_FIX"
+V47_STARTED_UTC = utc_now()
+V47_SEEN_KEYS = {"V27": set(), "V32": set()}
 V43_STARTED_UTC = utc_now()
 
 async def apply_live_entry(client, pos, candle_open_price, hold_ms):
@@ -6007,7 +6010,7 @@ async def apply_live_entry(client, pos, candle_open_price, hold_ms):
     pos["spread_pct"] = round(q["spread_pct"], 4)
     pos["entry_delay_seconds"] = round((now_ms - int(pos["entry_open_time"])) / 1000.0)
     pos["entry_slippage_vs_candle_pct"] = round(pct_change(candle_open_price, q["ask"]), 4)
-    pos["execution_version"] = V43_EXECUTION_VERSION
+    pos["execution_version"] = V47_EXECUTION_VERSION
 
     if pos["entry_delay_seconds"] > V43_MAX_ENTRY_DELAY_SECONDS:
         return False, (
@@ -8481,8 +8484,8 @@ async def v32_scan_once():
             entry_funnel["fresh_last_10m"] += 1
 
             key = f'{e["symbol"]}:{e["entry_open_time"]}'
-            if key in V32_STATE["seen_signal_keys"]:
-                _v46_reject("rejected_seen_key", e, "key already processed")
+            if key in V47_SEEN_KEYS["V32"]:
+                _v46_reject("rejected_seen_key", e, "key already processed in V47")
                 continue
             if e["symbol"] in V32_STATE["open"]:
                 _v46_reject("rejected_symbol_already_open", e, "symbol already open")
@@ -8535,9 +8538,11 @@ async def v32_scan_once():
                     _v46_reject("rejected_other_entry_reason", e, reason_text, pos)
                 alt_log_skip(V32_STATE, pos, skip_reason)
                 V32_STATE["seen_signal_keys"].add(key)
+                V47_SEEN_KEYS["V32"].add(key)
                 continue
 
             V32_STATE["seen_signal_keys"].add(key)
+            V47_SEEN_KEYS["V32"].add(key)
             V32_STATE["open"][e["symbol"]] = pos
             new_entries.append(pos)
             entry_funnel["accepted_entries"] += 1
@@ -10890,5 +10895,33 @@ async def v46_status():
         "spread_max_pct": SPREAD_MAX_PCT,
         "diagnostic_location": "/v32-scan-now -> entry_funnel_v46",
         "note": "V46 adds counters only; V27/V32 strategy decisions are unchanged.",
+        "generated_utc": utc_now(),
+    }
+
+
+@app.get("/v47-status")
+async def v47_status():
+    return {
+        **MODE_INFO,
+        "status": "OK",
+        "panel": "V47_SEEN_KEY_FIX",
+        "research_only": True,
+        "trading": False,
+        "orders": False,
+        "strategy_thresholds_changed": False,
+        "late_entry_guard_seconds": V43_MAX_ENTRY_DELAY_SECONDS,
+        "spread_max_pct": SPREAD_MAX_PCT,
+        "v47_started_utc": V47_STARTED_UTC,
+        "v47_seen_counts": {
+            "v27": len(V47_SEEN_KEYS["V27"]),
+            "v32": len(V47_SEEN_KEYS["V32"]),
+        },
+        "legacy_seen_keys_preserved": True,
+        "note": (
+            "V32 duplicate prevention uses a clean V47 seen namespace so legacy "
+            "pre-V47 seen keys cannot block fresh V47 entry attempts. A V47 key "
+            "is consumed only after a terminal live-entry decision. Strategy "
+            "thresholds and the <=120s guard are unchanged."
+        ),
         "generated_utc": utc_now(),
     }
