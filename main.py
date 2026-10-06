@@ -4250,6 +4250,7 @@ def relative_candidates_v13(candles, symbol):
             "symbol": symbol,
             "signal_time_ms": candles[i]["close_time"],
             "entry_open_time": candles[entry_idx]["open_time"],
+            "actionable_time_ms": candles[entry_idx]["close_time"] + 1,
             "momentum_30m_pct": mom30,
             "relative_momentum_z": z,
             "outcomes": outcomes,
@@ -6009,9 +6010,16 @@ async def apply_live_entry(client, pos, candle_open_price, hold_ms):
     pos["live_bid"] = q["bid"]
     pos["live_ask"] = q["ask"]
     pos["spread_pct"] = round(q["spread_pct"], 4)
-    pos["entry_delay_seconds"] = round((now_ms - int(pos["entry_open_time"])) / 1000.0)
+    delay_reference_ms = int(pos.get("actionable_time_ms") or pos["entry_open_time"])
+    pos["delay_reference_ms"] = delay_reference_ms
+    pos["delay_reference"] = (
+        "ACTIONABLE_AFTER_COMPLETED_WINDOW"
+        if pos.get("actionable_time_ms")
+        else "LEGACY_ENTRY_OPEN_TIME"
+    )
+    pos["entry_delay_seconds"] = round((now_ms - delay_reference_ms) / 1000.0)
     pos["entry_slippage_vs_candle_pct"] = round(pct_change(candle_open_price, q["ask"]), 4)
-    pos["execution_version"] = V47_EXECUTION_VERSION
+    pos["execution_version"] = "V50_ACTIONABLE_TIME"
 
     if pos["entry_delay_seconds"] > V43_MAX_ENTRY_DELAY_SECONDS:
         return False, (
@@ -11133,5 +11141,24 @@ async def v49_timing_diagnostic():
             "is positioned relative to the original signal timestamp."
         ),
         "started_utc": started_utc,
+        "generated_utc": utc_now(),
+    }
+
+
+@app.get("/v50-status")
+async def v50_status():
+    return {
+        **MODE_INFO,
+        "status": "OK",
+        "panel": "V50_ACTIONABLE_TIME_FIX",
+        "research_only": True,
+        "trading": False,
+        "orders": False,
+        "strategy_thresholds_changed": False,
+        "late_entry_guard_seconds": V43_MAX_ENTRY_DELAY_SECONDS,
+        "spread_max_pct": SPREAD_MAX_PCT,
+        "historical_entry_open_time_preserved": True,
+        "delay_reference": "actionable_time_ms = observation checkpoint candle close_time + 1ms",
+        "note": "Completed-candle forward timing correction only; frozen strategy thresholds unchanged.",
         "generated_utc": utc_now(),
     }
