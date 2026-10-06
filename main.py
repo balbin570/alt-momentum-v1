@@ -13438,3 +13438,239 @@ async def v63_validation_status():
         "trading":False,"orders":False,"active_strategy_changed":False,
         "active_risk_changed":False,"v61_fast_3s_changed":False,
         "study":V63_STUDY,"generated_utc":utc_now()}
+
+
+# ============================================================
+# V64 — WINNER vs LOSER DIAGNOSTIC (RESEARCH ONLY)
+# Frozen V62 pullback/reaccel entry + TIME120 control.
+# Descriptive diagnostics only: NO filter promotion / NO strategy change.
+# ============================================================
+V64_STUDY={"status":"IDLE","progress":{},"params":None,"result":None,"error":None,
+           "started_utc":None,"finished_utc":None}
+V64_TASK=None
+
+
+def v64_summary(vals):
+    a=[float(x) for x in vals if x is not None and math.isfinite(float(x))]
+    if not a:return {"n":0,"mean":None,"median":None}
+    return {"n":len(a),"mean":round(sum(a)/len(a),6),"median":round(statistics.median(a),6)}
+
+
+def v64_feature_row(candles, entry_i, signal_i, entry_px):
+    # All features use information available no later than entry open.
+    def pc(a,b): return ((b/a)-1.0)*100.0 if a else None
+    sig_close=candles[signal_i]['close']
+    eopen=candles[entry_i]['open']
+    # pullback/reaccel geometry from the completed bars preceding entry
+    prev=candles[entry_i-1]; prev2=candles[entry_i-2]
+    look=candles[max(0,entry_i-6):entry_i]
+    hi=max(x['high'] for x in look); lo=min(x['low'] for x in look)
+    vol_now=prev.get('volume',0.0)
+    vols=[x.get('volume',0.0) for x in candles[max(0,entry_i-21):entry_i-1]]
+    vavg=(sum(vols)/len(vols)) if vols else 0.0
+    ranges=[pc(x['low'],x['high']) for x in candles[max(0,entry_i-14):entry_i] if x['low']]
+    return {
+      'continuation_to_entry_pct':pc(sig_close,eopen),
+      'distance_from_30m_high_pct':pc(hi,eopen),
+      'range_position_30m':((eopen-lo)/(hi-lo)) if hi>lo else None,
+      'reaccel_body_pct':pc(prev['open'],prev['close']),
+      'reaccel_break_prev_high_pct':pc(prev2['high'],prev['close']),
+      'volume_ratio_20':(vol_now/vavg) if vavg>0 else None,
+      'mean_5m_range_pct_14':(sum(ranges)/len(ranges)) if ranges else None,
+    }
+
+
+def v64_compute(conf_by_slot,early_by_slot,alt_acc,store,candles_by_si,entry_slip,cost):
+    base=v61_build_entries(conf_by_slot,early_by_slot,alt_acc,store)
+    entries=v62_pullback_reaccel_entries(base['EARLY_TOP1_MAXZ'],store)
+    busy={}; rows=[]
+    cfg={"name":"TIME_ONLY_120m","stop":None,"act":None,"dist":None,"hold":120}
+    for t_ms,si,ei in entries:
+        if busy.get(si,0)>t_ms: continue
+        sim=v61_simulate(store[si]['o'],store[si]['h'],store[si]['l'],ei,cfg,entry_slip,entry_slip,0.0,cost)
+        if sim is None: continue
+        net,reason,xi=sim; busy[si]=store[si]['t'][min(xi,store[si]['n']-1)]
+        candles=candles_by_si[si]
+        # V62 frozen pullback entry is downstream of an EARLY source; use nearest causal
+        # reference 13 bars before entry for descriptive continuation geometry only.
+        sig_i=max(0,ei-13)
+        f=v64_feature_row(candles,ei,sig_i,store[si]['o'][ei])
+        f.update(net_pct=float(net),winner=bool(net>0),day=datetime.fromtimestamp(t_ms/1000,tz=timezone.utc).strftime('%Y-%m-%d'))
+        rows.append(f)
+    feats=['continuation_to_entry_pct','distance_from_30m_high_pct','range_position_30m','reaccel_body_pct',
+           'reaccel_break_prev_high_pct','volume_ratio_20','mean_5m_range_pct_14']
+    groups={}
+    for name,pred in [('WINNERS',lambda r:r['winner']),('LOSERS',lambda r:not r['winner'])]:
+        rr=[r for r in rows if pred(r)]
+        groups[name]={'n':len(rr),'mean_net_pct':round(sum(r['net_pct'] for r in rr)/len(rr),6) if rr else None,
+                      'features':{f:v64_summary([r.get(f) for r in rr]) for f in feats}}
+    comparison={}
+    for f in feats:
+        w=groups['WINNERS']['features'][f]['mean']; l=groups['LOSERS']['features'][f]['mean']
+        comparison[f]={'winner_mean':w,'loser_mean':l,'difference':round(w-l,6) if w is not None and l is not None else None}
+    # Temporal stability: same descriptive winner/loser feature means in first vs second half.
+    days=sorted(set(r['day'] for r in rows)); cut=days[len(days)//2] if days else None
+    temporal={}
+    for label,rr in [('FIRST_HALF',[r for r in rows if cut and r['day']<cut]),('SECOND_HALF',[r for r in rows if cut and r['day']>=cut])]:
+        temporal[label]={'n':len(rr),'win_rate_pct':round(100*sum(r['winner'] for r in rr)/len(rr),3) if rr else None,
+          'feature_differences':{f:(round((sum(r[f] for r in rr if r['winner'] and r.get(f) is not None)/max(1,sum(1 for r in rr if r['winner'] and r.get(f) is not None)))-(sum(r[f] for r in rr if (not r['winner']) and r.get(f) is not None)/max(1,sum(1 for r in rr if (not r['winner']) and r.get(f) is not None))),6)) for f in feats}}
+    return len(entries),len(rows),groups,comparison,temporal
+
+
+async def v64_run(n_symbols,days,entry_slip,cost):
+    V64_STUDY.update(status='RUNNING',params={'symbols':n_symbols,'days':days,'entry_slip_pct':entry_slip,'cost_pct':cost},
+        progress={'stage':'universe'},result=None,error=None,started_utc=utc_now(),finished_utc=None)
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
+            uni=await build_universe(client); syms=[u['symbol'] for u in uni if u['symbol']!='BTCUSDT'][:n_symbols]
+            sem=asyncio.Semaphore(6)
+            async def fetch(sym):
+                async with sem:
+                    try:return sym,await get_5m_candles_days(client,sym,days),None
+                    except Exception as exc:return sym,None,str(exc)
+            alt_acc,conf_by_slot,early_by_slot,store,candles_by_si={},{},{},{},{};errors=[];done=0
+            for start in range(0,len(syms),6):
+                batch=await asyncio.gather(*[fetch(x) for x in syms[start:start+6]])
+                for sym,candles,err in batch:
+                    done+=1;V64_STUDY['progress']={'stage':'fetch+features','done':done,'total':len(syms)}
+                    if err or not candles or len(candles)<400:errors.append({'symbol':sym,'error':err or 'insufficient data'});continue
+                    si=len(store);await asyncio.to_thread(v61_extract_symbol,sym,si,candles,alt_acc,conf_by_slot,early_by_slot,store)
+                    store[si]['c']=array('d',[c['close'] for c in candles]);candles_by_si[si]=candles
+        V64_STUDY['progress']={'stage':'diagnostic'}
+        n_sig,n_rows,groups,comp,temp=await asyncio.to_thread(v64_compute,conf_by_slot,early_by_slot,alt_acc,store,candles_by_si,entry_slip,cost)
+        V64_STUDY.update(status='DONE',progress={'stage':'done'},finished_utc=utc_now(),result={
+          'entry':'V62_FROZEN_PULLBACK_REACCEL_TOP1','exit':'TIME_ONLY_120m_CONTROL','signals_before_overlap':n_sig,
+          'analyzed_trades':n_rows,'winner_loser':groups,'feature_comparison':comp,'temporal_stability':temp,
+          'data':{'symbols_used':len(store),'symbols_failed':errors[:20]},
+          'guardrails':['Descriptive diagnostic only.','No feature threshold is promoted from this sample.',
+            'Any apparent separator must be frozen first and tested out-of-sample in V65.',
+            'Active V61/V55/FAST_3S strategy and risk are unchanged.']})
+    except Exception as exc:V64_STUDY.update(status='ERROR',error=f'{type(exc).__name__}: {exc}',finished_utc=utc_now())
+
+@app.get('/v64-diagnostic-start')
+async def v64_diagnostic_start(symbols:int=Query(30,ge=20,le=50),days:int=Query(30,ge=20,le=40),entry_slip_pct:float=Query(.10,ge=0,le=1),cost_pct:float=Query(.15,ge=0,le=1)):
+    global V64_TASK
+    if V64_TASK is not None and not V64_TASK.done():return {'status':'ALREADY_RUNNING','progress':V64_STUDY.get('progress')}
+    V64_TASK=asyncio.create_task(v64_run(symbols,days,entry_slip_pct,cost_pct))
+    return {'status':'STARTED','paper_only':True,'active_strategy_changed':False,'purpose':'winner_vs_loser_diagnostic'}
+
+@app.get('/v64-diagnostic-status')
+async def v64_diagnostic_status():
+    return {**MODE_INFO,'status':'OK','panel':'V64_WINNER_LOSER_DIAGNOSTIC','trading':False,'orders':False,
+      'read_only_research':True,'active_strategy_changed':False,'active_risk_changed':False,'v61_fast_3s_changed':False,
+      'study':V64_STUDY,'generated_utc':utc_now()}
+
+
+# ============================================================
+# V65 — COMBINED EARLY BREAKOUT CHALLENGER (PAPER/RESEARCH ONLY)
+# Adds: Binance server-time offset, immediate live ASK forward helper,
+# and a predeclared early breakout challenger (>=0.50% 5m + volume ratio >=1.20).
+# Existing V61/V55/FAST_3S control remains unchanged.
+# ============================================================
+V65_BREAKOUT_5M_PCT=0.50
+V65_VOLUME_RATIO_MIN=1.20
+V65_VOL_LOOKBACK=20
+V65_STUDY={"status":"IDLE","progress":{},"params":None,"result":None,"error":None,"started_utc":None,"finished_utc":None}
+V65_TASK=None
+V65_TIME_OFFSET_MS=0
+V65_TIME_SYNC_UTC=None
+
+async def get_binance_time_offset(client=None):
+    global V65_TIME_OFFSET_MS,V65_TIME_SYNC_UTC
+    own=client is None
+    c=client or httpx.AsyncClient(timeout=10.0)
+    try:
+        t0=int(time.time()*1000); r=await c.get(f'{BINANCE_BASE}/api/v3/time'); t1=int(time.time()*1000)
+        r.raise_for_status(); server=int(r.json()['serverTime']); local_mid=(t0+t1)//2
+        V65_TIME_OFFSET_MS=server-local_mid;V65_TIME_SYNC_UTC=utc_now()
+        return V65_TIME_OFFSET_MS
+    finally:
+        if own: await c.aclose()
+
+async def get_realtime_ask_price(symbol,client=None):
+    own=client is None;c=client or httpx.AsyncClient(timeout=10.0)
+    try:
+        r=await c.get(f'{BINANCE_BASE}/api/v3/ticker/bookTicker',params={'symbol':symbol});r.raise_for_status()
+        j=r.json();return {'symbol':symbol,'ask':float(j['askPrice']),'bid':float(j['bidPrice']),
+          'server_adjusted_local_ms':int(time.time()*1000)+V65_TIME_OFFSET_MS,'offset_ms':V65_TIME_OFFSET_MS}
+    finally:
+        if own:await c.aclose()
+
+def v65_early_entries(store):
+    # Historical causal replica: trigger on first COMPLETED 5m candle satisfying
+    # >=0.50% close/open and volume >=1.20x previous-20 average; enter next open.
+    by_slot={}
+    for si,d in store.items():
+        o,h,l,c,v,t=d['o'],d['h'],d['l'],d['c'],d.get('v'),d['t']
+        if v is None:continue
+        for i in range(V65_VOL_LOOKBACK,len(o)-1):
+            ch=((c[i]/o[i])-1)*100 if o[i] else 0
+            av=sum(v[i-V65_VOL_LOOKBACK:i])/V65_VOL_LOOKBACK
+            vr=(v[i]/av) if av>0 else 0
+            if ch>=V65_BREAKOUT_5M_PCT and vr>=V65_VOLUME_RATIO_MIN:
+                by_slot.setdefault(t[i],[]).append((ch,vr,si,i+1))
+    out=[]
+    for slot,a in by_slot.items():
+        # Top1 earliest-breakout challenger; rank by 5m change, then volume ratio.
+        ch,vr,si,ei=max(a,key=lambda x:(x[0],x[1]))
+        out.append((slot,si,ei))
+    return sorted(out)
+
+def v65_compare(entries,store,entry_slip,cost):
+    cfg={'name':'TIME_ONLY_120m','stop':None,'act':None,'dist':None,'hold':120};busy={};tr=[];rng=random.Random(65)
+    for tm,si,ei in entries:
+        if busy.get(si,0)>tm:continue
+        sim=v61_simulate(store[si]['o'],store[si]['h'],store[si]['l'],ei,cfg,entry_slip,entry_slip,0.0,cost)
+        if sim is None:continue
+        net,reason,xi=sim;busy[si]=store[si]['t'][min(xi,store[si]['n']-1)]
+        day=datetime.fromtimestamp(tm/1000,tz=timezone.utc).strftime('%Y-%m-%d');tr.append((net,day,reason))
+    return v61_stats(tr,rng)
+
+async def v65_run(n_symbols,days,entry_slip,cost):
+    V65_STUDY.update(status='RUNNING',progress={'stage':'time_sync'},params={'symbols':n_symbols,'days':days,'entry_slip_pct':entry_slip,'cost_pct':cost},result=None,error=None,started_utc=utc_now(),finished_utc=None)
+    try:
+      async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
+        off=await get_binance_time_offset(client);uni=await build_universe(client);syms=[u['symbol'] for u in uni if u['symbol']!='BTCUSDT'][:n_symbols]
+        sem=asyncio.Semaphore(6)
+        async def fetch(sym):
+          async with sem:
+            try:return sym,await get_5m_candles_days(client,sym,days),None
+            except Exception as e:return sym,None,str(e)
+        alt_acc,conf,early,store={},{},{},{};errs=[];done=0
+        for st in range(0,len(syms),6):
+          for sym,candles,err in await asyncio.gather(*[fetch(x) for x in syms[st:st+6]]):
+            done+=1;V65_STUDY['progress']={'stage':'fetch+features','done':done,'total':len(syms)}
+            if err or not candles or len(candles)<400:errs.append({'symbol':sym,'error':err or 'insufficient'});continue
+            si=len(store);await asyncio.to_thread(v61_extract_symbol,sym,si,candles,alt_acc,conf,early,store)
+            store[si]['c']=array('d',[x['close'] for x in candles]);store[si]['v']=array('d',[x.get('volume',0.0) for x in candles])
+      V65_STUDY['progress']={'stage':'compare'}
+      def calc():
+        base=v61_build_entries(conf,early,alt_acc,store)
+        pb=v62_pullback_reaccel_entries(base['EARLY_TOP1_MAXZ'],store);bo=v65_early_entries(store)
+        return len(pb),len(bo),v65_compare(pb,store,entry_slip,cost),v65_compare(bo,store,entry_slip,cost)
+      npb,nbo,spb,sbo=await asyncio.to_thread(calc)
+      V65_STUDY.update(status='DONE',progress={'stage':'done'},finished_utc=utc_now(),result={
+        'binance_time_sync':{'offset_ms':off,'synced_utc':V65_TIME_SYNC_UTC},
+        'forward_execution_design':'completed signal candle -> immediate live bookTicker ASK; no extra 5m wait in forward paper execution',
+        'comparison':{
+          'V62_PULLBACK_REACCEL_TIME120':{'raw_signals':npb,'stats':spb},
+          'V65_EARLY_BREAKOUT_TIME120':{'raw_signals':nbo,'rules':{'5m_change_min_pct':V65_BREAKOUT_5M_PCT,'volume_ratio_min':V65_VOLUME_RATIO_MIN,'volume_lookback_bars':V65_VOL_LOOKBACK,'selection':'Top1 per completed 5m slot by change then volume'},'stats':sbo}},
+        'data':{'symbols_used':len(store),'symbols_failed':errs[:20]},
+        'guardrails':['Paper/research only; no real orders.','Early breakout thresholds predeclared before result.','Historical test enters next bar open as causal proxy; forward paper design uses immediate live ASK after completed signal candle.','Active V61/V55/FAST_3S control unchanged.']})
+    except Exception as e:V65_STUDY.update(status='ERROR',error=f'{type(e).__name__}: {e}',finished_utc=utc_now())
+
+@app.get('/v65-combined-start')
+async def v65_combined_start(symbols:int=Query(30,ge=20,le=50),days:int=Query(30,ge=20,le=40),entry_slip_pct:float=Query(.10,ge=0,le=1),cost_pct:float=Query(.15,ge=0,le=1)):
+    global V65_TASK
+    if V65_TASK is not None and not V65_TASK.done():return {'status':'ALREADY_RUNNING','progress':V65_STUDY.get('progress')}
+    V65_TASK=asyncio.create_task(v65_run(symbols,days,entry_slip_pct,cost_pct))
+    return {'status':'STARTED','paper_only':True,'active_strategy_changed':False,'challenger':'EARLY_BREAKOUT_0.50_VOL1.20'}
+
+@app.get('/v65-combined-status')
+async def v65_combined_status():
+    return {**MODE_INFO,'status':'OK','panel':'V65_COMBINED_EARLY_BREAKOUT','trading':False,'orders':False,'active_strategy_changed':False,'active_risk_changed':False,'v61_fast_3s_changed':False,'study':V65_STUDY,'generated_utc':utc_now()}
+
+@app.get('/v65-time-sync')
+async def v65_time_sync():
+    try:off=await get_binance_time_offset();return {'status':'OK','offset_ms':off,'synced_utc':V65_TIME_SYNC_UTC}
+    except Exception as e:return {'status':'ERROR','error':str(e)}
