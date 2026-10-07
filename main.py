@@ -15279,8 +15279,12 @@ async def v77_run():
     global V77_STATE
     V77_STATE={"status":"RUNNING","progress":{"stage":"load_cache","done":0,"total":40},
       "result":None,"error":None,"started_utc":utc_now(),"finished_utc":None}
-    try:v77_save()
-    except Exception:pass
+    try:
+      v77_db_init()
+      v77_save()
+    except Exception as e:
+      V77_STATE.update(status="ERROR",error=f"V77 DB init failed: {type(e).__name__}: {e}",finished_utc=utc_now())
+      return
     try:
       v75=v75_load()
       cutoff_iso=(v75.get("resume_meta") or {}).get("cutoff_utc") if v75 else None
@@ -15340,6 +15344,7 @@ async def v77_start():
     global V77_TASK,V77_STATE
     if V77_TASK is not None and not V77_TASK.done():
       return {"status":"ALREADY_RUNNING","progress":V77_STATE.get("progress")}
+    v77_db_init()
     V77_TASK=asyncio.create_task(v77_run())
     return {"status":"STARTED","paper_only":True,"study":"BASE_V70_REGIME_SHIFT_DIAGNOSTIC"}
 
