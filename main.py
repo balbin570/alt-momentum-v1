@@ -17820,3 +17820,193 @@ async def v85_resume():
         if s and s.get("status")=="RUNNING":
             V85_TASK=asyncio.create_task(v85_run())
     except Exception:pass
+
+
+# ============================================================
+# V86 — FROZEN 4-FACTOR QUALITY SCORE VALIDATION
+# Discovery factors come ONLY from V85:
+#   disp30, alt30, btc30, breakout_change_pct
+# Thresholds are learned ONCE from older V84 winners (medians),
+# then frozen and evaluated on later V82.
+# Score 0..4 = number of frozen thresholds passed.
+# V82 is validation, not threshold tuning.
+# Telegram summary only; active V61/V74 entries remain unchanged.
+# ============================================================
+
+V86_TABLE="alt_v86_quality_state"
+V86_TASK=None
+V86_FACTORS=["disp30","alt30","btc30","breakout_change_pct"]
+
+def v86_db_init():
+    if not V21_DB_URL: raise RuntimeError("DATABASE_URL missing")
+    with v21_db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"""CREATE TABLE IF NOT EXISTS {V86_TABLE}(
+                id INTEGER PRIMARY KEY,payload JSONB NOT NULL,
+                updated_at TIMESTAMPTZ DEFAULT NOW())""")
+        conn.commit()
+
+def v86_save(p):
+    v86_db_init()
+    with v21_db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"""INSERT INTO {V86_TABLE}(id,payload,updated_at)
+                VALUES(1,%s::jsonb,NOW()) ON CONFLICT(id) DO UPDATE
+                SET payload=EXCLUDED.payload,updated_at=NOW()""",
+                (json.dumps(p,default=str),))
+        conn.commit()
+
+def v86_get():
+    try:
+        v86_db_init()
+        with v21_db_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT payload FROM {V86_TABLE} WHERE id=1")
+                r=cur.fetchone(); return r[0] if r else None
+    except Exception:return None
+
+def v86_thresholds_from_v84(rows):
+    winners=[r for r in rows if float(r["net"])>0]
+    if len(winners)<50:raise RuntimeError("Too few V84 winners")
+    out={}
+    for f in V86_FACTORS:
+        vals=sorted(float(r[f]) for r in winners if r.get(f) is not None)
+        if not vals:raise RuntimeError(f"Missing factor {f}")
+        out[f]=statistics.median(vals)
+    return out
+
+def v86_score_row(r,t):
+    return sum(1 for f in V86_FACTORS if r.get(f) is not None and float(r[f])>=float(t[f]))
+
+def v86_groups(rows,t):
+    scored=[]
+    for r in rows:
+        q=v86_score_row(r,t)
+        scored.append({**r,"v86_score":q})
+    exact={str(q):v85_perf([r for r in scored if r["v86_score"]==q]) for q in range(5)}
+    cumulative={f"{q}+":v85_perf([r for r in scored if r["v86_score"]>=q]) for q in range(5)}
+    return scored,exact,cumulative
+
+def v86_blocks(rows,t,n=4):
+    rows=sorted(rows,key=lambda r:int(r["entry_time_ms"]))
+    out=[]
+    for i in range(n):
+        p=rows[len(rows)*i//n:len(rows)*(i+1)//n]
+        scored,_,cum=v86_groups(p,t)
+        out.append({"block":i+1,"all":v85_perf(scored),
+                    "score_3plus":cum["3+"],"score_4":cum["4+"]})
+    return out
+
+def v86_label(score):
+    return "YUKSEK" if score>=3 else ("ORTA" if score==2 else "DUSUK")
+
+def v86_tg_text(res):
+    v=res["validation_v82"]
+    lines=[
+        "🧪 V86 4-FAKTOR KALİTE DOĞRULAMA",
+        "Paper/research only — sinyali engellemez",
+        "",
+        "Faktörler: disp30 + alt30 + btc30 + breakout",
+        f"V82 kontrol: n={v['all']['n']} PF={v['all']['pf']} ort={v['all']['mean']}%",
+        f"Skor ≥3: n={v['cumulative']['3+']['n']} PF={v['cumulative']['3+']['pf']} ort={v['cumulative']['3+']['mean']}%",
+        f"Skor 4/4: n={v['cumulative']['4+']['n']} PF={v['cumulative']['4+']['pf']} ort={v['cumulative']['4+']['mean']}%",
+        "",
+        f"Karar: {res['decision']}",
+        "V61/V74 değişmedi; gerçek emir yok."
+    ]
+    return "\n".join(lines)
+
+async def v86_run():
+    state={"status":"RUNNING","error":None,"result":None,"telegram":None,
+           "progress":{"stage":"load_v84_training","done":0,"total":3},
+           "started_utc":utc_now(),"finished_utc":None}
+    try:
+        await asyncio.to_thread(v86_save,state)
+        r84,_=await asyncio.to_thread(v85_load_window,"V84")
+        state["progress"]={"stage":"freeze_thresholds","done":1,"total":3};await asyncio.to_thread(v86_save,state)
+        thresholds=await asyncio.to_thread(v86_thresholds_from_v84,r84)
+
+        state["progress"]={"stage":"validate_v82","done":2,"total":3};await asyncio.to_thread(v86_save,state)
+        r82,_=await asyncio.to_thread(v85_load_window,"V82")
+        s84,e84,c84=v86_groups(r84,thresholds)
+        s82,e82,c82=v86_groups(r82,thresholds)
+
+        high=c82["3+"]
+        blocks=v86_blocks(r82,thresholds,4)
+        positive_blocks=sum(1 for b in blocks if b["score_3plus"]["pf"] is not None and
+                            b["score_3plus"]["pf"]>1 and
+                            b["score_3plus"]["mean"] is not None and b["score_3plus"]["mean"]>0)
+
+        # Predeclared validation gate. No retuning if it fails.
+        passed=bool(high["n"]>=50 and high["pf"] is not None and high["pf"]>1.10 and
+                    high["mean"] is not None and high["mean"]>0 and positive_blocks>=3)
+        decision="VALIDATED_FOR_TELEGRAM_QUALITY_LABEL" if passed else "FAIL_DO_NOT_RETUNE"
+
+        result={
+            "study":"V86_FROZEN_4_FACTOR_QUALITY_VALIDATION",
+            "method":{
+                "training_window":"V84_OLDER_90D",
+                "validation_window":"V82_LATER_60D",
+                "factors":V86_FACTORS,
+                "threshold_source":"MEDIAN_OF_V84_WINNERS_ONLY",
+                "thresholds":{k:round(v,6) for k,v in thresholds.items()},
+                "score":"0-4 count of factors >= frozen threshold",
+                "high_quality_definition":"score >= 3",
+                "validation_gate":"V82 n>=50, PF>1.10, mean>0, and >=3/4 chronological blocks PF>1 & mean>0",
+                "retuning_allowed":False},
+            "training_v84":{"all":v85_perf(s84),"exact":e84,"cumulative":c84},
+            "validation_v82":{"all":v85_perf(s82),"exact":e82,"cumulative":c82,
+                              "chronological_blocks":blocks,
+                              "positive_score3plus_blocks":positive_blocks},
+            "passed":passed,"decision":decision,
+            "telegram_behavior":"SUMMARY_NOW; LIVE ENTRY LABEL ONLY AFTER PASS",
+            "active_strategy_changed":False,
+            "guardrails":["V61/V74 unchanged","research/paper only","no real orders",
+                          "V82 validation thresholds are frozen before evaluation",
+                          "if FAIL, do not retune on V82"]}
+        state["result"]=result
+        try:state["telegram"]=await v22_telegram_send(v86_tg_text(result))
+        except Exception as te:state["telegram"]={"sent":False,"error":f"{type(te).__name__}: {te}"}
+        state.update(status="DONE",progress={"stage":"done","done":3,"total":3},
+                     finished_utc=utc_now())
+        await asyncio.to_thread(v86_save,state)
+    except Exception as e:
+        state.update(status="ERROR",error=f"{type(e).__name__}: {e}",finished_utc=utc_now())
+        try:await asyncio.to_thread(v86_save,state)
+        except Exception:pass
+
+@app.get("/v86-start")
+async def v86_start():
+    global V86_TASK
+    old=await asyncio.to_thread(v86_get)
+    if V86_TASK is not None and not V86_TASK.done():
+        return {"status":"ALREADY_RUNNING","paper_only":True}
+    if old and old.get("status")=="DONE":
+        return {"status":"ALREADY_DONE","use":"/v86-status","paper_only":True}
+    V86_TASK=asyncio.create_task(v86_run())
+    return {"status":"STARTED","study":"V86_FROZEN_4_FACTOR_QUALITY_VALIDATION",
+            "telegram_summary":True,"trading":False,"orders":False}
+
+@app.get("/v86-status")
+async def v86_status():
+    s=await asyncio.to_thread(v86_get)
+    return {**MODE_INFO,"status":"OK","panel":"V86_FROZEN_4_FACTOR_QUALITY_VALIDATION",
+            "trading":False,"orders":False,"active_strategy_changed":False,
+            "v61_unchanged":True,"v74_unchanged":True,"study":s,"generated_utc":utc_now()}
+
+@app.get("/v86-telegram")
+async def v86_telegram():
+    s=await asyncio.to_thread(v86_get)
+    if not s or s.get("status")!="DONE" or not s.get("result"):
+        return {"status":"NOT_READY"}
+    x=await v22_telegram_send(v86_tg_text(s["result"]))
+    return {"status":"OK","telegram":x,"trading":False,"orders":False}
+
+@app.on_event("startup")
+async def v86_resume():
+    global V86_TASK
+    try:
+        s=await asyncio.to_thread(v86_get)
+        if s and s.get("status")=="RUNNING":
+            V86_TASK=asyncio.create_task(v86_run())
+    except Exception:pass
