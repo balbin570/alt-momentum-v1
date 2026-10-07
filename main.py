@@ -15594,3 +15594,180 @@ async def v78_status():
     return {**MODE_INFO,"status":"OK","panel":"V78_REGIME_STRUCTURE_VALIDATION",
       "trading":False,"orders":False,"active_strategy_changed":False,
       "v74_prospective_unchanged":True,"study":V78_STATE,"generated_utc":utc_now()}
+
+
+# ============================================================
+# V79 â€” NEWER 40D DISPERSION VALIDATION
+# Independent newer window, frozen V66 CONFIRM10 + TIME120.
+# Tests V78 discovery hypothesis without retuning:
+# CONTROL vs HIGH dispersion using FROZEN V78 cutoff 0.69157.
+# Also reports rank-tertile HIGH as secondary descriptive robustness check.
+# Research only. V61/V74 unchanged. No orders.
+# ============================================================
+V79_STATE={"status":"IDLE","progress":{},"result":None,"error":None,"started_utc":None,"finished_utc":None}
+V79_TASK=None
+V79_RUN_KEY="V79_NEWER_40D_DISPERSION_VALIDATION"
+V79_FROZEN_DISP_CUT=0.69157
+
+def v79_db_init():
+    if not V21_DB_URL:return False
+    with v21_db_connect() as conn:
+      with conn.cursor() as cur:
+        cur.execute("""CREATE TABLE IF NOT EXISTS alt_v79_validation_state(
+          run_key TEXT PRIMARY KEY,payload JSONB NOT NULL,updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS alt_v79_symbol_cache(
+          run_key TEXT NOT NULL,symbol TEXT NOT NULL,payload JSONB NOT NULL,
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          PRIMARY KEY(run_key,symbol))""")
+      conn.commit()
+    return True
+
+def v79_save():
+    if not V21_DB_URL:return
+    v79_db_init()
+    with v21_db_connect() as conn:
+      with conn.cursor() as cur:
+        cur.execute("""INSERT INTO alt_v79_validation_state(run_key,payload,updated_at)
+          VALUES(%s,%s::jsonb,NOW()) ON CONFLICT(run_key) DO UPDATE
+          SET payload=EXCLUDED.payload,updated_at=NOW()""",(V79_RUN_KEY,json.dumps(V79_STATE,default=str)))
+      conn.commit()
+
+def v79_load():
+    if not V21_DB_URL:return None
+    v79_db_init()
+    with v21_db_connect() as conn:
+      with conn.cursor() as cur:
+        cur.execute("SELECT payload FROM alt_v79_validation_state WHERE run_key=%s",(V79_RUN_KEY,));r=cur.fetchone()
+    return r[0] if r else None
+
+def v79_cache_get(sym):
+    with v21_db_connect() as conn:
+      with conn.cursor() as cur:
+        cur.execute("SELECT payload FROM alt_v79_symbol_cache WHERE run_key=%s AND symbol=%s",(V79_RUN_KEY,sym));r=cur.fetchone()
+    return r[0] if r else None
+
+def v79_cache_put(sym,payload):
+    with v21_db_connect() as conn:
+      with conn.cursor() as cur:
+        cur.execute("""INSERT INTO alt_v79_symbol_cache(run_key,symbol,payload,updated_at)
+          VALUES(%s,%s,%s::jsonb,NOW()) ON CONFLICT(run_key,symbol) DO UPDATE
+          SET payload=EXCLUDED.payload,updated_at=NOW()""",(V79_RUN_KEY,sym,json.dumps(payload)))
+      conn.commit()
+
+async def v79_fetch_klines(sym,start_ms,end_ms):
+    # Durable exact-window fetch; 5m candles.
+    old=v79_cache_get(sym)
+    if isinstance(old,list) and len(old)>=500:return old
+    rows=[];cur=start_ms
+    async with httpx.AsyncClient(timeout=30) as client:
+      while cur<end_ms:
+        rr=await client.get(f"{BINANCE_BASE}/api/v3/klines",
+          params={"symbol":sym,"interval":"5m","startTime":cur,"endTime":end_ms,"limit":1000})
+        rr.raise_for_status();data=rr.json()
+        if not data:break
+        for x in data:
+          rows.append({"open_time":int(x[0]),"open":float(x[1]),"high":float(x[2]),
+            "low":float(x[3]),"close":float(x[4]),"volume":float(x[5])})
+        nxt=int(data[-1][0])+300000
+        if nxt<=cur:break
+        cur=nxt
+        await asyncio.sleep(.04)
+    # dedupe
+    rows=list({int(x["open_time"]):x for x in rows}.values());rows.sort(key=lambda x:x["open_time"])
+    if rows:v79_cache_put(sym,rows)
+    return rows
+
+def v79_eval(rows):
+    control={**v78_metrics(rows),"chronological_blocks":v78_blocks(rows)}
+    frozen=[r for r in rows if r.get("disp30") is not None and r["disp30"]>V79_FROZEN_DISP_CUT]
+    frozen_out={**v78_metrics(frozen),"chronological_blocks":v78_blocks(frozen)}
+    vals=sorted(r["disp30"] for r in rows if r.get("disp30") is not None)
+    q67=vals[int(2*(len(vals)-1)/3)] if vals else None
+    rank=[r for r in rows if q67 is not None and r.get("disp30") is not None and r["disp30"]>q67]
+    rank_out={**v78_metrics(rank),"chronological_blocks":v78_blocks(rank)}
+    return {"CONTROL_BASE_V70":control,
+      "FROZEN_HIGH_DISP_GT_0_69157":frozen_out,
+      "SECONDARY_RANK_HIGH_TERTILE":{**rank_out,"new_window_q67_descriptive":round(q67,5) if q67 is not None else None},
+      "comparison":{"frozen_retention_pct":round(100*len(frozen)/len(rows),2) if rows else None,
+        "frozen_pf_delta":round((frozen_out["profit_factor"] or 0)-(control["profit_factor"] or 0),4) if rows else None}}
+
+async def v79_run(symbols=40,days=40):
+    global V79_STATE
+    V79_STATE={"status":"RUNNING","progress":{"stage":"prepare","done":0,"total":symbols},
+      "result":None,"error":None,"started_utc":utc_now(),"finished_utc":None}
+    try:v79_save()
+    except Exception:pass
+    try:
+      # Freeze current completed-candle end at start; 40d window with 2d warmup.
+      now_ms=(int(time.time()*1000)//300000)*300000
+      start_ms=now_ms-(days+2)*86400000
+      # Use current cleaned top-volume universe, then freeze it for this run.
+      uni=await v22_get_universe()
+      syms=list(uni[:symbols])
+      if not syms:raise RuntimeError("No symbols from current cleaned universe")
+      fetch_syms=list(dict.fromkeys(syms+["BTCUSDT"]))
+      raw={};failed=[]
+      for idx,sym in enumerate(fetch_syms,1):
+        try:
+          x=await v79_fetch_klines(sym,start_ms,now_ms)
+          if len(x)>=500:raw[sym]=x
+          else:failed.append(sym)
+        except Exception:
+          failed.append(sym)
+        V79_STATE["progress"]={"stage":"fetch_newer_40d","done":min(idx,symbols),"total":symbols}
+        if idx%4==0:v79_save()
+      if "BTCUSDT" not in raw:raise RuntimeError("BTCUSDT newer-window data unavailable")
+      # compact only selected alts; BTC separate
+      store={};used=[]
+      for sym in syms:
+        if sym in raw:
+          store[len(store)]=v76_compact(raw[sym]);used.append(sym)
+      btc=raw["BTCUSDT"]
+      raw=None
+      V79_STATE["progress"]={"stage":"frozen_evaluation","done":len(used),"total":symbols};v79_save()
+      rows=await asyncio.to_thread(v78_recreate,store,btc,.15,.10)
+      # enforce requested 40d, excluding 2d warmup from reported trades
+      report_start=now_ms-days*86400000
+      rows=[r for r in rows if int(r["entry_time_ms"])>=report_start and int(r["entry_time_ms"])<now_ms]
+      ev=await asyncio.to_thread(v79_eval,rows)
+      V79_STATE.update(status="DONE",progress={"stage":"done","done":len(used),"total":symbols},finished_utc=utc_now(),
+        result={"validation":"INDEPENDENT_NEWER_40D_FROZEN_DISPERSION",
+          "window":{"start_utc":datetime.fromtimestamp(report_start/1000,timezone.utc).isoformat(),
+                    "end_utc":datetime.fromtimestamp(now_ms/1000,timezone.utc).isoformat(),"days":days},
+          "frozen_hypothesis":{"entry":"V66_CONFIRM_10M_TOP1","parent":"BTC30>0 AND ALT breadth30>0",
+            "exit":"TIME120","high_dispersion_rule":"ALT dispersion30 > 0.69157",
+            "cutpoint_source":"V78 older-OOS discovery; unchanged in V79"},
+          "results":ev,
+          "data":{"symbols_requested":symbols,"symbols_used":len(used),"symbols":used,"failed":failed,
+                  "source":"fresh Binance 5m historical fetch cached in PostgreSQL"},
+          "guardrails":["Primary dispersion threshold 0.69157 frozen before newer-window test.",
+            "No V79 threshold search or retuning.","Rank-high tertile is secondary descriptive robustness only.",
+            "Frozen V66 entry, BASE V70 parent cohort and TIME120 exit unchanged.",
+            "Every primary group reports N, mean, median, WR, PF, bootstrap 95% CI and four chronological blocks.",
+            "Current top-volume universe has survivorship-bias limitation.",
+            "V61/V74 execution unchanged.","Research/paper only; no orders."]})
+      v79_save()
+    except Exception as e:
+      V79_STATE.update(status="ERROR",error=f"{type(e).__name__}: {e}",finished_utc=utc_now())
+      try:v79_save()
+      except Exception:pass
+
+@app.get("/v79-start")
+async def v79_start(symbols:int=40,days:int=40):
+    global V79_TASK
+    if V79_TASK is not None and not V79_TASK.done():
+      return {"status":"ALREADY_RUNNING","progress":V79_STATE.get("progress")}
+    v79_db_init();V79_TASK=asyncio.create_task(v79_run(max(10,min(symbols,40)),max(20,min(days,40))))
+    return {"status":"STARTED","paper_only":True,"study":"V79_NEWER_40D_FROZEN_DISPERSION"}
+
+@app.get("/v79-status")
+async def v79_status():
+    global V79_STATE
+    if V79_STATE.get("status")=="IDLE":
+      try:
+        old=v79_load()
+        if old:V79_STATE=old
+      except Exception:pass
+    return {**MODE_INFO,"status":"OK","panel":"V79_NEWER_40D_DISPERSION_VALIDATION",
+      "trading":False,"orders":False,"active_strategy_changed":False,
+      "v74_prospective_unchanged":True,"study":V79_STATE,"generated_utc":utc_now()}
