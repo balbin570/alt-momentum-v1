@@ -15701,9 +15701,10 @@ async def v79_run(symbols=40,days=40):
       # Freeze current completed-candle end at start; 40d window with 2d warmup.
       now_ms=(int(time.time()*1000)//300000)*300000
       start_ms=now_ms-(days+2)*86400000
-      # Use current cleaned top-volume universe, then freeze it for this run.
-      uni=await v22_get_universe()
-      syms=list(uni[:symbols])
+      # Use the project's actual cleaned universe builder, then freeze top-volume symbols.
+      async with httpx.AsyncClient(timeout=30) as universe_client:
+        uni=await build_universe(universe_client)
+      syms=[x["symbol"] for x in uni[:symbols] if isinstance(x,dict) and x.get("symbol")]
       if not syms:raise RuntimeError("No symbols from current cleaned universe")
       fetch_syms=list(dict.fromkeys(syms+["BTCUSDT"]))
       raw={};failed=[]
