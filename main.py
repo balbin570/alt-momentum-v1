@@ -15230,60 +15230,44 @@ def v77_summary(rows):
       "median":v77_med([r.get(k) for r in rows])} for k in keys}}
 
 def v77_compute(store,btc,cost,entry_slip,cutoff_ms):
-    # Recreate frozen BASE V70 trades while retaining exact causal entry timestamp.
-    # This mirrors the existing frozen V66/V70 logic but keeps entry_time_ms for diagnostics.
-    btc_by_t={int(x["open_time"]):i for i,x in enumerate(btc)}
+    # Recreate frozen V66 CONFIRM_10M + BASE V70 while retaining exact entry timestamp.
+    # v66_candidates returns tuples: (breakout_time, symbol_index, breakout_index, change, volume_ratio).
+    import bisect
+    btc_times=[int(x["open_time"]) for x in btc]
     btc_c=array("d",[float(x["close"]) for x in btc])
-    # Candidate generator is the same frozen V66 helper already used by the research stack.
-    candidates=[]
-    for si,d in store.items():
-      try:
-        cc=v66_candidates(d,cost,entry_slip)
-      except TypeError:
-        cc=v66_candidates(d)
-      for r in cc:
-        rr=dict(r);rr["_si"]=si;candidates.append(rr)
+    cand=v66_candidates(store)
+    out=[];busy={}
+    for tm,si,i,ch,vr in cand:
+      d=store[si];o,c,t=d["o"],d["c"],d["t"]
+      breakout=float(c[i])
+      ei=i+3
+      if ei>=len(o) or i+2>=len(c):continue
+      if not(c[i+1]>breakout and c[i+2]>c[i+1]):continue
+      etm=int(t[ei])
+      if busy.get(si,0)>etm:continue
 
-    # Defensive discovery of timestamp/index fields from the V66 candidate object.
-    out=[]
-    for r in candidates:
-      si=r["_si"];d=store[si]
-      ts=r.get("entry_time") or r.get("entry_time_ms") or r.get("t") or r.get("time")
-      ei=r.get("entry_idx")
-      if ts is None and ei is not None and 0<=int(ei)<len(d["t"]):ts=int(d["t"][int(ei)])
-      if ts is None:continue
-      ts=int(ts)
-      if ts<10_000_000_000:ts*=1000
-      # nearest compact-array index
-      import bisect
-      j=bisect.bisect_right(d["t"],ts)-1
-      bi=bisect.bisect_right([int(x["open_time"]) for x in btc],ts)-1
-      if j<48 or bi<48:continue
+      # Frozen TIME120 exit, same-symbol busy window, 0.10% entry slip and 0.15% cost.
+      end=min(len(o)-1,ei+24)
+      ep=float(o[ei])*(1+entry_slip/100)
+      xp=float(o[end])
+      net=((xp/ep)-1)*100-cost
+      busy[si]=int(t[end])
 
-      # Frozen BASE V70 regime: BTC30 > 0 and ALT breadth30 > 0.
+      bi=bisect.bisect_right(btc_times,etm)-1
+      if bi<6:continue
       btc30=v77_ret(btc_c,bi,6)
       a30=[]
       for od in store.values():
-        k=bisect.bisect_right(od["t"],ts)-1
-        if k>=6:
-          x=v77_ret(od["c"],k,6)
+        j=bisect.bisect_right(od["t"],etm)-1
+        if j>=6:
+          x=v77_ret(od["c"],j,6)
           if x is not None:a30.append(x)
       br30=sum(a30)/len(a30) if a30 else None
+      # Frozen BASE V70 cohort.
       if btc30 is None or br30 is None or not(btc30>0 and br30>0):continue
-
-      # Net outcome: prefer frozen candidate's existing net; otherwise causal TIME120.
-      net=r.get("net")
-      if net is None:
-        entry=r.get("entry_price")
-        if entry is None and ei is not None and int(ei)<len(d["o"]):
-          entry=float(d["o"][int(ei)])*(1+entry_slip/100)
-        exit_i=(int(ei)+24) if ei is not None else (j+24)
-        if entry and exit_i<len(d["o"]):
-          xp=float(d["o"][exit_i])
-          net=((xp/float(entry))-1)*100-cost
-      if net is None:continue
-      out.append({"day":datetime.fromtimestamp(ts/1000,timezone.utc).date().isoformat(),
-                  "net":float(net),"entry_time_ms":ts})
+      out.append({"day":datetime.fromtimestamp(etm/1000,timezone.utc).strftime("%Y-%m-%d"),
+                  "net":float(net),"entry_time_ms":etm,
+                  "breakout_change_pct":float(ch),"volume_ratio":float(vr)})
     return out
 
 def v77_enrich(store,btc,base_rows):
