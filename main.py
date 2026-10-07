@@ -18095,3 +18095,152 @@ async def v87_status():
             "recent_tagged_open":tagged_open[-10:],
             "recent_tagged_closed":tagged_closed[-20:][::-1],
             "generated_utc":utc_now()}
+
+# ============================================================
+# V88 — CAUSAL AUDIT OF V86 QUALITY SCORE
+# Fixes market-context alignment: at entry OPEN, only candles with
+# open_time < entry_time are allowed. No active strategy/risk changes.
+# ============================================================
+V88_TABLE="alt_v88_causal_audit_state"
+V88_TASK=None
+
+def v88_db_init():
+    if not V21_DB_URL: raise RuntimeError("DATABASE_URL missing")
+    with v21_db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"""CREATE TABLE IF NOT EXISTS {V88_TABLE}(
+                id INTEGER PRIMARY KEY,payload JSONB NOT NULL,
+                updated_at TIMESTAMPTZ DEFAULT NOW())""")
+        conn.commit()
+
+def v88_save(p):
+    v88_db_init()
+    with v21_db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"""INSERT INTO {V88_TABLE}(id,payload,updated_at)
+                VALUES(1,%s::jsonb,NOW()) ON CONFLICT(id) DO UPDATE
+                SET payload=EXCLUDED.payload,updated_at=NOW()""",(json.dumps(p,default=str),))
+        conn.commit()
+
+def v88_get():
+    try:
+        v88_db_init()
+        with v21_db_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT payload FROM {V88_TABLE} WHERE id=1")
+                r=cur.fetchone(); return r[0] if r else None
+    except Exception:return None
+
+def v88_recreate_causal(store,btc,cost=.15,entry_slip=.10):
+    import bisect
+    btc_times=[int(x["open_time"]) for x in btc]
+    btc_c=array("d",[float(x["close"]) for x in btc])
+    cand=v66_candidates(store)
+    out=[];busy={}
+    for tm,si,i,ch,vr in cand:
+        d=store[si];o,c,t=d["o"],d["c"],d["t"]
+        if i+3>=len(o) or i+2>=len(c):continue
+        breakout=float(c[i]);ei=i+3
+        if not(c[i+1]>breakout and c[i+2]>c[i+1]):continue
+        etm=int(t[ei])
+        if busy.get(si,0)>etm:continue
+        end=min(len(o)-1,ei+24)
+        ep=float(o[ei])*(1+entry_slip/100);xp=float(o[end])
+        net=((xp/ep)-1)*100-cost
+        busy[si]=int(t[end])
+
+        # CAUSAL FIX: entry happens at candle OPEN etm. The candle whose
+        # open_time == etm is not completed yet, therefore it is excluded.
+        bi=bisect.bisect_left(btc_times,etm)-1
+        if bi<288:continue
+        btc30=v77_ret(btc_c,bi,6);btc4=v77_ret(btc_c,bi,48);btc24=v77_ret(btc_c,bi,288)
+        a30=[];a4=[];a24=[]
+        for od in store.values():
+            j=bisect.bisect_left(od["t"],etm)-1
+            if j<0:continue
+            for bars,bucket in ((6,a30),(48,a4),(288,a24)):
+                x=v77_ret(od["c"],j,bars)
+                if x is not None:bucket.append(x)
+        if not a30 or not a24:continue
+        alt30=sum(a30)/len(a30);alt4=sum(a4)/len(a4) if a4 else None;alt24=sum(a24)/len(a24)
+        if not(btc30>0 and alt30>0):continue
+        out.append({"day":datetime.fromtimestamp(etm/1000,timezone.utc).strftime("%Y-%m-%d"),
+          "entry_time_ms":etm,"net":float(net),"btc30":btc30,"btc4":btc4,"btc24":btc24,
+          "alt30":alt30,"alt4":alt4,"alt24":alt24,
+          "disp30":statistics.pstdev(a30) if len(a30)>1 else None,
+          "breakout_change_pct":float(ch),"volume_ratio":float(vr)})
+    return out
+
+def v88_load_window(which):
+    if which=="V82":
+        job=v82_job_get()
+        if not job or job.get("status")!="DONE":raise RuntimeError("V82 DONE required")
+        s=int(job["fetch_start_ms"]);e=int(job["end_ms"]);rs=int(job["report_start_ms"])
+        btc=v82_cache_get("BTCUSDT",s,e);getter=lambda sym:v82_cache_get(sym,s,e);syms=list(job["symbols"])
+    else:
+        job=v84_get()
+        if not job or job.get("status")!="DONE":raise RuntimeError("V84 DONE required")
+        w=job["window"];s=int(w["fetch_start_ms"]);e=int(w["report_end_ms"]);rs=int(w["report_start_ms"])
+        btc=v84_cache_get("BTCUSDT",s,e);getter=lambda sym:v84_cache_get(sym,s,e)
+        old82=v82_job_get();syms=list(old82["symbols"])
+    if not isinstance(btc,list):raise RuntimeError(f"{which} BTC cache missing")
+    store={};failed=[]
+    for sym in syms:
+        cc=getter(sym)
+        if isinstance(cc,list) and len(cc)>=500:store[len(store)]=v76_compact(cc)
+        else:failed.append(sym)
+    rows=v88_recreate_causal(store,btc,.15,.10)
+    rows=[r for r in rows if rs<=int(r["entry_time_ms"])<e]
+    rows.sort(key=lambda r:int(r["entry_time_ms"]))
+    return rows,failed
+
+def v88_summary(rows,t):
+    scored,exact,cum=v86_groups(rows,t)
+    blocks=v86_blocks(rows,t,4)
+    pos=sum(1 for b in blocks if b["score_3plus"]["pf"] is not None and b["score_3plus"]["pf"]>1 and b["score_3plus"]["mean"] is not None and b["score_3plus"]["mean"]>0)
+    return {"all":v85_perf(scored),"exact":exact,"cumulative":cum,"chronological_blocks":blocks,"positive_score3plus_blocks":pos}
+
+async def v88_run():
+    state={"status":"RUNNING","error":None,"result":None,"progress":{"stage":"causal_v84","done":0,"total":3},"started_utc":utc_now(),"finished_utc":None}
+    try:
+        await asyncio.to_thread(v88_save,state)
+        r84,f84=await asyncio.to_thread(v88_load_window,"V84")
+        state["progress"]={"stage":"freeze_causal_thresholds","done":1,"total":3};await asyncio.to_thread(v88_save,state)
+        thresholds=await asyncio.to_thread(v86_thresholds_from_v84,r84)
+        r82,f82=await asyncio.to_thread(v88_load_window,"V82")
+        state["progress"]={"stage":"causal_validation_v82","done":2,"total":3};await asyncio.to_thread(v88_save,state)
+        s84=v88_summary(r84,thresholds);s82=v88_summary(r82,thresholds)
+        high=s82["cumulative"]["3+"]
+        passed=bool(high["n"]>=50 and high["pf"] is not None and high["pf"]>1.10 and high["mean"] is not None and high["mean"]>0 and s82["positive_score3plus_blocks"]>=3)
+        result={
+          "study":"V88_CAUSAL_AUDIT_V86_4_FACTOR",
+          "lookahead_fix":"market context uses last COMPLETED 5m candle strictly before entry_open_time",
+          "breakout_factor":"V66 breakout candle is completed before two confirmation closes and is therefore known at entry",
+          "training":"V84 older 90d; thresholds = medians of causal V84 winners",
+          "validation":"V82 later 60d; thresholds frozen before evaluation",
+          "thresholds":{k:round(v,6) for k,v in thresholds.items()},
+          "training_v84":s84,"validation_v82":s82,
+          "passed":passed,
+          "decision":"CAUSAL_PASS_FORWARD_V66_SHADOW_ALLOWED" if passed else "CAUSAL_FAIL_RETIRE_V86_QUALITY_LABEL",
+          "failed_symbols":{"V84":f84,"V82":f82},
+          "active_strategy_changed":False,"entry_gate":False,"trading":False,"orders":False,
+          "v61_unchanged":True,"v74_unchanged":True,
+          "guardrails":["no V32 gating","no live orders","no threshold retuning on V82","current-universe survivorship bias remains"]}
+        state.update(status="DONE",result=result,progress={"stage":"done","done":3,"total":3},finished_utc=utc_now())
+        await asyncio.to_thread(v88_save,state)
+    except Exception as ex:
+        state.update(status="ERROR",error=f"{type(ex).__name__}: {ex}",finished_utc=utc_now())
+        try:await asyncio.to_thread(v88_save,state)
+        except Exception:pass
+
+@app.get("/v88-start")
+async def v88_start():
+    global V88_TASK
+    if V88_TASK is not None and not V88_TASK.done():return {"status":"ALREADY_RUNNING"}
+    V88_TASK=asyncio.create_task(v88_run())
+    return {**MODE_INFO,"status":"STARTED","study":"V88_CAUSAL_AUDIT_V86_4_FACTOR","trading":False,"orders":False}
+
+@app.get("/v88-status")
+async def v88_status():
+    s=await asyncio.to_thread(v88_get)
+    return {**MODE_INFO,"status":"OK","panel":"V88_CAUSAL_AUDIT_V86_4_FACTOR","trading":False,"orders":False,"entry_gate":False,"v61_unchanged":True,"v74_unchanged":True,"study":s,"generated_utc":utc_now()}
