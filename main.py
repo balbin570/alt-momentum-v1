@@ -16196,3 +16196,243 @@ async def v801_start():
 async def v801_status():
     return {**MODE_INFO,"status":"OK","panel":"V80.1_OUTCOME_X_REGIME_DIAGNOSTIC","trading":False,"orders":False,
       "active_strategy_changed":False,"v74_prospective_unchanged":True,"study":V801_STATE,"generated_utc":utc_now()}
+
+
+# ============================================================
+# V81 â€” COMPREHENSIVE REGIME RESEARCH ENGINE
+# One deploy / one start:
+# 1) reconstruct frozen V66 + BASE-V70 + TIME120 cohort
+# 2) attach regime context
+# 3) chronological DEV / VALIDATION / FINAL split
+# 4) derive thresholds from DEV only
+# 5) test predeclared regime candidates on VALIDATION
+# 6) carry qualifying candidates unchanged into FINAL
+# 7) N / mean / median / WR / PF / bootstrap CI / time blocks
+# 8) automatic REJECT / WATCH / PROSPECTIVE_PAPER_CANDIDATE
+#
+# IMPORTANT:
+# FINAL is untouched *within V81 selection logic*, but the underlying
+# 40-day window has been inspected in V79/V80, so it is NOT claimed
+# to be a globally pristine holdout.
+# No live strategy/execution changes. Research/paper only.
+# ============================================================
+
+V81_STATE={"status":"IDLE","progress":{},"result":None,"error":None}
+V81_TASK=None
+
+def v81_pct(vals,p):
+    a=sorted(float(x) for x in vals if x is not None and math.isfinite(float(x)))
+    if not a:return None
+    k=(len(a)-1)*p
+    lo=int(math.floor(k)); hi=int(math.ceil(k))
+    if lo==hi:return a[lo]
+    return a[lo]*(hi-k)+a[hi]*(k-lo)
+
+def v81_ci(vals, boots=1200):
+    a=[float(x) for x in vals if x is not None and math.isfinite(float(x))]
+    if len(a)<8:return [None,None]
+    rnd=random.Random(810081)
+    means=[]
+    n=len(a)
+    for _ in range(boots):
+        means.append(sum(a[rnd.randrange(n)] for __ in range(n))/n)
+    return [round(v81_pct(means,.025),4),round(v81_pct(means,.975),4)]
+
+def v81_metrics(rows):
+    ns=[float(r["net"]) for r in rows]
+    if not ns:
+        return {"n":0,"mean_net_pct":None,"median_net_pct":None,"win_rate_pct":None,
+                "profit_factor":None,"mean_95ci":[None,None]}
+    w=[x for x in ns if x>0]; l=[x for x in ns if x<=0]
+    gl=-sum(l)
+    return {"n":len(ns),
+      "mean_net_pct":round(statistics.mean(ns),4),
+      "median_net_pct":round(statistics.median(ns),4),
+      "win_rate_pct":round(100*len(w)/len(ns),2),
+      "profit_factor":round(sum(w)/gl,4) if gl>0 else None,
+      "mean_95ci":v81_ci(ns)}
+
+def v81_blocks(rows,nblocks=4):
+    if not rows:return []
+    z=max(1,len(rows)//nblocks); out=[]
+    for i in range(nblocks):
+        p=rows[i*z:(i+1)*z if i<nblocks-1 else len(rows)]
+        if not p:continue
+        out.append({"block":i+1,
+          "start_utc":datetime.fromtimestamp(p[0]["ts"]/1000,timezone.utc).isoformat(),
+          "end_utc":datetime.fromtimestamp(p[-1]["ts"]/1000,timezone.utc).isoformat(),
+          **v81_metrics(p)})
+    return out
+
+def v81_apply(rows,name,t):
+    def ok(r):
+        c=r["context"]
+        if name=="CONTROL": return True
+        if name=="DISP_HIGH": return c["alt_dispersion30"] is not None and c["alt_dispersion30"]>=t["disp"]
+        if name=="BTC_VOL_LOW": return c["btc_vol1h"] is not None and c["btc_vol1h"]<=t["btcvol"]
+        if name=="BTC4H_LOW": return c["btc4h"] is not None and c["btc4h"]<=t["btc4h"]
+        if name=="ALT24_HIGH": return c["alt24h"] is not None and c["alt24h"]>=t["alt24"]
+        if name=="DISP_HIGH_BTCVOL_LOW":
+            return (c["alt_dispersion30"] is not None and c["btc_vol1h"] is not None and
+                    c["alt_dispersion30"]>=t["disp"] and c["btc_vol1h"]<=t["btcvol"])
+        if name=="DISP_HIGH_BTC4H_LOW":
+            return (c["alt_dispersion30"] is not None and c["btc4h"] is not None and
+                    c["alt_dispersion30"]>=t["disp"] and c["btc4h"]<=t["btc4h"])
+        if name=="DISP_HIGH_ALT24_HIGH":
+            return (c["alt_dispersion30"] is not None and c["alt24h"] is not None and
+                    c["alt_dispersion30"]>=t["disp"] and c["alt24h"]>=t["alt24"])
+        if name=="CALM_BTC_SELECTIVE_ALTS":
+            return (c["alt_dispersion30"] is not None and c["btc_vol1h"] is not None and c["btc4h"] is not None and
+                    c["alt_dispersion30"]>=t["disp"] and c["btc_vol1h"]<=t["btcvol"] and c["btc4h"]<=t["btc4h"])
+        return False
+    return [r for r in rows if ok(r)]
+
+def v81_eval(rows,name,t):
+    x=v81_apply(rows,name,t)
+    return {**v81_metrics(x),"retention_pct":round(100*len(x)/len(rows),2) if rows else 0,
+            "chronological_blocks":v81_blocks(x)}
+
+def v81_label(val,final,control_final):
+    # Conservative automatic label; no threshold tuning here.
+    if val["n"]<25 or final["n"]<20:
+        return "REJECT_LOW_N"
+    vp=val.get("profit_factor"); fp=final.get("profit_factor"); cp=control_final.get("profit_factor")
+    vlo=val.get("mean_95ci",[None,None])[0]; flo=final.get("mean_95ci",[None,None])[0]
+    if vp is None or fp is None:return "REJECT"
+    if vp>1.15 and fp>1.15 and fp>(cp or 0) and final["mean_net_pct"]>0:
+        if (vlo is not None and vlo>0) and (flo is not None and flo>0):
+            return "PROSPECTIVE_PAPER_CANDIDATE"
+        return "WATCH"
+    return "REJECT"
+
+async def v81_run():
+    global V81_STATE
+    V81_STATE={"status":"RUNNING","progress":{"stage":"load_cache"},"result":None,"error":None,
+               "started_utc":utc_now(),"finished_utc":None}
+    try:
+        job=v794_job_get()
+        if not job or job.get("status")!="DONE":
+            raise RuntimeError("V79.4 DONE cache/result required")
+        syms=job["symbols"]; btc=v79_cache_get("BTCUSDT")
+        if not isinstance(btc,list): raise RuntimeError("BTC cache unavailable")
+        alts=[]; store={}; used=[]
+        for sym in syms:
+            x=v79_cache_get(sym)
+            if isinstance(x,list) and len(x)>=500:
+                alts.append(x); store[len(store)]=v76_compact(x); used.append(sym)
+
+        V81_STATE["progress"]={"stage":"recreate_frozen_cohort","symbols_used":len(used)}
+        rows=await asyncio.to_thread(v78_recreate,store,btc,.15,.10)
+        rs=int(job["report_start_ms"]); re=int(job["end_ms"])
+        rows=sorted([r for r in rows if rs<=int(r["entry_time_ms"])<re],
+                    key=lambda r:int(r["entry_time_ms"]))
+
+        enriched=[]; fields={}
+        for i,r in enumerate(rows):
+            net,f=v801_net(r)
+            if net is None: continue
+            fields[f]=fields.get(f,0)+1
+            enriched.append({"net":net,"ts":int(r["entry_time_ms"]),
+                             "context":v80_context_for_time(int(r["entry_time_ms"]),btc,alts)})
+            if (i+1)%50==0:
+                V81_STATE["progress"]={"stage":"attach_context","done":i+1,"total":len(rows)}
+                await asyncio.sleep(0)
+        if len(enriched)<90: raise RuntimeError("Too few valid outcomes")
+
+        # Strict chronological split: 50% DEV, 25% VALIDATION, 25% FINAL.
+        n=len(enriched); a=n//2; b=a+(n-a)//2
+        dev=enriched[:a]; val=enriched[a:b]; final=enriched[b:]
+
+        # Thresholds are learned ONCE from DEV medians only.
+        # No search over threshold grids.
+        t={
+          "disp":round(v81_pct([r["context"]["alt_dispersion30"] for r in dev],.50),5),
+          "btcvol":round(v81_pct([r["context"]["btc_vol1h"] for r in dev],.50),5),
+          "btc4h":round(v81_pct([r["context"]["btc4h"] for r in dev],.50),5),
+          "alt24":round(v81_pct([r["context"]["alt24h"] for r in dev],.50),5)
+        }
+        candidates=["CONTROL","DISP_HIGH","BTC_VOL_LOW","BTC4H_LOW","ALT24_HIGH",
+          "DISP_HIGH_BTCVOL_LOW","DISP_HIGH_BTC4H_LOW","DISP_HIGH_ALT24_HIGH",
+          "CALM_BTC_SELECTIVE_ALTS"]
+
+        dev_res={c:v81_eval(dev,c,t) for c in candidates}
+        val_res={c:v81_eval(val,c,t) for c in candidates}
+
+        # Predeclared qualification from validation only.
+        qualifiers=[]
+        for c in candidates:
+            if c=="CONTROL":continue
+            z=val_res[c]
+            if z["n"]>=25 and z["profit_factor"] is not None and z["profit_factor"]>1.05 and z["mean_net_pct"]>0:
+                qualifiers.append(c)
+
+        # FINAL is evaluated for reporting for all candidates, but classification
+        # is only meaningful for candidates that qualified before FINAL.
+        final_res={c:v81_eval(final,c,t) for c in candidates}
+        control_final=final_res["CONTROL"]
+        classification={}
+        for c in candidates:
+            if c=="CONTROL":
+                classification[c]="CONTROL"
+            elif c not in qualifiers:
+                classification[c]="REJECT_AT_VALIDATION"
+            else:
+                classification[c]=v81_label(val_res[c],final_res[c],control_final)
+
+        # Ranking is descriptive; FINAL is not used to retune thresholds.
+        ranking=sorted([c for c in candidates if c!="CONTROL"],
+          key=lambda c:(final_res[c]["profit_factor"] or -999, final_res[c]["n"]), reverse=True)
+
+        V81_STATE={"status":"DONE","progress":{"stage":"done","done":len(enriched),"total":len(enriched)},
+          "result":{
+            "study":"V81_COMPREHENSIVE_REGIME_RESEARCH_ENGINE",
+            "sample":{"trades":len(enriched),"symbols_used":len(used),"net_field_counts":fields,
+              "window_start":datetime.fromtimestamp(rs/1000,timezone.utc).isoformat(),
+              "window_end":datetime.fromtimestamp(re/1000,timezone.utc).isoformat()},
+            "frozen_strategy":{"entry":"V66_CONFIRM_10M_TOP1",
+              "parent":"BTC30>0 AND ALT breadth30>0","exit":"TIME120","cost_pct":0.15},
+            "split":{"method":"chronological_50_25_25","DEV_n":len(dev),"VALIDATION_n":len(val),"FINAL_n":len(final),
+              "warning":"FINAL is untouched within V81 selection logic, but this 40-day source window was previously inspected in V79/V80; it is not a globally pristine holdout."},
+            "dev_only_thresholds":t,
+            "candidate_definitions":{
+              "DISP_HIGH":"alt_dispersion30 >= DEV median",
+              "BTC_VOL_LOW":"btc_vol1h <= DEV median",
+              "BTC4H_LOW":"btc4h <= DEV median",
+              "ALT24_HIGH":"alt24h >= DEV median",
+              "DISP_HIGH_BTCVOL_LOW":"DISP_HIGH AND BTC_VOL_LOW",
+              "DISP_HIGH_BTC4H_LOW":"DISP_HIGH AND BTC4H_LOW",
+              "DISP_HIGH_ALT24_HIGH":"DISP_HIGH AND ALT24_HIGH",
+              "CALM_BTC_SELECTIVE_ALTS":"DISP_HIGH AND BTC_VOL_LOW AND BTC4H_LOW"},
+            "DEV":dev_res,"VALIDATION":val_res,"validation_qualifiers":qualifiers,
+            "FINAL":final_res,"classification":classification,
+            "descriptive_final_ranking":ranking,
+            "decision_rules":{
+              "validation_gate":"N>=25, PF>1.05, mean>0",
+              "candidate_watch":"qualified; FINAL N>=20, PF>1.15, PF>FINAL control, mean>0",
+              "prospective_candidate":"WATCH conditions plus positive lower 95% CI in both validation and FINAL"},
+            "guardrails":[
+              "No threshold grid search; thresholds come from DEV medians only.",
+              "VALIDATION decides which candidates may proceed.",
+              "FINAL does not alter thresholds.",
+              "Because V79/V80 already inspected this 40-day source window, FINAL is an internal holdout, not a globally untouched OOS.",
+              "No live strategy or execution changes.",
+              "V61/V74 unchanged.",
+              "Research/paper only; no orders."
+            ]},
+          "error":None,"started_utc":V81_STATE.get("started_utc"),"finished_utc":utc_now()}
+    except Exception as e:
+        V81_STATE.update(status="ERROR",error=f"{type(e).__name__}: {e}",finished_utc=utc_now())
+
+@app.get("/v81-start")
+async def v81_start():
+    global V81_TASK
+    if V81_TASK is not None and not V81_TASK.done():
+        return {"status":"ALREADY_RUNNING","progress":V81_STATE.get("progress")}
+    V81_TASK=asyncio.create_task(v81_run())
+    return {"status":"STARTED","paper_only":True,"study":"V81_COMPREHENSIVE_REGIME_RESEARCH_ENGINE"}
+
+@app.get("/v81-status")
+async def v81_status():
+    return {**MODE_INFO,"status":"OK","panel":"V81_COMPREHENSIVE_REGIME_RESEARCH_ENGINE",
+      "trading":False,"orders":False,"active_strategy_changed":False,
+      "v74_prospective_unchanged":True,"study":V81_STATE,"generated_utc":utc_now()}
