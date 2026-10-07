@@ -1,3 +1,4 @@
+
 from datetime import timedelta
 import bisect
 import statistics
@@ -17321,3 +17322,246 @@ async def v831_resume():
             V831_TASK=asyncio.create_task(v831_run())
     except Exception:
         pass
+
+
+# ============================================================
+# V84 â€” FROZEN 90D OLDER OOS EDGE-STATE VALIDATION
+# Research/paper only. V61/V74 unchanged.
+# Frozen V83.1 rule: previous 30 completed trades PF > 1.05 AND mean > 0.
+# Window: 90d ending exactly where V82 report window begins.
+# Extra 14d pre-window warmup supplies causal prior trades + indicators.
+# Separate PostgreSQL cache: DOES NOT overwrite V82 cache.
+# ============================================================
+
+V84_JOB_TABLE="alt_v84_job"
+V84_CACHE_TABLE="alt_v84_cache"
+V84_TASK=None
+V84_DAYS=90
+V84_WARMUP_DAYS=14
+V84_LOOKBACK=30
+V84_PF_GATE=1.05
+
+def v84_db_init():
+    if not V21_DB_URL: raise RuntimeError("DATABASE_URL missing")
+    with v21_db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"""CREATE TABLE IF NOT EXISTS {V84_JOB_TABLE}(
+                id INTEGER PRIMARY KEY,payload JSONB NOT NULL,updated_at TIMESTAMPTZ DEFAULT NOW())""")
+            cur.execute(f"""CREATE TABLE IF NOT EXISTS {V84_CACHE_TABLE}(
+                symbol TEXT PRIMARY KEY,start_ms BIGINT NOT NULL,end_ms BIGINT NOT NULL,
+                candles JSONB NOT NULL,updated_at TIMESTAMPTZ DEFAULT NOW())""")
+        conn.commit()
+
+def v84_save(p):
+    v84_db_init()
+    with v21_db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"""INSERT INTO {V84_JOB_TABLE}(id,payload,updated_at)
+                VALUES(1,%s::jsonb,NOW()) ON CONFLICT(id) DO UPDATE
+                SET payload=EXCLUDED.payload,updated_at=NOW()""",(json.dumps(p),))
+        conn.commit()
+
+def v84_get():
+    try:
+        v84_db_init()
+        with v21_db_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT payload FROM {V84_JOB_TABLE} WHERE id=1")
+                r=cur.fetchone(); return r[0] if r else None
+    except Exception:return None
+
+def v84_cache_get(sym,s,e):
+    try:
+        v84_db_init()
+        with v21_db_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(f"""SELECT candles FROM {V84_CACHE_TABLE}
+                    WHERE symbol=%s AND start_ms=%s AND end_ms=%s""",(sym,int(s),int(e)))
+                r=cur.fetchone();return r[0] if r else None
+    except Exception:return None
+
+def v84_cache_put(sym,s,e,c):
+    v84_db_init()
+    with v21_db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"""INSERT INTO {V84_CACHE_TABLE}
+                (symbol,start_ms,end_ms,candles,updated_at)
+                VALUES(%s,%s,%s,%s::jsonb,NOW())
+                ON CONFLICT(symbol) DO UPDATE SET start_ms=EXCLUDED.start_ms,
+                end_ms=EXCLUDED.end_ms,candles=EXCLUDED.candles,updated_at=NOW()""",
+                (sym,int(s),int(e),json.dumps(c)))
+        conn.commit()
+
+async def v84_fetch(sym,s,e):
+    c=await asyncio.to_thread(v84_cache_get,sym,s,e)
+    if isinstance(c,list) and len(c)>=500:return c,"CACHE"
+    rows=[];cur=int(s)
+    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0,connect=10.0)) as client:
+        while cur<int(e):
+            d=await get_json(client,"/api/v3/klines",params={
+                "symbol":sym,"interval":"5m","startTime":cur,"endTime":int(e),"limit":1000})
+            if not d:break
+            rows.extend({"open_time":int(x[0]),"open":float(x[1]),"high":float(x[2]),
+                         "low":float(x[3]),"close":float(x[4]),"volume":float(x[5])} for x in d)
+            nxt=int(d[-1][0])+300000
+            if nxt<=cur:break
+            cur=nxt;await asyncio.sleep(.04)
+    rows=list({x["open_time"]:x for x in rows}.values());rows.sort(key=lambda x:x["open_time"])
+    if len(rows)<500:raise RuntimeError(f"{sym}: insufficient candles ({len(rows)})")
+    await asyncio.to_thread(v84_cache_put,sym,s,e,rows)
+    return rows,"FETCH"
+
+def v84_sum(rows):
+    vals=[float(x["net"]) for x in rows]
+    if not vals:return {"n":0,"mean_net_pct":None,"median_net_pct":None,
+                        "win_rate_pct":None,"profit_factor":None}
+    pf=v83_pf(vals)
+    return {"n":len(vals),"mean_net_pct":round(statistics.mean(vals),4),
+            "median_net_pct":round(statistics.median(vals),4),
+            "win_rate_pct":round(100*sum(x>0 for x in vals)/len(vals),2),
+            "profit_factor":round(pf,4) if pf is not None else None}
+
+def v84_blocks(rows,n=4):
+    rows=sorted(rows,key=lambda x:x["ts"]);out=[]
+    for i in range(n):
+        p=rows[len(rows)*i//n:len(rows)*(i+1)//n]
+        if p:out.append({"block":i+1,**v84_sum(p)})
+    return out
+
+async def v84_run():
+    state={"status":"RUNNING","error":None,"result":None,
+           "progress":{"stage":"init","done":0,"total":0},
+           "started_utc":utc_now(),"finished_utc":None}
+    try:
+        await asyncio.to_thread(v84_save,state)
+
+        old82=await asyncio.to_thread(v82_job_get)
+        if not old82 or old82.get("status")!="DONE":
+            raise RuntimeError("V82 DONE result required")
+        symbols=list(old82["symbols"])
+
+        # Independent older report window.
+        report_end=int(old82["report_start_ms"])
+        report_start=report_end-V84_DAYS*86400000
+        fetch_start=report_start-V84_WARMUP_DAYS*86400000
+        fetch_end=report_end
+
+        state.update({"window":{
+            "report_start_ms":report_start,"report_end_ms":report_end,
+            "fetch_start_ms":fetch_start,"days":V84_DAYS,"warmup_days":V84_WARMUP_DAYS,
+            "non_overlap_with_v82":True}})
+        state["progress"]={"stage":"btc","done":0,"total":1}
+        await asyncio.to_thread(v84_save,state)
+
+        btc,src=await v84_fetch("BTCUSDT",fetch_start,fetch_end)
+        state["progress"]={"stage":"symbols","done":0,"total":len(symbols)}
+        state["failed_symbols"]={}
+        await asyncio.to_thread(v84_save,state)
+
+        store={};used=[]
+        for sym in symbols:
+            try:
+                c,_=await v84_fetch(sym,fetch_start,fetch_end)
+                store[len(store)]=v76_compact(c);used.append(sym)
+                del c
+            except Exception as e:
+                state["failed_symbols"][sym]=f"{type(e).__name__}: {e}"
+            state["progress"]["done"]+=1
+            await asyncio.to_thread(v84_save,state)
+            await asyncio.sleep(0)
+
+        state["progress"]={"stage":"recreate","done":0,"total":1}
+        await asyncio.to_thread(v84_save,state)
+        cohort=await asyncio.to_thread(v78_recreate,store,btc,0.15,0.10)
+        del store;del btc
+        cohort=sorted(cohort,key=lambda r:int(r["entry_time_ms"]))
+
+        # Build causal stream including pre-window trades.
+        stream=[]
+        for r in cohort:
+            ts=int(r["entry_time_ms"]);net,_=v801_net(r)
+            if net is not None and fetch_start<=ts<report_end:
+                stream.append({"ts":ts,"net":float(net)})
+        del cohort
+
+        evaluated=[]
+        for i in range(V84_LOOKBACK,len(stream)):
+            r=stream[i]
+            if r["ts"]<report_start:continue
+            hist=stream[i-V84_LOOKBACK:i]
+            vals=[x["net"] for x in hist]
+            pf=v83_pf(vals);mn=statistics.mean(vals)
+            evaluated.append({**r,"edge_on":bool(pf is not None and pf>V84_PF_GATE and mn>0),
+                              "prior30_pf":pf,"prior30_mean":mn})
+
+        if not evaluated:raise RuntimeError("No V84 evaluated trades")
+        on=[r for r in evaluated if r["edge_on"]];off=[r for r in evaluated if not r["edge_on"]]
+        A=v84_sum(evaluated);O=v84_sum(on);F=v84_sum(off)
+
+        result={
+            "study":"V84_FROZEN_90D_OLDER_OOS_EDGE_STATE",
+            "window":{"days":90,"warmup_days":14,
+                      "report_start_utc":datetime.fromtimestamp(report_start/1000,timezone.utc).isoformat(),
+                      "report_end_utc":datetime.fromtimestamp(report_end/1000,timezone.utc).isoformat(),
+                      "non_overlap_with_v82":True},
+            "symbols_requested":len(symbols),"symbols_used":len(used),
+            "failed_symbols":state["failed_symbols"],
+            "frozen_rule":{"lookback_trades":30,
+                "EDGE_ON":"previous 30 completed trades PF > 1.05 AND mean net > 0",
+                "retuned":False,"causal":True},
+            "results":{
+                "ALL":{**A,"chronological_blocks":v84_blocks(evaluated)},
+                "EDGE_ON":{**O,"retention_pct":round(100*len(on)/len(evaluated),2),
+                           "chronological_blocks":v84_blocks(on)},
+                "EDGE_OFF":{**F,"retention_pct":round(100*len(off)/len(evaluated),2),
+                            "chronological_blocks":v84_blocks(off)}},
+            "decision":{
+                "PASS":bool(O["n"]>=50 and O["profit_factor"] is not None and
+                    A["profit_factor"] is not None and O["profit_factor"]>A["profit_factor"] and
+                    O["mean_net_pct"] is not None and O["mean_net_pct"]>0 and
+                    F["profit_factor"] is not None and F["profit_factor"]<1.0),
+                "next_if_pass":"PROSPECTIVE_SHADOW_PAPER",
+                "next_if_fail":"DO_NOT_RETUNE_ON_V84"},
+            "guardrails":[
+                "Frozen V83.1 rule; no threshold changes.",
+                "Older 90d report window ends where V82 begins.",
+                "14d pre-window data is warmup only, not scored.",
+                "Separate V84 PostgreSQL cache; V82 cache untouched.",
+                "Current-universe survivorship bias remains.",
+                "V61/V74 unchanged; research/paper only; no orders."]}
+        state.update(status="DONE",result=result,
+            progress={"stage":"done","done":len(evaluated),"total":len(evaluated)},
+            finished_utc=utc_now())
+        await asyncio.to_thread(v84_save,state)
+    except Exception as e:
+        state.update(status="ERROR",error=f"{type(e).__name__}: {e}",finished_utc=utc_now())
+        try:await asyncio.to_thread(v84_save,state)
+        except Exception:pass
+
+@app.get("/v84-start")
+async def v84_start():
+    global V84_TASK
+    old=await asyncio.to_thread(v84_get)
+    if V84_TASK is not None and not V84_TASK.done():
+        return {"status":"ALREADY_RUNNING","paper_only":True}
+    if old and old.get("status")=="DONE":
+        return {"status":"ALREADY_DONE","use":"/v84-status","paper_only":True}
+    V84_TASK=asyncio.create_task(v84_run())
+    return {"status":"STARTED","study":"V84_FROZEN_90D_OLDER_OOS_EDGE_STATE",
+            "trading":False,"orders":False,"paper_only":True}
+
+@app.get("/v84-status")
+async def v84_status():
+    s=await asyncio.to_thread(v84_get)
+    return {**MODE_INFO,"status":"OK","panel":"V84_FROZEN_90D_OLDER_OOS_EDGE_STATE",
+            "trading":False,"orders":False,"active_strategy_changed":False,
+            "v61_unchanged":True,"v74_unchanged":True,"study":s,"generated_utc":utc_now()}
+
+@app.on_event("startup")
+async def v84_resume():
+    global V84_TASK
+    try:
+        s=await asyncio.to_thread(v84_get)
+        if s and s.get("status")=="RUNNING":
+            V84_TASK=asyncio.create_task(v84_run())
+    except Exception:pass
