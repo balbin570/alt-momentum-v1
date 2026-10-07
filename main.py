@@ -16440,25 +16440,25 @@ async def v81_status():
 
 
 # ============================================================
-# V82 â€” ONE-SHOT INDEPENDENT OOS + FINALIST REGIME VALIDATION
+# V82 — INDEPENDENT OOS FINALIST VALIDATION — FIXED
+# ============================================================
+# PURPOSE
+# - Independent older 60-day OOS validation.
+# - Frozen V81 finalists:
+#       BTC_VOL_LOW: btc_vol1h <= 0.09330
+#       ALT24_HIGH:  alt24h >= 1.54532
+# - Predeclared intersection:
+#       ALT24_HIGH AND BTC_VOL_LOW
 #
-# Purpose:
-# - Keep active V61/V74 untouched.
-# - Freeze the V81 finalists and thresholds:
-#     BTC_VOL_LOW: btc_vol1h <= 0.09330
-#     ALT24_HIGH:  alt24h >= 1.54532
-# - Add their intersection: ALT24_HIGH_AND_BTC_VOL_LOW.
-# - Test on an OLDER, non-overlapping 60-day window ending before
-#   the V79/V81 40-day source window began.
-# - Report CONTROL + finalists + intersection with N/mean/median/
-#   WR/PF/bootstrap CI + 4 chronological blocks.
-# - No threshold tuning, no grid search, no active-strategy change.
-#
-# Operational design:
-# - low-RAM sequential fetching
-# - persistent PostgreSQL candle cache
-# - restart-safe job checkpoint after every symbol
-# - startup auto-resume
+# IMPORTANT
+# - No threshold tuning.
+# - No grid search.
+# - Frozen V66 CONFIRM10 entry.
+# - Frozen BASE V70 parent cohort.
+# - Frozen TIME120 exit.
+# - Active V61/V74 unchanged.
+# - Research / paper only.
+# - No real orders.
 # ============================================================
 
 V82_TABLE = "alt_v82_job"
@@ -16467,388 +16467,24 @@ V82_TASK = None
 
 V82_BTCVOL_MAX = 0.09330
 V82_ALT24_MIN = 1.54532
+
 V82_DAYS = 60
 V82_SYMBOLS = 40
 
+
+# ============================================================
+# DATABASE
+# ============================================================
+
 def v82_db_init():
-    if not DATABASE_URL:
-        return
-    with psycopg.connect(DATABASE_URL, connect_timeout=8) as conn:
-        with conn.cursor() as cur:
-            cur.execute(f"""
-                CREATE TABLE IF NOT EXISTS {V82_TABLE} (
-                    id INTEGER PRIMARY KEY,
-                    payload JSONB NOT NULL,
-                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                )
-            """)
-            cur.execute(f"""
-                CREATE TABLE IF NOT EXISTS {V82_CACHE} (
-                    symbol TEXT PRIMARY KEY,
-                    start_ms BIGINT NOT NULL,
-                    end_ms BIGINT NOT NULL,
-                    candles JSONB NOT NULL,
-                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                )
-            """)
-        conn.commit()
 
-def v82_job_get():
-    if not DATABASE_URL:
-        return None
-    try:
-        with psycopg.connect(DATABASE_URL, connect_timeout=8) as conn:
-            with conn.cursor() as cur:
-                cur.execute(f"SELECT payload FROM {V82_TABLE} WHERE id=1")
-                row=cur.fetchone()
-                return row[0] if row else None
-    except Exception:
-        return None
-
-def v82_job_save(payload):
-    if not DATABASE_URL:
-        return
-    with psycopg.connect(DATABASE_URL, connect_timeout=8) as conn:
-        with conn.cursor() as cur:
-            cur.execute(f"""
-                INSERT INTO {V82_TABLE}(id,payload,updated_at)
-                VALUES(1,%s::jsonb,NOW())
-                ON CONFLICT(id) DO UPDATE SET payload=EXCLUDED.payload, updated_at=NOW()
-            """,(json.dumps(payload),))
-        conn.commit()
-
-def v82_cache_get(symbol,start_ms,end_ms):
-    if not DATABASE_URL:
-        return None
-    try:
-        with psycopg.connect(DATABASE_URL, connect_timeout=8) as conn:
-            with conn.cursor() as cur:
-                cur.execute(f"""
-                    SELECT candles FROM {V82_CACHE}
-                    WHERE symbol=%s AND start_ms=%s AND end_ms=%s
-                """,(symbol,int(start_ms),int(end_ms)))
-                row=cur.fetchone()
-                return row[0] if row else None
-    except Exception:
-        return None
-
-def v82_cache_put(symbol,start_ms,end_ms,candles):
-    if not DATABASE_URL:
-        return
-    with psycopg.connect(DATABASE_URL, connect_timeout=8) as conn:
-        with conn.cursor() as cur:
-            cur.execute(f"""
-                INSERT INTO {V82_CACHE}(symbol,start_ms,end_ms,candles,updated_at)
-                VALUES(%s,%s,%s,%s::jsonb,NOW())
-                ON CONFLICT(symbol) DO UPDATE SET
-                    start_ms=EXCLUDED.start_ms,
-                    end_ms=EXCLUDED.end_ms,
-                    candles=EXCLUDED.candles,
-                    updated_at=NOW()
-            """,(symbol,int(start_ms),int(end_ms),json.dumps(candles)))
-        conn.commit()
-
-def v82_metrics(rows):
-    vals=[float(r["net"]) for r in rows if r.get("net") is not None]
-    if not vals:
-        return {"n":0,"mean_net_pct":None,"median_net_pct":None,
-                "win_rate_pct":None,"profit_factor":None,"mean_95ci":[None,None]}
-    wins=[x for x in vals if x>0]; losses=[x for x in vals if x<=0]
-    gl=-sum(losses)
-    return {
-      "n":len(vals),
-      "mean_net_pct":round(statistics.mean(vals),4),
-      "median_net_pct":round(statistics.median(vals),4),
-      "win_rate_pct":round(100*len(wins)/len(vals),2),
-      "profit_factor":round(sum(wins)/gl,4) if gl>0 else None,
-      "mean_95ci":v81_ci(vals)
-    }
-
-def v82_blocks(rows,nblocks=4):
-    rows=sorted(rows,key=lambda x:x["ts"])
-    if not rows:return []
-    out=[]
-    for i in range(nblocks):
-        a=(len(rows)*i)//nblocks
-        b=(len(rows)*(i+1))//nblocks
-        p=rows[a:b]
-        if not p:continue
-        out.append({
-          "block":i+1,
-          "start_utc":datetime.fromtimestamp(p[0]["ts"]/1000,timezone.utc).isoformat(),
-          "end_utc":datetime.fromtimestamp(p[-1]["ts"]/1000,timezone.utc).isoformat(),
-          **v82_metrics(p)
-        })
-    return out
-
-def v82_group(rows,name):
-    def keep(r):
-        c=r["context"]
-        if name=="CONTROL": return True
-        if name=="BTC_VOL_LOW":
-            return c.get("btc_vol1h") is not None and c["btc_vol1h"]<=V82_BTCVOL_MAX
-        if name=="ALT24_HIGH":
-            return c.get("alt24h") is not None and c["alt24h"]>=V82_ALT24_MIN
-        if name=="ALT24_HIGH_AND_BTC_VOL_LOW":
-            return (c.get("btc_vol1h") is not None and c.get("alt24h") is not None and
-                    c["btc_vol1h"]<=V82_BTCVOL_MAX and c["alt24h"]>=V82_ALT24_MIN)
+    if not V21_DB_URL:
         return False
-    x=[r for r in rows if keep(r)]
-    return {
-      **v82_metrics(x),
-      "retention_pct":round(100*len(x)/len(rows),2) if rows else 0,
-      "chronological_blocks":v82_blocks(x)
-    }
 
-async def v82_fetch_symbol(symbol,start_ms,end_ms):
-    cached=await asyncio.to_thread(v82_cache_get,symbol,start_ms,end_ms)
-    if isinstance(cached,list) and len(cached)>=500:
-        return cached,"CACHE"
-    # Reuse the project's proven Binance historical downloader.
-    candles=await asyncio.wait_for(
-        asyncio.to_thread(v76_fetch_5m_range,symbol,start_ms,end_ms),
-        timeout=90
-    )
-    if not isinstance(candles,list) or len(candles)<500:
-        raise RuntimeError(f"{symbol}: insufficient candles")
-    await asyncio.to_thread(v82_cache_put,symbol,start_ms,end_ms,candles)
-    return candles,"FETCH"
+    with v21_db_connect() as conn:
 
-async def v82_run():
-    global V82_TASK
-    job=v82_job_get()
-    if not job:
-        raise RuntimeError("V82 job not initialized")
-
-    try:
-        job["status"]="RUNNING"; job["error"]=None
-        job["started_utc"]=job.get("started_utc") or utc_now()
-        v82_job_save(job)
-
-        start_ms=int(job["fetch_start_ms"]); end_ms=int(job["end_ms"])
-        syms=list(job["symbols"])
-
-        # BTC first
-        if not job.get("btc_done"):
-            btc,src=await v82_fetch_symbol("BTCUSDT",start_ms,end_ms)
-            job["btc_done"]=True; job["btc_source"]=src
-            job["progress"]={"stage":"btc_done","done":0,"total":len(syms)}
-            v82_job_save(job)
-        else:
-            btc=v82_cache_get("BTCUSDT",start_ms,end_ms)
-
-        done=set(job.get("done_symbols",[]))
-        failed=dict(job.get("failed_symbols",{}))
-
-        for idx,sym in enumerate(syms):
-            if sym in done:
-                continue
-            try:
-                _,src=await v82_fetch_symbol(sym,start_ms,end_ms)
-                done.add(sym)
-                failed.pop(sym,None)
-                job["last_symbol"]=sym
-                job["last_source"]=src
-            except Exception as e:
-                failed[sym]=f"{type(e).__name__}: {e}"
-            job["done_symbols"]=sorted(done)
-            job["failed_symbols"]=failed
-            job["progress"]={"stage":"fetch_symbols","done":len(done),"total":len(syms),
-                             "failed":len(failed),"last_symbol":sym}
-            v82_job_save(job)
-            await asyncio.sleep(0)
-
-        # Build compact store from successfully cached symbols.
-        store={}; alts=[]; used=[]
-        for sym in syms:
-            x=v82_cache_get(sym,start_ms,end_ms)
-            if isinstance(x,list) and len(x)>=500:
-                store[len(store)]=v76_compact(x)
-                alts.append(x); used.append(sym)
-
-        btc=v82_cache_get("BTCUSDT",start_ms,end_ms)
-        if not isinstance(btc,list):
-            raise RuntimeError("BTC cache unavailable after fetch")
-
-        job["progress"]={"stage":"recreate_frozen_cohort","done":len(used),"total":len(syms)}
-        v82_job_save(job)
-
-        # Same frozen V66 CONFIRM10 + BASE V70 reconstruction.
-        rows=await asyncio.to_thread(v78_recreate,store,btc,.15,.10)
-
-        report_start=int(job["report_start_ms"])
-        cohort=sorted(
-            [r for r in rows if report_start<=int(r["entry_time_ms"])<end_ms],
-            key=lambda r:int(r["entry_time_ms"])
-        )
-
-        enriched=[]
-        for i,r in enumerate(cohort):
-            net,_=v801_net(r)
-            if net is None: continue
-            ts=int(r["entry_time_ms"])
-            ctx=v80_context_for_time(ts,btc,alts)
-            enriched.append({"ts":ts,"net":float(net),"context":ctx})
-            if (i+1)%50==0:
-                job["progress"]={"stage":"attach_context","done":i+1,"total":len(cohort)}
-                v82_job_save(job)
-                await asyncio.sleep(0)
-
-        groups={}
-        for name in ["CONTROL","BTC_VOL_LOW","ALT24_HIGH","ALT24_HIGH_AND_BTC_VOL_LOW"]:
-            groups[name]=v82_group(enriched,name)
-
-        control=groups["CONTROL"]
-        decisions={}
-        for name,z in groups.items():
-            if name=="CONTROL":
-                decisions[name]="CONTROL"; continue
-            pf=z.get("profit_factor"); lo=z.get("mean_95ci",[None,None])[0]
-            if z["n"]<30:
-                decisions[name]="INSUFFICIENT_N"
-            elif pf is not None and pf>1.15 and z["mean_net_pct"]>0:
-                if lo is not None and lo>0:
-                    decisions[name]="INDEPENDENT_OOS_PASS"
-                else:
-                    decisions[name]="SUPPORTIVE_NOT_CONCLUSIVE"
-            else:
-                decisions[name]="FAIL"
-
-        result={
-          "study":"V82_INDEPENDENT_OOS_FINALIST_VALIDATION",
-          "window":{
-            "report_start":datetime.fromtimestamp(report_start/1000,timezone.utc).isoformat(),
-            "end":datetime.fromtimestamp(end_ms/1000,timezone.utc).isoformat(),
-            "days":V82_DAYS,
-            "non_overlap_with_v79_v81":True
-          },
-          "data":{"symbols_requested":len(syms),"symbols_used":len(used),
-                  "failed_symbols":failed,"cohort_trades":len(enriched)},
-          "frozen_strategy":{"entry":"V66_CONFIRM_10M_TOP1",
-             "parent":"BTC30>0 AND ALT breadth30>0","exit":"TIME120","cost_pct":0.15},
-          "frozen_v81_finalists":{
-             "BTC_VOL_LOW":f"btc_vol1h <= {V82_BTCVOL_MAX}",
-             "ALT24_HIGH":f"alt24h >= {V82_ALT24_MIN}",
-             "INTERSECTION":"ALT24_HIGH AND BTC_VOL_LOW",
-             "threshold_source":"V81 DEV medians; unchanged in V82"
-          },
-          "groups":groups,
-          "decision":decisions,
-          "guardrails":[
-             "Older non-overlapping window; V82 does not retune thresholds.",
-             "No threshold grid search.",
-             "CONTROL and both V81 finalists are evaluated exactly as frozen.",
-             "Intersection is predeclared before viewing V82 outcomes.",
-             "Active V61/V74 execution is unchanged.",
-             "Research/paper only; no orders."
-          ]
-        }
-
-        job["status"]="DONE"; job["result"]=result
-        job["progress"]={"stage":"done","done":len(enriched),"total":len(enriched)}
-        job["finished_utc"]=utc_now(); job["error"]=None
-        v82_job_save(job)
-
-    except Exception as e:
-        job=v82_job_get() or {}
-        job["status"]="ERROR"; job["error"]=f"{type(e).__name__}: {e}"
-        job["finished_utc"]=utc_now()
-        v82_job_save(job)
-
-def v82_make_job(symbols=V82_SYMBOLS,days=V82_DAYS):
-    # Freeze the older window immediately BEFORE the V79/V81 source window.
-    # V79/V81 begins 2026-08-28 11:15 UTC.
-    end_dt=datetime(2026,8,28,11,15,tzinfo=timezone.utc)
-    report_start_dt=end_dt-timedelta(days=int(days))
-    # Extra warmup for 24h context + indicators.
-    fetch_start_dt=report_start_dt-timedelta(days=3)
-
-    # Freeze today's selected universe once at job creation.
-    syms=v76_universe(int(symbols))
-    return {
-      "status":"READY",
-      "study":"V82_INDEPENDENT_OOS_FINALIST_VALIDATION",
-      "symbols":syms,
-      "report_start_ms":int(report_start_dt.timestamp()*1000),
-      "fetch_start_ms":int(fetch_start_dt.timestamp()*1000),
-      "end_ms":int(end_dt.timestamp()*1000),
-      "done_symbols":[],
-      "failed_symbols":{},
-      "btc_done":False,
-      "progress":{"stage":"ready","done":0,"total":len(syms)},
-      "result":None,"error":None,
-      "created_utc":utc_now()
-    }
-
-@app.get("/v82-start")
-async def v82_start(symbols:int=V82_SYMBOLS,days:int=V82_DAYS):
-    global V82_TASK
-    await asyncio.to_thread(v82_db_init)
-    job=await asyncio.to_thread(v82_job_get)
-
-    # Reuse DONE result unless explicit different request requires a new frozen job.
-    if job and job.get("status")=="DONE":
-        return {"status":"ALREADY_DONE","study":job.get("study"),
-                "use":"/v82-status","paper_only":True}
-
-    if not job or int(days)!=V82_DAYS or int(symbols)!=V82_SYMBOLS:
-        # Keep protocol frozen to 40x60 for this validation.
-        job=await asyncio.to_thread(v82_make_job,V82_SYMBOLS,V82_DAYS)
-        await asyncio.to_thread(v82_job_save,job)
-
-    if V82_TASK is None or V82_TASK.done():
-        V82_TASK=asyncio.create_task(v82_run())
-    return {"status":"STARTED_OR_RESUMED",
-            "study":"V82_INDEPENDENT_OOS_FINALIST_VALIDATION",
-            "window":"older non-overlapping 60d ending 2026-08-28 11:15 UTC",
-            "paper_only":True,"trading":False,"orders":False}
-
-@app.get("/v82-status")
-async def v82_status():
-    await asyncio.to_thread(v82_db_init)
-    job=await asyncio.to_thread(v82_job_get)
-    return {**MODE_INFO,"status":"OK","panel":"V82_INDEPENDENT_OOS_FINALIST_VALIDATION",
-      "trading":False,"orders":False,"active_strategy_changed":False,
-      "v61_unchanged":True,"v74_unchanged":True,
-      "study":job,"generated_utc":utc_now()}
-
-@app.on_event("startup")
-async def v82_autoresume_startup():
-    global V82_TASK
-    try:
-        await asyncio.to_thread(v82_db_init)
-        job=await asyncio.to_thread(v82_job_get)
-        if job and job.get("status") in ("READY","RUNNING") and (V82_TASK is None or V82_TASK.done()):
-            V82_TASK=asyncio.create_task(v82_run())
-    except Exception:
-        pass
-
-# ============================================================
-# V82 — ONE-SHOT INDEPENDENT OOS + FINALIST REGIME VALIDATION
-#
-# Frozen V81 finalists:
-# BTC_VOL_LOW: btc_vol1h <= 0.09330
-# ALT24_HIGH:  alt24h >= 1.54532
-#
-# Older, non-overlapping 60-day OOS.
-# Research/paper only. Active V61/V74 unchanged.
-# ============================================================
-
-V82_TABLE = "alt_v82_job"
-V82_CACHE = "alt_v82_cache"
-V82_TASK = None
-
-V82_BTCVOL_MAX = 0.09330
-V82_ALT24_MIN = 1.54532
-V82_DAYS = 60
-V82_SYMBOLS = 40
-
-
-def v82_db_init():
-    if not DATABASE_URL:
-        return
-    with psycopg.connect(DATABASE_URL, connect_timeout=8) as conn:
         with conn.cursor() as cur:
+
             cur.execute(f"""
                 CREATE TABLE IF NOT EXISTS {V82_TABLE} (
                     id INTEGER PRIMARY KEY,
@@ -16856,6 +16492,7 @@ def v82_db_init():
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
             """)
+
             cur.execute(f"""
                 CREATE TABLE IF NOT EXISTS {V82_CACHE} (
                     symbol TEXT PRIMARY KEY,
@@ -16865,77 +16502,155 @@ def v82_db_init():
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
             """)
+
         conn.commit()
+
+    return True
 
 
 def v82_job_get():
-    if not DATABASE_URL:
+
+    if not V21_DB_URL:
         return None
+
     try:
-        with psycopg.connect(DATABASE_URL, connect_timeout=8) as conn:
+
+        with v21_db_connect() as conn:
+
             with conn.cursor() as cur:
-                cur.execute(f"SELECT payload FROM {V82_TABLE} WHERE id=1")
+
+                cur.execute(
+                    f"""
+                    SELECT payload
+                    FROM {V82_TABLE}
+                    WHERE id = 1
+                    """
+                )
+
                 row = cur.fetchone()
-                return row[0] if row else None
+
+        return row[0] if row else None
+
     except Exception:
+
         return None
 
 
 def v82_job_save(payload):
-    if not DATABASE_URL:
+
+    if not V21_DB_URL:
         return
-    with psycopg.connect(DATABASE_URL, connect_timeout=8) as conn:
+
+    with v21_db_connect() as conn:
+
         with conn.cursor() as cur:
+
             cur.execute(
                 f"""
-                INSERT INTO {V82_TABLE}(id,payload,updated_at)
-                VALUES(1,%s::jsonb,NOW())
-                ON CONFLICT(id) DO UPDATE SET
-                    payload=EXCLUDED.payload,
-                    updated_at=NOW()
+                INSERT INTO {V82_TABLE}
+                    (id, payload, updated_at)
+                VALUES
+                    (1, %s::jsonb, NOW())
+
+                ON CONFLICT(id)
+                DO UPDATE SET
+                    payload = EXCLUDED.payload,
+                    updated_at = NOW()
                 """,
-                (json.dumps(payload),),
+                (
+                    json.dumps(
+                        payload,
+                        default=str
+                    ),
+                ),
             )
+
         conn.commit()
 
 
-def v82_cache_get(symbol, start_ms, end_ms):
-    if not DATABASE_URL:
+# ============================================================
+# V82 HISTORICAL CANDLE CACHE
+# ============================================================
+
+def v82_cache_get(
+    symbol,
+    start_ms,
+    end_ms,
+):
+
+    if not V21_DB_URL:
         return None
+
     try:
-        with psycopg.connect(DATABASE_URL, connect_timeout=8) as conn:
+
+        with v21_db_connect() as conn:
+
             with conn.cursor() as cur:
+
                 cur.execute(
                     f"""
                     SELECT candles
                     FROM {V82_CACHE}
-                    WHERE symbol=%s
-                      AND start_ms=%s
-                      AND end_ms=%s
+                    WHERE symbol = %s
+                      AND start_ms = %s
+                      AND end_ms = %s
                     """,
-                    (symbol, int(start_ms), int(end_ms)),
+                    (
+                        symbol,
+                        int(start_ms),
+                        int(end_ms),
+                    ),
                 )
+
                 row = cur.fetchone()
-                return row[0] if row else None
+
+        return row[0] if row else None
+
     except Exception:
+
         return None
 
 
-def v82_cache_put(symbol, start_ms, end_ms, candles):
-    if not DATABASE_URL:
+def v82_cache_put(
+    symbol,
+    start_ms,
+    end_ms,
+    candles,
+):
+
+    if not V21_DB_URL:
         return
-    with psycopg.connect(DATABASE_URL, connect_timeout=8) as conn:
+
+    with v21_db_connect() as conn:
+
         with conn.cursor() as cur:
+
             cur.execute(
                 f"""
                 INSERT INTO {V82_CACHE}
-                    (symbol,start_ms,end_ms,candles,updated_at)
-                VALUES(%s,%s,%s,%s::jsonb,NOW())
-                ON CONFLICT(symbol) DO UPDATE SET
-                    start_ms=EXCLUDED.start_ms,
-                    end_ms=EXCLUDED.end_ms,
-                    candles=EXCLUDED.candles,
-                    updated_at=NOW()
+                    (
+                        symbol,
+                        start_ms,
+                        end_ms,
+                        candles,
+                        updated_at
+                    )
+
+                VALUES
+                    (
+                        %s,
+                        %s,
+                        %s,
+                        %s::jsonb,
+                        NOW()
+                    )
+
+                ON CONFLICT(symbol)
+                DO UPDATE SET
+                    start_ms = EXCLUDED.start_ms,
+                    end_ms = EXCLUDED.end_ms,
+                    candles = EXCLUDED.candles,
+                    updated_at = NOW()
                 """,
                 (
                     symbol,
@@ -16944,125 +16659,19 @@ def v82_cache_put(symbol, start_ms, end_ms, candles):
                     json.dumps(candles),
                 ),
             )
+
         conn.commit()
 
 
-def v82_metrics(rows):
-    vals = [
-        float(r["net"])
-        for r in rows
-        if r.get("net") is not None
-    ]
+# ============================================================
+# HISTORICAL BINANCE FETCH
+# ============================================================
 
-    if not vals:
-        return {
-            "n": 0,
-            "mean_net_pct": None,
-            "median_net_pct": None,
-            "win_rate_pct": None,
-            "profit_factor": None,
-            "mean_95ci": [None, None],
-        }
-
-    wins = [x for x in vals if x > 0]
-    losses = [x for x in vals if x <= 0]
-
-    gross_loss = -sum(losses)
-
-    return {
-        "n": len(vals),
-        "mean_net_pct": round(statistics.mean(vals), 4),
-        "median_net_pct": round(statistics.median(vals), 4),
-        "win_rate_pct": round(
-            100 * len(wins) / len(vals), 2
-        ),
-        "profit_factor": (
-            round(sum(wins) / gross_loss, 4)
-            if gross_loss > 0
-            else None
-        ),
-        "mean_95ci": v81_ci(vals),
-    }
-
-
-def v82_blocks(rows, nblocks=4):
-    rows = sorted(rows, key=lambda x: x["ts"])
-
-    if not rows:
-        return []
-
-    out = []
-
-    for i in range(nblocks):
-        a = (len(rows) * i) // nblocks
-        b = (len(rows) * (i + 1)) // nblocks
-        part = rows[a:b]
-
-        if not part:
-            continue
-
-        out.append(
-            {
-                "block": i + 1,
-                "start_utc": datetime.fromtimestamp(
-                    part[0]["ts"] / 1000,
-                    timezone.utc,
-                ).isoformat(),
-                "end_utc": datetime.fromtimestamp(
-                    part[-1]["ts"] / 1000,
-                    timezone.utc,
-                ).isoformat(),
-                **v82_metrics(part),
-            }
-        )
-
-    return out
-
-
-def v82_group(rows, name):
-
-    def keep(r):
-        c = r["context"]
-
-        if name == "CONTROL":
-            return True
-
-        if name == "BTC_VOL_LOW":
-            return (
-                c.get("btc_vol1h") is not None
-                and c["btc_vol1h"] <= V82_BTCVOL_MAX
-            )
-
-        if name == "ALT24_HIGH":
-            return (
-                c.get("alt24h") is not None
-                and c["alt24h"] >= V82_ALT24_MIN
-            )
-
-        if name == "ALT24_HIGH_AND_BTC_VOL_LOW":
-            return (
-                c.get("btc_vol1h") is not None
-                and c.get("alt24h") is not None
-                and c["btc_vol1h"] <= V82_BTCVOL_MAX
-                and c["alt24h"] >= V82_ALT24_MIN
-            )
-
-        return False
-
-    selected = [r for r in rows if keep(r)]
-
-    return {
-        **v82_metrics(selected),
-        "retention_pct": (
-            round(100 * len(selected) / len(rows), 2)
-            if rows
-            else 0
-        ),
-        "chronological_blocks": v82_blocks(selected),
-    }
-
-
-async def v82_fetch_symbol(symbol, start_ms, end_ms):
+async def v82_fetch_symbol(
+    symbol,
+    start_ms,
+    end_ms,
+):
 
     cached = await asyncio.to_thread(
         v82_cache_get,
@@ -17071,22 +16680,84 @@ async def v82_fetch_symbol(symbol, start_ms, end_ms):
         end_ms,
     )
 
-    if isinstance(cached, list) and len(cached) >= 500:
+    if (
+        isinstance(cached, list)
+        and len(cached) >= 500
+    ):
+
         return cached, "CACHE"
 
-    candles = await asyncio.wait_for(
-        asyncio.to_thread(
-            v76_fetch_5m_range,
-            symbol,
-            start_ms,
-            end_ms,
-        ),
-        timeout=90,
+    rows = []
+
+    cur = int(start_ms)
+
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(
+            30.0,
+            connect=10.0,
+        )
+    ) as client:
+
+        while cur < int(end_ms):
+
+            data = await get_json(
+                client,
+                "/api/v3/klines",
+                params={
+                    "symbol": symbol,
+                    "interval": "5m",
+                    "startTime": cur,
+                    "endTime": int(end_ms),
+                    "limit": 1000,
+                },
+            )
+
+            if not data:
+                break
+
+            for x in data:
+
+                rows.append(
+                    {
+                        "open_time": int(x[0]),
+                        "open": float(x[1]),
+                        "high": float(x[2]),
+                        "low": float(x[3]),
+                        "close": float(x[4]),
+                        "volume": float(x[5]),
+                    }
+                )
+
+            nxt = (
+                int(data[-1][0])
+                + 300000
+            )
+
+            if nxt <= cur:
+                break
+
+            cur = nxt
+
+            await asyncio.sleep(0.04)
+
+    # remove possible duplicates
+
+    rows = list(
+        {
+            int(x["open_time"]): x
+            for x in rows
+        }.values()
     )
 
-    if not isinstance(candles, list) or len(candles) < 500:
+    rows.sort(
+        key=lambda x: x["open_time"]
+    )
+
+    if len(rows) < 500:
+
         raise RuntimeError(
-            f"{symbol}: insufficient candles"
+            f"{symbol}: insufficient candles "
+            f"({len(rows)})"
         )
 
     await asyncio.to_thread(
@@ -17094,390 +16765,267 @@ async def v82_fetch_symbol(symbol, start_ms, end_ms):
         symbol,
         start_ms,
         end_ms,
-        candles,
+        rows,
     )
 
-    return candles, "FETCH"
-
-
-async def v82_run():
-    global V82_TASK
-
-    job = v82_job_get()
-
-    if not job:
-        raise RuntimeError("V82 job not initialized")
-
-    try:
-        job["status"] = "RUNNING"
-        job["error"] = None
-        job["started_utc"] = (
-            job.get("started_utc") or utc_now()
-        )
-
-        v82_job_save(job)
-
-        start_ms = int(job["fetch_start_ms"])
-        end_ms = int(job["end_ms"])
-        syms = list(job["symbols"])
-
-        # --------------------------------------
-        # BTC FIRST
-        # --------------------------------------
-
-        if not job.get("btc_done"):
-
-            btc, source = await v82_fetch_symbol(
-                "BTCUSDT",
-                start_ms,
-                end_ms,
-            )
-
-            job["btc_done"] = True
-            job["btc_source"] = source
-
-            job["progress"] = {
-                "stage": "btc_done",
-                "done": 0,
-                "total": len(syms),
-            }
-
-            v82_job_save(job)
-
-        else:
-            btc = v82_cache_get(
-                "BTCUSDT",
-                start_ms,
-                end_ms,
-            )
-
-        # --------------------------------------
-        # ALTCOINS
-        # --------------------------------------
-
-        done = set(job.get("done_symbols", []))
-        failed = dict(job.get("failed_symbols", {}))
-
-        for sym in syms:
-
-            if sym in done:
-                continue
-
-            try:
-                _, source = await v82_fetch_symbol(
-                    sym,
-                    start_ms,
-                    end_ms,
-                )
-
-                done.add(sym)
-                failed.pop(sym, None)
-
-                job["last_symbol"] = sym
-                job["last_source"] = source
-
-            except Exception as e:
-
-                failed[sym] = (
-                    f"{type(e).__name__}: {e}"
-                )
-
-            job["done_symbols"] = sorted(done)
-            job["failed_symbols"] = failed
-
-            job["progress"] = {
-                "stage": "fetch_symbols",
-                "done": len(done),
-                "total": len(syms),
-                "failed": len(failed),
-                "last_symbol": sym,
-            }
-
-            v82_job_save(job)
-
-            await asyncio.sleep(0)
-
-        # --------------------------------------
-        # BUILD LOW-RAM STORE
-        # --------------------------------------
-
-        store = {}
-        alts = []
-        used = []
-
-        for sym in syms:
-
-            x = v82_cache_get(
-                sym,
-                start_ms,
-                end_ms,
-            )
-
-            if isinstance(x, list) and len(x) >= 500:
-
-                store[len(store)] = v76_compact(x)
-
-                alts.append(x)
-                used.append(sym)
-
-        btc = v82_cache_get(
-            "BTCUSDT",
-            start_ms,
-            end_ms,
-        )
-
-        if not isinstance(btc, list):
-            raise RuntimeError(
-                "BTC cache unavailable after fetch"
-            )
-
-        job["progress"] = {
-            "stage": "recreate_frozen_cohort",
-            "done": len(used),
-            "total": len(syms),
-        }
-
-        v82_job_save(job)
-
-        # --------------------------------------
-        # FROZEN V66 + BASE V70
-        # --------------------------------------
-
-        rows = await asyncio.to_thread(
-            v78_recreate,
-            store,
-            btc,
-            0.15,
-            0.10,
-        )
-
-        report_start = int(job["report_start_ms"])
-
-        cohort = sorted(
-            [
-                r
-                for r in rows
-                if report_start
-                <= int(r["entry_time_ms"])
-                < end_ms
-            ],
-            key=lambda r: int(r["entry_time_ms"]),
-        )
-
-        # --------------------------------------
-        # ATTACH REGIME CONTEXT
-        # --------------------------------------
-
-        enriched = []
-
-        for i, r in enumerate(cohort):
-
-            net, _ = v801_net(r)
-
-            if net is None:
-                continue
-
-            ts = int(r["entry_time_ms"])
-
-            context = v80_context_for_time(
-                ts,
-                btc,
-                alts,
-            )
-
-            enriched.append(
-                {
-                    "ts": ts,
-                    "net": float(net),
-                    "context": context,
-                }
-            )
-
-            if (i + 1) % 50 == 0:
-
-                job["progress"] = {
-                    "stage": "attach_context",
-                    "done": i + 1,
-                    "total": len(cohort),
-                }
-
-                v82_job_save(job)
-
-                await asyncio.sleep(0)
-
-        # --------------------------------------
-        # FROZEN FINALISTS
-        # --------------------------------------
-
-        groups = {}
-
-        for name in [
-            "CONTROL",
-            "BTC_VOL_LOW",
-            "ALT24_HIGH",
-            "ALT24_HIGH_AND_BTC_VOL_LOW",
-        ]:
-            groups[name] = v82_group(
-                enriched,
-                name,
-            )
-
-        # --------------------------------------
-        # AUTOMATIC DECISION
-        # --------------------------------------
-
-        decisions = {}
-
-        for name, z in groups.items():
-
-            if name == "CONTROL":
-                decisions[name] = "CONTROL"
-                continue
-
-            pf = z.get("profit_factor")
-
-            ci = z.get(
-                "mean_95ci",
-                [None, None],
-            )
-
-            lower_ci = ci[0]
-
-            if z["n"] < 30:
-
-                decisions[name] = "INSUFFICIENT_N"
-
-            elif (
-                pf is not None
-                and pf > 1.15
-                and z["mean_net_pct"] > 0
-            ):
-
-                if (
-                    lower_ci is not None
-                    and lower_ci > 0
-                ):
-                    decisions[name] = (
-                        "INDEPENDENT_OOS_PASS"
-                    )
-
-                else:
-                    decisions[name] = (
-                        "SUPPORTIVE_NOT_CONCLUSIVE"
-                    )
-
-            else:
-                decisions[name] = "FAIL"
-
-        # --------------------------------------
-        # FINAL REPORT
-        # --------------------------------------
-
-        result = {
-            "study":
-                "V82_INDEPENDENT_OOS_FINALIST_VALIDATION",
-
-            "window": {
-                "report_start":
-                    datetime.fromtimestamp(
-                        report_start / 1000,
-                        timezone.utc,
-                    ).isoformat(),
-
-                "end":
-                    datetime.fromtimestamp(
-                        end_ms / 1000,
-                        timezone.utc,
-                    ).isoformat(),
-
-                "days": V82_DAYS,
-
-                "non_overlap_with_v79_v81": True,
-            },
-
-            "data": {
-                "symbols_requested": len(syms),
-                "symbols_used": len(used),
-                "failed_symbols": failed,
-                "cohort_trades": len(enriched),
-            },
-
-            "frozen_strategy": {
-                "entry": "V66_CONFIRM_10M_TOP1",
-                "parent":
-                    "BTC30>0 AND ALT breadth30>0",
-                "exit": "TIME120",
-                "cost_pct": 0.15,
-            },
-
-            "frozen_v81_finalists": {
-
-                "BTC_VOL_LOW":
-                    f"btc_vol1h <= {V82_BTCVOL_MAX}",
-
-                "ALT24_HIGH":
-                    f"alt24h >= {V82_ALT24_MIN}",
-
-                "INTERSECTION":
-                    "ALT24_HIGH AND BTC_VOL_LOW",
-
-                "threshold_source":
-                    "V81 DEV medians; unchanged in V82",
-            },
-
-            "groups": groups,
-
-            "decision": decisions,
-
-            "guardrails": [
-                "Older non-overlapping window; V82 does not retune thresholds.",
-                "No threshold grid search.",
-                "CONTROL and both V81 finalists are evaluated exactly as frozen.",
-                "Intersection is predeclared before viewing V82 outcomes.",
-                "Active V61/V74 execution is unchanged.",
-                "Research/paper only; no orders.",
+    return rows, "FETCH"
+
+
+# ============================================================
+# METRICS
+# ============================================================
+
+def v82_metrics(rows):
+
+    vals = [
+        float(r["net"])
+        for r in rows
+        if r.get("net") is not None
+    ]
+
+    if not vals:
+
+        return {
+            "n": 0,
+            "mean_net_pct": None,
+            "median_net_pct": None,
+            "win_rate_pct": None,
+            "profit_factor": None,
+            "mean_95ci": [
+                None,
+                None,
             ],
         }
 
-        job["status"] = "DONE"
-        job["result"] = result
+    wins = [
+        x
+        for x in vals
+        if x > 0
+    ]
 
-        job["progress"] = {
-            "stage": "done",
-            "done": len(enriched),
-            "total": len(enriched),
-        }
+    losses = [
+        x
+        for x in vals
+        if x <= 0
+    ]
 
-        job["finished_utc"] = utc_now()
-        job["error"] = None
+    gross_loss = -sum(losses)
 
-        v82_job_save(job)
+    return {
 
-    except Exception as e:
+        "n":
+            len(vals),
 
-        job = v82_job_get() or {}
+        "mean_net_pct":
+            round(
+                statistics.mean(vals),
+                4,
+            ),
 
-        job["status"] = "ERROR"
+        "median_net_pct":
+            round(
+                statistics.median(vals),
+                4,
+            ),
 
-        job["error"] = (
-            f"{type(e).__name__}: {e}"
+        "win_rate_pct":
+            round(
+                100
+                * len(wins)
+                / len(vals),
+                2,
+            ),
+
+        "profit_factor":
+            (
+                round(
+                    sum(wins)
+                    / gross_loss,
+                    4,
+                )
+                if gross_loss > 0
+                else None
+            ),
+
+        "mean_95ci":
+            v81_ci(vals),
+    }
+
+
+# ============================================================
+# CHRONOLOGICAL BLOCKS
+# ============================================================
+
+def v82_blocks(
+    rows,
+    nblocks=4,
+):
+
+    rows = sorted(
+        rows,
+        key=lambda x: x["ts"],
+    )
+
+    if not rows:
+        return []
+
+    out = []
+
+    for i in range(nblocks):
+
+        a = (
+            len(rows)
+            * i
+        ) // nblocks
+
+        b = (
+            len(rows)
+            * (i + 1)
+        ) // nblocks
+
+        part = rows[a:b]
+
+        if not part:
+            continue
+
+        out.append(
+            {
+                "block":
+                    i + 1,
+
+                "start_utc":
+                    datetime.fromtimestamp(
+                        part[0]["ts"]
+                        / 1000,
+                        timezone.utc,
+                    ).isoformat(),
+
+                "end_utc":
+                    datetime.fromtimestamp(
+                        part[-1]["ts"]
+                        / 1000,
+                        timezone.utc,
+                    ).isoformat(),
+
+                **v82_metrics(part),
+            }
         )
 
-        job["finished_utc"] = utc_now()
-
-        v82_job_save(job)
+    return out
 
 
-def v82_make_job(
+# ============================================================
+# FROZEN V81 GROUPS
+# ============================================================
+
+def v82_group(
+    rows,
+    name,
+):
+
+    def keep(r):
+
+        c = r["context"]
+
+        if name == "CONTROL":
+
+            return True
+
+        if name == "BTC_VOL_LOW":
+
+            return (
+                c.get("btc_vol1h")
+                is not None
+
+                and
+
+                c["btc_vol1h"]
+                <= V82_BTCVOL_MAX
+            )
+
+        if name == "ALT24_HIGH":
+
+            return (
+                c.get("alt24h")
+                is not None
+
+                and
+
+                c["alt24h"]
+                >= V82_ALT24_MIN
+            )
+
+        if (
+            name
+            ==
+            "ALT24_HIGH_AND_BTC_VOL_LOW"
+        ):
+
+            return (
+                c.get("btc_vol1h")
+                is not None
+
+                and
+
+                c.get("alt24h")
+                is not None
+
+                and
+
+                c["btc_vol1h"]
+                <= V82_BTCVOL_MAX
+
+                and
+
+                c["alt24h"]
+                >= V82_ALT24_MIN
+            )
+
+        return False
+
+    selected = [
+        r
+        for r in rows
+        if keep(r)
+    ]
+
+    return {
+
+        **v82_metrics(selected),
+
+        "retention_pct":
+            (
+                round(
+                    100
+                    * len(selected)
+                    / len(rows),
+                    2,
+                )
+                if rows
+                else 0
+            ),
+
+        "chronological_blocks":
+            v82_blocks(selected),
+    }
+
+
+# ============================================================
+# CREATE FROZEN JOB
+# ============================================================
+
+async def v82_make_job(
     symbols=V82_SYMBOLS,
     days=V82_DAYS,
 ):
 
-    # V79/V81 source window starts:
+    # V79/V81 newer sample begins:
+    #
     # 2026-08-28 11:15 UTC
     #
-    # V82 uses the immediately preceding
-    # non-overlapping 60 days.
+    # V82 ends exactly there.
+    #
+    # Therefore V82 and V79/V81 do not overlap.
 
     end_dt = datetime(
         2026,
@@ -17490,28 +17038,54 @@ def v82_make_job(
 
     report_start_dt = (
         end_dt
-        - timedelta(days=int(days))
+        - timedelta(
+            days=int(days)
+        )
     )
 
-    # Extra warm-up for 24h regime context
-    # and indicator calculations.
+    # Additional warmup for
+    # 24-hour context and indicators.
 
     fetch_start_dt = (
         report_start_dt
         - timedelta(days=3)
     )
 
-    syms = v76_universe(
-        int(symbols)
-    )
+    # Use the REAL project universe builder.
+
+    async with httpx.AsyncClient(
+        timeout=30
+    ) as client:
+
+        universe = await build_universe(
+            client
+        )
+
+    syms = [
+        x["symbol"]
+        for x in universe[:int(symbols)]
+        if (
+            isinstance(x, dict)
+            and x.get("symbol")
+        )
+    ]
+
+    if not syms:
+
+        raise RuntimeError(
+            "No symbols from cleaned universe"
+        )
 
     return {
-        "status": "READY",
+
+        "status":
+            "READY",
 
         "study":
             "V82_INDEPENDENT_OOS_FINALIST_VALIDATION",
 
-        "symbols": syms,
+        "symbols":
+            syms,
 
         "report_start_ms":
             int(
@@ -17531,30 +17105,639 @@ def v82_make_job(
                 * 1000
             ),
 
-        "done_symbols": [],
+        "done_symbols":
+            [],
 
-        "failed_symbols": {},
+        "failed_symbols":
+            {},
 
-        "btc_done": False,
+        "btc_done":
+            False,
 
         "progress": {
-            "stage": "ready",
-            "done": 0,
-            "total": len(syms),
+            "stage":
+                "ready",
+
+            "done":
+                0,
+
+            "total":
+                len(syms),
         },
 
-        "result": None,
-        "error": None,
+        "result":
+            None,
 
-        "created_utc": utc_now(),
+        "error":
+            None,
+
+        "created_utc":
+            utc_now(),
     }
 
 
+# ============================================================
+# V82 WORKER
+# ============================================================
+
+async def v82_run():
+
+    global V82_TASK
+
+    job = v82_job_get()
+
+    if not job:
+
+        raise RuntimeError(
+            "V82 job not initialized"
+        )
+
+    try:
+
+        job["status"] = "RUNNING"
+
+        job["error"] = None
+
+        job["started_utc"] = (
+            job.get("started_utc")
+            or utc_now()
+        )
+
+        v82_job_save(job)
+
+        start_ms = int(
+            job["fetch_start_ms"]
+        )
+
+        end_ms = int(
+            job["end_ms"]
+        )
+
+        syms = list(
+            job["symbols"]
+        )
+
+        # ====================================================
+        # BTC FIRST
+        # ====================================================
+
+        if not job.get("btc_done"):
+
+            btc, source = (
+                await v82_fetch_symbol(
+                    "BTCUSDT",
+                    start_ms,
+                    end_ms,
+                )
+            )
+
+            job["btc_done"] = True
+
+            job["btc_source"] = source
+
+            job["progress"] = {
+                "stage":
+                    "btc_done",
+
+                "done":
+                    0,
+
+                "total":
+                    len(syms),
+            }
+
+            v82_job_save(job)
+
+        # ====================================================
+        # SYMBOL DOWNLOAD
+        # ====================================================
+
+        done = set(
+            job.get(
+                "done_symbols",
+                [],
+            )
+        )
+
+        failed = dict(
+            job.get(
+                "failed_symbols",
+                {},
+            )
+        )
+
+        for sym in syms:
+
+            if sym in done:
+                continue
+
+            try:
+
+                _, source = (
+                    await v82_fetch_symbol(
+                        sym,
+                        start_ms,
+                        end_ms,
+                    )
+                )
+
+                done.add(sym)
+
+                failed.pop(
+                    sym,
+                    None,
+                )
+
+                job["last_symbol"] = sym
+
+                job["last_source"] = source
+
+            except Exception as e:
+
+                failed[sym] = (
+                    f"{type(e).__name__}: "
+                    f"{e}"
+                )
+
+            job["done_symbols"] = (
+                sorted(done)
+            )
+
+            job["failed_symbols"] = (
+                failed
+            )
+
+            job["progress"] = {
+
+                "stage":
+                    "fetch_symbols",
+
+                "done":
+                    len(done),
+
+                "total":
+                    len(syms),
+
+                "failed":
+                    len(failed),
+
+                "last_symbol":
+                    sym,
+            }
+
+            v82_job_save(job)
+
+            await asyncio.sleep(0)
+
+        # ====================================================
+        # LOW RAM COMPACT STORE
+        # ====================================================
+
+        store = {}
+
+        alts = []
+
+        used = []
+
+        for sym in syms:
+
+            candles = v82_cache_get(
+                sym,
+                start_ms,
+                end_ms,
+            )
+
+            if (
+                isinstance(
+                    candles,
+                    list,
+                )
+                and
+                len(candles) >= 500
+            ):
+
+                store[
+                    len(store)
+                ] = v76_compact(
+                    candles
+                )
+
+                alts.append(
+                    candles
+                )
+
+                used.append(
+                    sym
+                )
+
+        btc = v82_cache_get(
+            "BTCUSDT",
+            start_ms,
+            end_ms,
+        )
+
+        if not isinstance(
+            btc,
+            list,
+        ):
+
+            raise RuntimeError(
+                "BTC cache unavailable"
+            )
+
+        job["progress"] = {
+
+            "stage":
+                "recreate_frozen_cohort",
+
+            "done":
+                len(used),
+
+            "total":
+                len(syms),
+        }
+
+        v82_job_save(job)
+
+        # ====================================================
+        # EXACT FROZEN ENTRY / PARENT / EXIT
+        # ====================================================
+
+        rows = await asyncio.to_thread(
+            v78_recreate,
+            store,
+            btc,
+            0.15,
+            0.10,
+        )
+
+        report_start = int(
+            job["report_start_ms"]
+        )
+
+        cohort = sorted(
+            [
+                r
+                for r in rows
+                if (
+                    report_start
+                    <= int(
+                        r["entry_time_ms"]
+                    )
+                    < end_ms
+                )
+            ],
+            key=lambda r:
+                int(
+                    r["entry_time_ms"]
+                ),
+        )
+
+        # ====================================================
+        # ATTACH CONTEXT
+        # ====================================================
+
+        enriched = []
+
+        for i, r in enumerate(
+            cohort
+        ):
+
+            net, _ = v801_net(r)
+
+            if net is None:
+                continue
+
+            ts = int(
+                r["entry_time_ms"]
+            )
+
+            context = (
+                v80_context_for_time(
+                    ts,
+                    btc,
+                    alts,
+                )
+            )
+
+            enriched.append(
+                {
+                    "ts":
+                        ts,
+
+                    "net":
+                        float(net),
+
+                    "context":
+                        context,
+                }
+            )
+
+            if (
+                (i + 1)
+                % 50
+                == 0
+            ):
+
+                job["progress"] = {
+
+                    "stage":
+                        "attach_context",
+
+                    "done":
+                        i + 1,
+
+                    "total":
+                        len(cohort),
+                }
+
+                v82_job_save(job)
+
+                await asyncio.sleep(0)
+
+        # ====================================================
+        # FINALIST EVALUATION
+        # ====================================================
+
+        groups = {}
+
+        group_names = [
+
+            "CONTROL",
+
+            "BTC_VOL_LOW",
+
+            "ALT24_HIGH",
+
+            "ALT24_HIGH_AND_BTC_VOL_LOW",
+        ]
+
+        for name in group_names:
+
+            groups[name] = (
+                v82_group(
+                    enriched,
+                    name,
+                )
+            )
+
+        # ====================================================
+        # PREDECLARED DECISION RULE
+        # ====================================================
+
+        decisions = {}
+
+        for name, result in (
+            groups.items()
+        ):
+
+            if name == "CONTROL":
+
+                decisions[name] = (
+                    "CONTROL"
+                )
+
+                continue
+
+            pf = result.get(
+                "profit_factor"
+            )
+
+            ci = result.get(
+                "mean_95ci",
+                [None, None],
+            )
+
+            lower_ci = ci[0]
+
+            if result["n"] < 30:
+
+                decisions[name] = (
+                    "INSUFFICIENT_N"
+                )
+
+            elif (
+                pf is not None
+                and pf > 1.15
+                and result[
+                    "mean_net_pct"
+                ] > 0
+            ):
+
+                if (
+                    lower_ci is not None
+                    and lower_ci > 0
+                ):
+
+                    decisions[name] = (
+                        "INDEPENDENT_OOS_PASS"
+                    )
+
+                else:
+
+                    decisions[name] = (
+                        "SUPPORTIVE_NOT_CONCLUSIVE"
+                    )
+
+            else:
+
+                decisions[name] = (
+                    "FAIL"
+                )
+
+        # ====================================================
+        # RESULT
+        # ====================================================
+
+        result = {
+
+            "study":
+                "V82_INDEPENDENT_OOS_FINALIST_VALIDATION",
+
+            "window": {
+
+                "report_start":
+                    datetime.fromtimestamp(
+                        report_start
+                        / 1000,
+                        timezone.utc,
+                    ).isoformat(),
+
+                "end":
+                    datetime.fromtimestamp(
+                        end_ms
+                        / 1000,
+                        timezone.utc,
+                    ).isoformat(),
+
+                "days":
+                    V82_DAYS,
+
+                "non_overlap_with_v79_v81":
+                    True,
+            },
+
+            "data": {
+
+                "symbols_requested":
+                    len(syms),
+
+                "symbols_used":
+                    len(used),
+
+                "failed_symbols":
+                    failed,
+
+                "cohort_trades":
+                    len(enriched),
+            },
+
+            "frozen_strategy": {
+
+                "entry":
+                    "V66_CONFIRM_10M_TOP1",
+
+                "parent":
+                    "BTC30>0 AND ALT breadth30>0",
+
+                "exit":
+                    "TIME120",
+
+                "cost_pct":
+                    0.15,
+            },
+
+            "frozen_v81_finalists": {
+
+                "BTC_VOL_LOW":
+                    (
+                        "btc_vol1h <= "
+                        f"{V82_BTCVOL_MAX}"
+                    ),
+
+                "ALT24_HIGH":
+                    (
+                        "alt24h >= "
+                        f"{V82_ALT24_MIN}"
+                    ),
+
+                "INTERSECTION":
+                    (
+                        "ALT24_HIGH AND "
+                        "BTC_VOL_LOW"
+                    ),
+
+                "threshold_source":
+                    (
+                        "V81 DEV medians; "
+                        "unchanged in V82"
+                    ),
+            },
+
+            "groups":
+                groups,
+
+            "decision":
+                decisions,
+
+            "guardrails": [
+
+                (
+                    "Older non-overlapping "
+                    "window."
+                ),
+
+                (
+                    "V82 does not retune "
+                    "thresholds."
+                ),
+
+                (
+                    "No threshold grid "
+                    "search."
+                ),
+
+                (
+                    "Both V81 finalists "
+                    "evaluated exactly as "
+                    "frozen."
+                ),
+
+                (
+                    "Intersection was "
+                    "predeclared before "
+                    "viewing V82 outcomes."
+                ),
+
+                (
+                    "Active V61/V74 "
+                    "execution unchanged."
+                ),
+
+                (
+                    "Research/paper only; "
+                    "no orders."
+                ),
+            ],
+        }
+
+        job["status"] = "DONE"
+
+        job["result"] = result
+
+        job["progress"] = {
+
+            "stage":
+                "done",
+
+            "done":
+                len(enriched),
+
+            "total":
+                len(enriched),
+        }
+
+        job["finished_utc"] = (
+            utc_now()
+        )
+
+        job["error"] = None
+
+        v82_job_save(job)
+
+    except Exception as e:
+
+        job = (
+            v82_job_get()
+            or {}
+        )
+
+        job["status"] = "ERROR"
+
+        job["error"] = (
+            f"{type(e).__name__}: "
+            f"{e}"
+        )
+
+        job["finished_utc"] = (
+            utc_now()
+        )
+
+        try:
+
+            v82_job_save(job)
+
+        except Exception:
+
+            pass
+
+
+# ============================================================
+# START ENDPOINT
+# ============================================================
+
 @app.get("/v82-start")
-async def v82_start(
-    symbols: int = V82_SYMBOLS,
-    days: int = V82_DAYS,
-):
+async def v82_start():
 
     global V82_TASK
 
@@ -17568,23 +17751,38 @@ async def v82_start(
 
     if (
         job
-        and job.get("status") == "DONE"
+        and
+        job.get("status")
+        == "DONE"
     ):
+
         return {
-            "status": "ALREADY_DONE",
-            "study": job.get("study"),
-            "use": "/v82-status",
-            "paper_only": True,
+
+            "status":
+                "ALREADY_DONE",
+
+            "study":
+                job.get("study"),
+
+            "use":
+                "/v82-status",
+
+            "paper_only":
+                True,
+
+            "trading":
+                False,
+
+            "orders":
+                False,
         }
 
-    if (
-        not job
-        or int(days) != V82_DAYS
-        or int(symbols) != V82_SYMBOLS
-    ):
+    # Create job only once.
+    # Existing RUNNING job survives Render restart.
 
-        job = await asyncio.to_thread(
-            v82_make_job,
+    if not job:
+
+        job = await v82_make_job(
             V82_SYMBOLS,
             V82_DAYS,
         )
@@ -17596,27 +17794,45 @@ async def v82_start(
 
     if (
         V82_TASK is None
-        or V82_TASK.done()
+        or
+        V82_TASK.done()
     ):
 
-        V82_TASK = asyncio.create_task(
-            v82_run()
+        V82_TASK = (
+            asyncio.create_task(
+                v82_run()
+            )
         )
 
     return {
-        "status": "STARTED_OR_RESUMED",
+
+        "status":
+            "STARTED_OR_RESUMED",
 
         "study":
             "V82_INDEPENDENT_OOS_FINALIST_VALIDATION",
 
         "window":
-            "older non-overlapping 60d ending 2026-08-28 11:15 UTC",
+            (
+                "older non-overlapping "
+                "60d ending "
+                "2026-08-28 11:15 UTC"
+            ),
 
-        "paper_only": True,
-        "trading": False,
-        "orders": False,
+        "paper_only":
+            True,
+
+        "trading":
+            False,
+
+        "orders":
+            False,
     }
 
+
+# ============================================================
+# STATUS ENDPOINT
+# ============================================================
 
 @app.get("/v82-status")
 async def v82_status():
@@ -17630,26 +17846,41 @@ async def v82_status():
     )
 
     return {
+
         **MODE_INFO,
 
-        "status": "OK",
+        "status":
+            "OK",
 
         "panel":
             "V82_INDEPENDENT_OOS_FINALIST_VALIDATION",
 
-        "trading": False,
-        "orders": False,
+        "trading":
+            False,
 
-        "active_strategy_changed": False,
+        "orders":
+            False,
 
-        "v61_unchanged": True,
-        "v74_unchanged": True,
+        "active_strategy_changed":
+            False,
 
-        "study": job,
+        "v61_unchanged":
+            True,
 
-        "generated_utc": utc_now(),
+        "v74_unchanged":
+            True,
+
+        "study":
+            job,
+
+        "generated_utc":
+            utc_now(),
     }
 
+
+# ============================================================
+# AUTO RESUME AFTER RENDER RESTART
+# ============================================================
 
 @app.on_event("startup")
 async def v82_autoresume_startup():
@@ -17668,17 +17899,26 @@ async def v82_autoresume_startup():
 
         if (
             job
-            and job.get("status")
-            in ("READY", "RUNNING")
-            and (
+            and
+            job.get("status")
+            in (
+                "READY",
+                "RUNNING",
+            )
+            and
+            (
                 V82_TASK is None
-                or V82_TASK.done()
+                or
+                V82_TASK.done()
             )
         ):
 
-            V82_TASK = asyncio.create_task(
-                v82_run()
+            V82_TASK = (
+                asyncio.create_task(
+                    v82_run()
+                )
             )
 
     except Exception:
+
         pass
