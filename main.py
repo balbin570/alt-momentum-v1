@@ -15796,3 +15796,180 @@ async def v79_status():
     return {**MODE_INFO,"status":"OK","panel":"V79.3_NEWER_40D_DISPERSION_VALIDATION_NOHANG",
       "trading":False,"orders":False,"active_strategy_changed":False,
       "v74_prospective_unchanged":True,"study":V79_STATE,"generated_utc":utc_now()}
+
+
+# ============================================================
+# V79.4 â€” RESUMABLE / RESTART-SAFE WORKER
+# Scientific rules unchanged. This is operational resilience only.
+# - persistent job definition/checkpoint
+# - auto-resume after Render restart
+# - reuses V79 symbol cache
+# - BTC first
+# - bounded per-symbol fetch
+# ============================================================
+V794_RUN_KEY="V79_4_NEWER_40D_RESUMABLE"
+V794_TASK=None
+
+def v794_db_init():
+    if not V21_DB_URL:return False
+    with v21_db_connect() as conn:
+      with conn.cursor() as cur:
+        cur.execute("""CREATE TABLE IF NOT EXISTS alt_v794_job(
+          run_key TEXT PRIMARY KEY,payload JSONB NOT NULL,updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())""")
+      conn.commit()
+    return True
+
+def v794_job_get():
+    if not V21_DB_URL:return None
+    v794_db_init()
+    with v21_db_connect() as conn:
+      with conn.cursor() as cur:
+        cur.execute("SELECT payload FROM alt_v794_job WHERE run_key=%s",(V794_RUN_KEY,))
+        r=cur.fetchone()
+    return r[0] if r else None
+
+def v794_job_put(p):
+    v794_db_init()
+    with v21_db_connect() as conn:
+      with conn.cursor() as cur:
+        cur.execute("""INSERT INTO alt_v794_job(run_key,payload,updated_at)
+          VALUES(%s,%s::jsonb,NOW()) ON CONFLICT(run_key) DO UPDATE
+          SET payload=EXCLUDED.payload,updated_at=NOW()""",(V794_RUN_KEY,json.dumps(p,default=str)))
+      conn.commit()
+
+def v794_cache_ok(sym):
+    try:
+      x=v79_cache_get(sym)
+      return isinstance(x,list) and len(x)>=500
+    except Exception:return False
+
+async def v794_worker():
+    global V794_TASK
+    job=v794_job_get()
+    if not job or job.get("status") not in ("RUNNING","RESUMING"):return
+    try:
+      job["status"]="RUNNING";job["error"]=None;v794_job_put(job)
+      syms=job["symbols"]; start_ms=int(job["fetch_start_ms"]); end_ms=int(job["end_ms"])
+      fetch_syms=list(dict.fromkeys(["BTCUSDT"]+syms))
+      completed=set(job.get("completed",[]))
+      # Reconcile checkpoint with durable cache after restart.
+      for sym in fetch_syms:
+        if v794_cache_ok(sym):completed.add(sym)
+      job["completed"]=sorted(completed)
+      job["progress"]={"stage":"fetch_newer_40d","done":len(completed),"total":len(fetch_syms),
+                       "remaining":len(fetch_syms)-len(completed)}
+      v794_job_put(job)
+
+      pending=[x for x in fetch_syms if x not in completed]
+      # Sequential + hard timeout = lowest RAM and restart-safe.
+      async with httpx.AsyncClient(timeout=httpx.Timeout(20.0,connect=10.0)) as client:
+        for sym in pending:
+          try:
+            x=await asyncio.wait_for(v79_fetch_klines(sym,start_ms,end_ms,client),timeout=90)
+            if len(x)>=500:
+              completed.add(sym)
+              job.setdefault("fetch_errors",{}).pop(sym,None)
+            else:
+              job.setdefault("fetch_errors",{})[sym]=f"only_{len(x)}_candles"
+              completed.add(sym)  # terminal skip; don't hang forever
+          except Exception as e:
+            job.setdefault("fetch_errors",{})[sym]=f"{type(e).__name__}: {e}"
+            completed.add(sym)  # terminal skip for this frozen run
+          job["completed"]=sorted(completed)
+          job["progress"]={"stage":"fetch_newer_40d","done":len(completed),"total":len(fetch_syms),
+                           "remaining":len(fetch_syms)-len(completed),"last_symbol":sym,
+                           "last_error":job.get("fetch_errors",{}).get(sym)}
+          v794_job_put(job)
+
+      if not v794_cache_ok("BTCUSDT"):
+        raise RuntimeError("BTCUSDT unavailable after bounded fetch: "+job.get("fetch_errors",{}).get("BTCUSDT","unknown"))
+
+      # Build only from durable cache. Keep memory bounded to the evaluation phase.
+      raw_btc=v79_cache_get("BTCUSDT")
+      store={};used=[];failed=[]
+      for sym in syms:
+        x=v79_cache_get(sym)
+        if isinstance(x,list) and len(x)>=500:
+          store[len(store)]=v76_compact(x);used.append(sym)
+        else: failed.append(sym)
+      job["progress"]={"stage":"frozen_evaluation","done":len(used),"total":len(syms)}
+      v794_job_put(job)
+
+      rows=await asyncio.to_thread(v78_recreate,store,raw_btc,.15,.10)
+      report_start=int(job["report_start_ms"])
+      rows=[r for r in rows if int(r["entry_time_ms"])>=report_start and int(r["entry_time_ms"])<end_ms]
+      ev=await asyncio.to_thread(v79_eval,rows)
+      job.update(status="DONE",finished_utc=utc_now(),error=None,
+        progress={"stage":"done","done":len(used),"total":len(syms)},
+        result={"validation":"INDEPENDENT_NEWER_40D_FROZEN_DISPERSION_RESUMABLE",
+          "window":{"start_utc":datetime.fromtimestamp(report_start/1000,timezone.utc).isoformat(),
+                    "end_utc":datetime.fromtimestamp(end_ms/1000,timezone.utc).isoformat(),
+                    "days":job["days"]},
+          "frozen_hypothesis":{"entry":"V66_CONFIRM_10M_TOP1",
+            "parent":"BTC30>0 AND ALT breadth30>0","exit":"TIME120",
+            "high_dispersion_rule":"ALT dispersion30 > 0.69157",
+            "cutpoint_source":"V78 older-OOS discovery; unchanged in V79.4"},
+          "results":ev,
+          "data":{"symbols_requested":len(syms),"symbols_used":len(used),
+                  "symbols":used,"failed":failed,
+                  "fetch_errors":job.get("fetch_errors",{}),
+                  "source":"durable V79 PostgreSQL symbol cache"},
+          "guardrails":["V79.4 changes execution resilience only; scientific rules unchanged.",
+            "Primary dispersion threshold 0.69157 remains frozen.",
+            "No threshold search or retuning.","Frozen V66 entry, BASE V70 parent cohort and TIME120 exit unchanged.",
+            "Rank-high tertile remains secondary descriptive only.",
+            "V61/V74 execution unchanged.","Research/paper only; no orders."]})
+      v794_job_put(job)
+    except Exception as e:
+      job=v794_job_get() or {}
+      job.update(status="ERROR",error=f"{type(e).__name__}: {e}",finished_utc=utc_now())
+      v794_job_put(job)
+
+async def v794_autoresume():
+    global V794_TASK
+    await asyncio.sleep(8)
+    try:
+      job=v794_job_get()
+      if job and job.get("status") in ("RUNNING","RESUMING"):
+        job["status"]="RESUMING";job["resume_count"]=int(job.get("resume_count",0))+1
+        job["last_resume_utc"]=utc_now();v794_job_put(job)
+        V794_TASK=asyncio.create_task(v794_worker())
+    except Exception:
+      pass
+
+@app.on_event("startup")
+async def v794_startup_resume():
+    asyncio.create_task(v794_autoresume())
+
+@app.get("/v79-4-start")
+async def v794_start(symbols:int=40,days:int=40):
+    global V794_TASK
+    v794_db_init()
+    current=v794_job_get()
+    if V794_TASK is not None and not V794_TASK.done():
+      return {"status":"ALREADY_RUNNING","progress":(current or {}).get("progress")}
+    symbols=max(10,min(symbols,40));days=max(20,min(days,40))
+    now_ms=(int(time.time()*1000)//300000)*300000
+    async with httpx.AsyncClient(timeout=30) as c:
+      uni=await build_universe(c)
+    syms=[x["symbol"] for x in uni[:symbols] if isinstance(x,dict) and x.get("symbol")]
+    job={"status":"RUNNING","created_utc":utc_now(),"started_utc":utc_now(),
+      "finished_utc":None,"error":None,"days":days,"symbols":syms,
+      "end_ms":now_ms,"report_start_ms":now_ms-days*86400000,
+      "fetch_start_ms":now_ms-(days+2)*86400000,
+      "completed":[],"fetch_errors":{},"resume_count":0,
+      "progress":{"stage":"prepare","done":0,"total":len(syms)+1},
+      "scientific_rules":{"dispersion_cut":0.69157,"entry":"V66_CONFIRM_10M_TOP1",
+                          "parent":"BTC30>0 AND ALT breadth30>0","exit":"TIME120"}}
+    v794_job_put(job)
+    V794_TASK=asyncio.create_task(v794_worker())
+    return {"status":"STARTED","paper_only":True,"restart_safe":True,
+            "study":"V79.4_NEWER_40D_FROZEN_DISPERSION","symbols":len(syms)}
+
+@app.get("/v79-4-status")
+async def v794_status():
+    job=v794_job_get()
+    return {**MODE_INFO,"status":"OK","panel":"V79.4_RESUMABLE_NEWER_40D_DISPERSION",
+      "trading":False,"orders":False,"active_strategy_changed":False,
+      "v74_prospective_unchanged":True,"restart_safe":True,
+      "study":job,"generated_utc":utc_now()}
