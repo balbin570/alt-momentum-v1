@@ -15973,3 +15973,147 @@ async def v794_status():
       "trading":False,"orders":False,"active_strategy_changed":False,
       "v74_prospective_unchanged":True,"restart_safe":True,
       "study":job,"generated_utc":utc_now()}
+
+
+# ============================================================
+# V80 â€” REGIME TRANSITION DIAGNOSTIC
+# Diagnostic only: compare V79 newer-window bad half vs good half.
+# No new thresholds, no strategy promotion, no execution changes.
+# Reuses durable V79 cache and frozen V66/BASE-V70 cohort.
+# ============================================================
+V80_RUN_KEY="V80_REGIME_TRANSITION_DIAGNOSTIC"
+V80_STATE={"status":"IDLE","progress":{},"result":None,"error":None}
+V80_TASK=None
+
+def v80_stats(vals):
+    vals=[float(x) for x in vals if x is not None and math.isfinite(float(x))]
+    if not vals:return {"n":0,"mean":None,"median":None}
+    return {"n":len(vals),"mean":round(statistics.mean(vals),5),
+            "median":round(statistics.median(vals),5)}
+
+def v80_idx(candles, ts):
+    # last candle at or before timestamp
+    lo,hi=0,len(candles)-1;ans=None
+    while lo<=hi:
+      m=(lo+hi)//2
+      if int(candles[m]["open_time"])<=ts:ans=m;lo=m+1
+      else:hi=m-1
+    return ans
+
+def v80_ret(candles,i,bars):
+    if i is None or i-bars<0:return None
+    a=float(candles[i-bars]["close"]);b=float(candles[i]["close"])
+    return (b/a-1)*100 if a else None
+
+def v80_realized_vol(candles,i,bars=12):
+    if i is None or i-bars<0:return None
+    rr=[]
+    for j in range(i-bars+1,i+1):
+      a=float(candles[j-1]["close"]);b=float(candles[j]["close"])
+      if a>0:rr.append((b/a-1)*100)
+    return statistics.pstdev(rr) if len(rr)>=2 else None
+
+def v80_context_for_time(ts, btc, alt_lists):
+    bi=v80_idx(btc,ts)
+    btc30=v80_ret(btc,bi,6); btc1h=v80_ret(btc,bi,12)
+    btc4h=v80_ret(btc,bi,48); btc24h=v80_ret(btc,bi,288)
+    btcvol=v80_realized_vol(btc,bi,12)
+    r30=[];r1=[];r4=[];r24=[]
+    for c in alt_lists:
+      i=v80_idx(c,ts)
+      for arr,bars in ((r30,6),(r1,12),(r4,48),(r24,288)):
+        x=v80_ret(c,i,bars)
+        if x is not None:arr.append(x)
+    def mean(x): return statistics.mean(x) if x else None
+    disp30=statistics.pstdev(r30) if len(r30)>=2 else None
+    return {"btc30":btc30,"btc1h":btc1h,"btc4h":btc4h,"btc24h":btc24h,
+      "btc_accel_30_vs_1h":None if btc30 is None or btc1h is None else btc30-btc1h/2,
+      "btc_vol1h":btcvol,"alt30":mean(r30),"alt1h":mean(r1),"alt4h":mean(r4),"alt24h":mean(r24),
+      "alt_accel_30_vs_1h":None if not r30 or not r1 else mean(r30)-mean(r1)/2,
+      "alt_dispersion30":disp30}
+
+def v80_summarize(rows, feature_names):
+    return {f:v80_stats([r["context"].get(f) for r in rows]) for f in feature_names}
+
+async def v80_run():
+    global V80_STATE
+    V80_STATE={"status":"RUNNING","progress":{"stage":"load_cache"},"result":None,"error":None,
+               "started_utc":utc_now(),"finished_utc":None}
+    try:
+      job=v794_job_get()
+      if not job or job.get("status")!="DONE":
+        raise RuntimeError("V79.4 DONE result required")
+      syms=job["symbols"]; btc=v79_cache_get("BTCUSDT")
+      if not isinstance(btc,list):raise RuntimeError("BTC cache unavailable")
+      alt_lists=[];store={};used=[]
+      for sym in syms:
+        x=v79_cache_get(sym)
+        if isinstance(x,list) and len(x)>=500:
+          alt_lists.append(x);store[len(store)]=v76_compact(x);used.append(sym)
+      V80_STATE["progress"]={"stage":"recreate_frozen_cohort","symbols_used":len(used)}
+      rows=await asyncio.to_thread(v78_recreate,store,btc,.15,.10)
+      rs=int(job["report_start_ms"]);re=int(job["end_ms"])
+      rows=[r for r in rows if int(r["entry_time_ms"])>=rs and int(r["entry_time_ms"])<re]
+      rows.sort(key=lambda r:int(r["entry_time_ms"]))
+      if len(rows)<20:raise RuntimeError("Too few frozen cohort trades")
+      # Exact temporal split: first half vs second half by trade chronology.
+      mid=len(rows)//2
+      labeled=[]
+      for k,r in enumerate(rows):
+        ts=int(r["entry_time_ms"])
+        ctx=v80_context_for_time(ts,btc,alt_lists)
+        labeled.append({"half":"BAD_EARLY" if k<mid else "GOOD_LATE",
+                        "net":r.get("net_pct"),"context":ctx,"ts":ts})
+        if (k+1)%50==0:
+          V80_STATE["progress"]={"stage":"context","done":k+1,"total":len(rows)}
+          await asyncio.sleep(0)
+      bad=[x for x in labeled if x["half"]=="BAD_EARLY"]
+      good=[x for x in labeled if x["half"]=="GOOD_LATE"]
+      features=["btc30","btc1h","btc4h","btc24h","btc_accel_30_vs_1h","btc_vol1h",
+                "alt30","alt1h","alt4h","alt24h","alt_accel_30_vs_1h","alt_dispersion30"]
+      bs=v80_summarize(bad,features);gs=v80_summarize(good,features)
+      diffs={}
+      for f in features:
+        a=bs[f]["mean"];b=gs[f]["mean"]
+        diffs[f]=None if a is None or b is None else round(b-a,5)
+      # Calendar quartiles as a second descriptive view, no thresholds.
+      quart=[]
+      qsize=max(1,len(labeled)//4)
+      for q in range(4):
+        part=labeled[q*qsize:(q+1)*qsize if q<3 else len(labeled)]
+        nets=[x["net"] for x in part if x["net"] is not None]
+        quart.append({"block":q+1,"n":len(part),
+          "start_utc":datetime.fromtimestamp(part[0]["ts"]/1000,timezone.utc).isoformat() if part else None,
+          "end_utc":datetime.fromtimestamp(part[-1]["ts"]/1000,timezone.utc).isoformat() if part else None,
+          "net":v80_stats(nets),"context":v80_summarize(part,features)})
+      V80_STATE={"status":"DONE","progress":{"stage":"done","done":len(labeled),"total":len(labeled)},
+        "result":{"validation":"V80_REGIME_TRANSITION_DIAGNOSTIC_NEWER_40D",
+          "frozen_parent":{"entry":"V66_CONFIRM_10M_TOP1","parent":"BTC30>0 AND ALT breadth30>0",
+                           "exit":"TIME120","dispersion_rule_not_changed":True},
+          "sample":{"trades":len(labeled),"symbols_used":len(used),
+                    "window_start":datetime.fromtimestamp(rs/1000,timezone.utc).isoformat(),
+                    "window_end":datetime.fromtimestamp(re/1000,timezone.utc).isoformat()},
+          "BAD_EARLY_HALF":{"n":len(bad),"net":v80_stats([x["net"] for x in bad]),"context":bs},
+          "GOOD_LATE_HALF":{"n":len(good),"net":v80_stats([x["net"] for x in good]),"context":gs},
+          "GOOD_MINUS_BAD_MEAN":diffs,"CHRONOLOGICAL_QUARTERS":quart,
+          "guardrails":["Diagnostic only; no threshold selected.","No strategy/execution changes.",
+            "Frozen V66 entry, BASE V70 parent cohort and TIME120 exit preserved.",
+            "Context features are descriptive; do not promote observed means to cutpoints.",
+            "V61/V74 unchanged.","Research/paper only; no orders."]},
+        "error":None,"started_utc":V80_STATE.get("started_utc"),"finished_utc":utc_now()}
+    except Exception as e:
+      V80_STATE.update(status="ERROR",error=f"{type(e).__name__}: {e}",finished_utc=utc_now())
+
+@app.get("/v80-start")
+async def v80_start():
+    global V80_TASK
+    if V80_TASK is not None and not V80_TASK.done():
+      return {"status":"ALREADY_RUNNING","progress":V80_STATE.get("progress")}
+    V80_TASK=asyncio.create_task(v80_run())
+    return {"status":"STARTED","paper_only":True,"study":"V80_REGIME_TRANSITION_DIAGNOSTIC"}
+
+@app.get("/v80-status")
+async def v80_status():
+    return {**MODE_INFO,"status":"OK","panel":"V80_REGIME_TRANSITION_DIAGNOSTIC",
+      "trading":False,"orders":False,"active_strategy_changed":False,
+      "v74_prospective_unchanged":True,"study":V80_STATE,"generated_utc":utc_now()}
