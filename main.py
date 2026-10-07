@@ -17066,3 +17066,258 @@ async def v83_status():
         "study":V83_STATE,
         "generated_utc":utc_now()
     }
+
+
+# ============================================================
+# V83.1 â€” LOW-RAM + POSTGRES PERSISTENT EDGE-STATE
+# New endpoints: /v831-start and /v831-status
+# ============================================================
+
+V831_TABLE = "alt_v831_edge_state"
+V831_TASK = None
+
+def v831_db_init():
+    if not V21_DB_URL:
+        raise RuntimeError("DATABASE_URL missing")
+    with v21_db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                CREATE TABLE IF NOT EXISTS {V831_TABLE}(
+                    id INTEGER PRIMARY KEY,
+                    payload JSONB NOT NULL,
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
+        conn.commit()
+
+def v831_save(payload):
+    v831_db_init()
+    with v21_db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                INSERT INTO {V831_TABLE}(id,payload,updated_at)
+                VALUES(1,%s::jsonb,NOW())
+                ON CONFLICT(id) DO UPDATE
+                SET payload=EXCLUDED.payload,updated_at=NOW()
+            """,(json.dumps(payload),))
+        conn.commit()
+
+def v831_get():
+    try:
+        v831_db_init()
+        with v21_db_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT payload FROM {V831_TABLE} WHERE id=1")
+                r=cur.fetchone()
+                return r[0] if r else None
+    except Exception:
+        return None
+
+def v831_summary(rows):
+    vals=[float(r["net"]) for r in rows]
+    if not vals:
+        return {"n":0,"mean_net_pct":None,"median_net_pct":None,
+                "win_rate_pct":None,"profit_factor":None}
+    pf=v83_pf(vals)
+    return {
+        "n":len(vals),
+        "mean_net_pct":round(statistics.mean(vals),4),
+        "median_net_pct":round(statistics.median(vals),4),
+        "win_rate_pct":round(100*sum(x>0 for x in vals)/len(vals),2),
+        "profit_factor":round(pf,4) if pf is not None else None,
+    }
+
+def v831_blocks(rows,n=4):
+    rows=sorted(rows,key=lambda r:r["ts"])
+    out=[]
+    for i in range(n):
+        a=len(rows)*i//n;b=len(rows)*(i+1)//n
+        p=rows[a:b]
+        if p: out.append({"block":i+1,**v831_summary(p)})
+    return out
+
+async def v831_run():
+    state={
+        "status":"RUNNING","error":None,"result":None,
+        "progress":{"stage":"init","done":0,"total":0},
+        "started_utc":utc_now(),"finished_utc":None
+    }
+    try:
+        await asyncio.to_thread(v831_save,state)
+
+        job=await asyncio.to_thread(v82_job_get)
+        if not job or job.get("status")!="DONE":
+            raise RuntimeError("V82 must be DONE first")
+
+        start_ms=int(job["fetch_start_ms"])
+        report_start=int(job["report_start_ms"])
+        end_ms=int(job["end_ms"])
+        syms=list(job["symbols"])
+
+        btc=await asyncio.to_thread(v82_cache_get,"BTCUSDT",start_ms,end_ms)
+        if not isinstance(btc,list):
+            raise RuntimeError("V82 BTC cache missing")
+
+        # LOW RAM: never retain raw alt candle lists.
+        # Each symbol is loaded, compacted, then raw JSON is released.
+        store={}
+        used=[]
+        state["progress"]={"stage":"compact_symbols","done":0,"total":len(syms)}
+        await asyncio.to_thread(v831_save,state)
+
+        for sym in syms:
+            c=await asyncio.to_thread(v82_cache_get,sym,start_ms,end_ms)
+            if isinstance(c,list) and len(c)>=500:
+                store[len(store)]=v76_compact(c)
+                used.append(sym)
+            del c
+            state["progress"]["done"]+=1
+            if state["progress"]["done"]%5==0:
+                await asyncio.to_thread(v831_save,state)
+            await asyncio.sleep(0)
+
+        state["progress"]={"stage":"recreate_frozen_cohort","done":0,"total":1}
+        await asyncio.to_thread(v831_save,state)
+
+        cohort=await asyncio.to_thread(v78_recreate,store,btc,0.15,0.10)
+        del store
+        del btc
+
+        rows=[]
+        for r in cohort:
+            ts=int(r["entry_time_ms"])
+            if report_start<=ts<end_ms:
+                net,_=v801_net(r)
+                if net is not None:
+                    rows.append({"ts":ts,"net":float(net)})
+        del cohort
+        rows.sort(key=lambda x:x["ts"])
+
+        if len(rows)<=V83_LOOKBACK:
+            raise RuntimeError("Not enough cohort trades")
+
+        state["progress"]={"stage":"causal_edge_state","done":0,"total":len(rows)-V83_LOOKBACK}
+        await asyncio.to_thread(v831_save,state)
+
+        evaluated=[]
+        for i in range(V83_LOOKBACK,len(rows)):
+            hist=rows[i-V83_LOOKBACK:i]
+            vals=[x["net"] for x in hist]
+            prior_pf=v83_pf(vals)
+            prior_mean=statistics.mean(vals)
+            evaluated.append({
+                **rows[i],
+                "edge_on":bool(prior_pf is not None and prior_pf>V83_PF_GATE and prior_mean>0),
+                "prior30_pf":prior_pf,
+                "prior30_mean":prior_mean
+            })
+
+        on=[r for r in evaluated if r["edge_on"]]
+        off=[r for r in evaluated if not r["edge_on"]]
+
+        thirds=[]
+        for i in range(3):
+            a=len(evaluated)*i//3;b=len(evaluated)*(i+1)//3
+            p=evaluated[a:b]
+            thirds.append({
+                "segment":i+1,
+                "ALL":v831_summary(p),
+                "EDGE_ON":v831_summary([r for r in p if r["edge_on"]]),
+                "EDGE_OFF":v831_summary([r for r in p if not r["edge_on"]])
+            })
+
+        all_s=v831_summary(evaluated)
+        on_s=v831_summary(on)
+        off_s=v831_summary(off)
+
+        result={
+            "study":"V83.1_LOW_RAM_CAUSAL_EDGE_STATE",
+            "symbols_used":len(used),
+            "cohort_trades_total":len(rows),
+            "warmup_trades":V83_LOOKBACK,
+            "evaluated_trades":len(evaluated),
+            "frozen_rule":{
+                "EDGE_ON":"previous 30 completed trades PF > 1.05 AND mean net > 0",
+                "lookback_trades":30,
+                "causal":True,
+                "retuned":False
+            },
+            "results":{
+                "ALL":{**all_s,"chronological_blocks":v831_blocks(evaluated)},
+                "EDGE_ON":{**on_s,
+                    "retention_pct":round(100*len(on)/len(evaluated),2),
+                    "chronological_blocks":v831_blocks(on)},
+                "EDGE_OFF":{**off_s,
+                    "retention_pct":round(100*len(off)/len(evaluated),2),
+                    "chronological_blocks":v831_blocks(off)}
+            },
+            "chronological_thirds":thirds,
+            "decision":{
+                "EDGE_ON_BETTER":bool(
+                    on_s["n"]>=30 and
+                    on_s["profit_factor"] is not None and
+                    all_s["profit_factor"] is not None and
+                    on_s["profit_factor"]>all_s["profit_factor"] and
+                    on_s["mean_net_pct"] is not None and
+                    on_s["mean_net_pct"]>0
+                ),
+                "promotion":"DIAGNOSTIC_ONLY"
+            },
+            "guardrails":[
+                "Same frozen V66 CONFIRM10 + BASE V70 + TIME120 cohort.",
+                "Only previous completed trades determine EDGE_ON.",
+                "No threshold grid search or retuning.",
+                "V82 cache reused; no Binance refetch.",
+                "PostgreSQL persists progress/result across Render restart.",
+                "V83.1 deliberately omits heavy all-symbol market-context reconstruction.",
+                "V61/V74 unchanged; research/paper only; no orders."
+            ]
+        }
+
+        state.update(
+            status="DONE",result=result,error=None,
+            progress={"stage":"done","done":len(evaluated),"total":len(evaluated)},
+            finished_utc=utc_now()
+        )
+        await asyncio.to_thread(v831_save,state)
+
+    except Exception as e:
+        state.update(status="ERROR",error=f"{type(e).__name__}: {e}",finished_utc=utc_now())
+        try: await asyncio.to_thread(v831_save,state)
+        except Exception: pass
+
+@app.get("/v831-start")
+async def v831_start():
+    global V831_TASK
+    old=await asyncio.to_thread(v831_get)
+    if V831_TASK is not None and not V831_TASK.done():
+        return {"status":"ALREADY_RUNNING","paper_only":True}
+    if old and old.get("status")=="DONE":
+        return {"status":"ALREADY_DONE","paper_only":True,"use":"/v831-status"}
+    V831_TASK=asyncio.create_task(v831_run())
+    return {"status":"STARTED","study":"V83.1_LOW_RAM_CAUSAL_EDGE_STATE",
+            "paper_only":True,"trading":False,"orders":False}
+
+@app.get("/v831-status")
+async def v831_status():
+    state=await asyncio.to_thread(v831_get)
+    return {
+        **MODE_INFO,
+        "status":"OK",
+        "panel":"V83.1_LOW_RAM_CAUSAL_EDGE_STATE",
+        "trading":False,"orders":False,
+        "active_strategy_changed":False,
+        "v61_unchanged":True,"v74_unchanged":True,
+        "study":state,
+        "generated_utc":utc_now()
+    }
+
+@app.on_event("startup")
+async def v831_resume():
+    global V831_TASK
+    try:
+        state=await asyncio.to_thread(v831_get)
+        if state and state.get("status")=="RUNNING":
+            V831_TASK=asyncio.create_task(v831_run())
+    except Exception:
+        pass
