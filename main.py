@@ -15654,16 +15654,18 @@ def v79_cache_put(sym,payload):
           SET payload=EXCLUDED.payload,updated_at=NOW()""",(V79_RUN_KEY,sym,json.dumps(payload)))
       conn.commit()
 
-async def v79_fetch_klines(sym,start_ms,end_ms):
-    # Durable exact-window fetch; 5m candles.
+async def v79_fetch_klines(sym,start_ms,end_ms,client=None):
+    # Durable exact-window fetch using the SAME Binance data endpoint as the working project.
     old=v79_cache_get(sym)
-    if isinstance(old,list) and len(old)>=500:return old
+    if isinstance(old,list) and len(old)>=500:
+      return old
     rows=[];cur=start_ms
-    async with httpx.AsyncClient(timeout=30) as client:
+    own_client = client is None
+    c = client or httpx.AsyncClient(timeout=30)
+    try:
       while cur<end_ms:
-        rr=await client.get(f"{BINANCE_BASE}/api/v3/klines",
+        data=await get_json(c,"/api/v3/klines",
           params={"symbol":sym,"interval":"5m","startTime":cur,"endTime":end_ms,"limit":1000})
-        rr.raise_for_status();data=rr.json()
         if not data:break
         for x in data:
           rows.append({"open_time":int(x[0]),"open":float(x[1]),"high":float(x[2]),
@@ -15672,8 +15674,11 @@ async def v79_fetch_klines(sym,start_ms,end_ms):
         if nxt<=cur:break
         cur=nxt
         await asyncio.sleep(.04)
-    # dedupe
-    rows=list({int(x["open_time"]):x for x in rows}.values());rows.sort(key=lambda x:x["open_time"])
+    finally:
+      if own_client:
+        await c.aclose()
+    rows=list({int(x["open_time"]):x for x in rows}.values())
+    rows.sort(key=lambda x:x["open_time"])
     if rows:v79_cache_put(sym,rows)
     return rows
 
@@ -15707,17 +15712,22 @@ async def v79_run(symbols=40,days=40):
       syms=[x["symbol"] for x in uni[:symbols] if isinstance(x,dict) and x.get("symbol")]
       if not syms:raise RuntimeError("No symbols from current cleaned universe")
       fetch_syms=list(dict.fromkeys(syms+["BTCUSDT"]))
-      raw={};failed=[]
-      for idx,sym in enumerate(fetch_syms,1):
-        try:
-          x=await v79_fetch_klines(sym,start_ms,now_ms)
-          if len(x)>=500:raw[sym]=x
-          else:failed.append(sym)
-        except Exception:
-          failed.append(sym)
-        V79_STATE["progress"]={"stage":"fetch_newer_40d","done":min(idx,symbols),"total":symbols}
-        if idx%4==0:v79_save()
-      if "BTCUSDT" not in raw:raise RuntimeError("BTCUSDT newer-window data unavailable")
+      raw={};failed=[];fetch_errors={}
+      async with httpx.AsyncClient(timeout=30) as data_client:
+        for idx,sym in enumerate(fetch_syms,1):
+          try:
+            x=await v79_fetch_klines(sym,start_ms,now_ms,data_client)
+            if len(x)>=500:
+              raw[sym]=x
+            else:
+              failed.append(sym);fetch_errors[sym]=f"only_{len(x)}_candles"
+          except Exception as e:
+            failed.append(sym);fetch_errors[sym]=f"{type(e).__name__}: {e}"
+          V79_STATE["progress"]={"stage":"fetch_newer_40d","done":idx,"total":len(fetch_syms),
+            "ok":len(raw),"failed":len(failed)}
+          if idx%4==0:v79_save()
+      if "BTCUSDT" not in raw:
+        raise RuntimeError("BTCUSDT newer-window data unavailable; detail="+fetch_errors.get("BTCUSDT","unknown"))
       # compact only selected alts; BTC separate
       store={};used=[]
       for sym in syms:
@@ -15740,7 +15750,8 @@ async def v79_run(symbols=40,days=40):
             "cutpoint_source":"V78 older-OOS discovery; unchanged in V79"},
           "results":ev,
           "data":{"symbols_requested":symbols,"symbols_used":len(used),"symbols":used,"failed":failed,
-                  "source":"fresh Binance 5m historical fetch cached in PostgreSQL"},
+                  "fetch_errors":fetch_errors,
+                  "source":"fresh Binance data-api 5m historical fetch cached in PostgreSQL"},
           "guardrails":["Primary dispersion threshold 0.69157 frozen before newer-window test.",
             "No V79 threshold search or retuning.","Rank-high tertile is secondary descriptive robustness only.",
             "Frozen V66 entry, BASE V70 parent cohort and TIME120 exit unchanged.",
