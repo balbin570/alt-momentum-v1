@@ -16117,3 +16117,82 @@ async def v80_status():
     return {**MODE_INFO,"status":"OK","panel":"V80_REGIME_TRANSITION_DIAGNOSTIC",
       "trading":False,"orders":False,"active_strategy_changed":False,
       "v74_prospective_unchanged":True,"study":V80_STATE,"generated_utc":utc_now()}
+
+# === V80.1 OUTCOME x REGIME DIAGNOSTIC ===
+V801_STATE={"status":"IDLE","progress":{},"result":None,"error":None}
+V801_TASK=None
+def v801_num(v):
+    try:
+        x=float(v); return x if math.isfinite(x) else None
+    except Exception:return None
+def v801_net(r):
+    for k in ("net_return_pct","net_pct","return_net_pct","ret_net_pct","pnl_pct","return_pct","ret120_net_pct","net"):
+        x=v801_num(r.get(k))
+        if x is not None:return x,k
+    return None,None
+def v801_corr(a,b):
+    p=[(v801_num(x),v801_num(y)) for x,y in zip(a,b)]
+    p=[z for z in p if z[0] is not None and z[1] is not None]
+    if len(p)<3:return None
+    x=[z[0] for z in p];y=[z[1] for z in p];mx=statistics.mean(x);my=statistics.mean(y)
+    n=sum((u-mx)*(v-my) for u,v in p);dx=sum((u-mx)**2 for u in x);dy=sum((v-my)**2 for v in y)
+    return round(n/math.sqrt(dx*dy),5) if dx>0 and dy>0 else None
+def v801_group(rows,fs):
+    ns=[r["net"] for r in rows];w=[x for x in ns if x>0];l=[x for x in ns if x<=0]
+    return {"n":len(rows),"mean_net_pct":round(statistics.mean(ns),5) if ns else None,
+      "median_net_pct":round(statistics.median(ns),5) if ns else None,
+      "win_rate_pct":round(100*len(w)/len(ns),3) if ns else None,
+      "profit_factor":round(sum(w)/(-sum(l)),4) if l and -sum(l)>0 else None,
+      "context":v80_summarize(rows,fs)}
+async def v801_run():
+    global V801_STATE
+    V801_STATE={"status":"RUNNING","progress":{"stage":"load"},"result":None,"error":None,"started_utc":utc_now()}
+    try:
+        job=v794_job_get()
+        if not job or job.get("status")!="DONE":raise RuntimeError("V79.4 DONE required")
+        syms=job["symbols"];btc=v79_cache_get("BTCUSDT");alts=[];store={};used=[]
+        for sym in syms:
+            x=v79_cache_get(sym)
+            if isinstance(x,list) and len(x)>=500:
+                alts.append(x);store[len(store)]=v76_compact(x);used.append(sym)
+        rows=await asyncio.to_thread(v78_recreate,store,btc,.15,.10)
+        rs=int(job["report_start_ms"]);re=int(job["end_ms"])
+        rows=sorted([r for r in rows if rs<=int(r["entry_time_ms"])<re],key=lambda r:int(r["entry_time_ms"]))
+        en=[];fc={}
+        for i,r in enumerate(rows):
+            net,f=v801_net(r)
+            if net is None:continue
+            fc[f]=fc.get(f,0)+1
+            en.append({"net":net,"context":v80_context_for_time(int(r["entry_time_ms"]),btc,alts),"ts":int(r["entry_time_ms"])})
+            if (i+1)%50==0:
+                V801_STATE["progress"]={"stage":"context","done":i+1,"total":len(rows)};await asyncio.sleep(0)
+        if not en:raise RuntimeError("No net-return field found; keys="+",".join(sorted(rows[0].keys()) if rows else []))
+        fs=["btc30","btc1h","btc4h","btc24h","btc_accel_30_vs_1h","btc_vol1h","alt30","alt1h","alt4h","alt24h","alt_accel_30_vs_1h","alt_dispersion30"]
+        w=[r for r in en if r["net"]>0];l=[r for r in en if r["net"]<=0]
+        ws=v80_summarize(w,fs);ls=v80_summarize(l,fs)
+        diff={f:None if ws[f]["mean"] is None or ls[f]["mean"] is None else round(ws[f]["mean"]-ls[f]["mean"],5) for f in fs}
+        corr={f:v801_corr([r["context"].get(f) for r in en],[r["net"] for r in en]) for f in fs}
+        qs=[];z=max(1,len(en)//4)
+        for q in range(4):
+            p=en[q*z:(q+1)*z if q<3 else len(en)]
+            qs.append({"block":q+1,"start_utc":datetime.fromtimestamp(p[0]["ts"]/1000,timezone.utc).isoformat() if p else None,
+                       "end_utc":datetime.fromtimestamp(p[-1]["ts"]/1000,timezone.utc).isoformat() if p else None,**v801_group(p,fs)})
+        V801_STATE={"status":"DONE","progress":{"stage":"done","done":len(en),"total":len(rows)},
+          "result":{"validation":"V80.1_OUTCOME_X_REGIME_DIAGNOSTIC",
+          "sample":{"recreated":len(rows),"valid_outcomes":len(en),"symbols_used":len(used),"net_field_counts":fc},
+          "ALL":v801_group(en,fs),"WINNERS":v801_group(w,fs),"LOSERS":v801_group(l,fs),
+          "WINNER_MINUS_LOSER_CONTEXT_MEAN":diff,"PEARSON_CONTEXT_VS_NET":corr,"CHRONOLOGICAL_QUARTERS":qs,
+          "guardrails":["Diagnostic only; no threshold selected or optimized.","No strategy/execution changes.",
+          "Frozen V66 entry, BASE V70 parent cohort and TIME120 exit preserved.","Correlation is descriptive, not causal.",
+          "Do not convert winner/loser means into cutpoints.","V61/V74 unchanged.","Research/paper only; no orders."]},
+          "error":None,"finished_utc":utc_now()}
+    except Exception as e:V801_STATE.update(status="ERROR",error=f"{type(e).__name__}: {e}",finished_utc=utc_now())
+@app.get("/v80-1-start")
+async def v801_start():
+    global V801_TASK
+    if V801_TASK is not None and not V801_TASK.done():return {"status":"ALREADY_RUNNING","progress":V801_STATE.get("progress")}
+    V801_TASK=asyncio.create_task(v801_run());return {"status":"STARTED","paper_only":True,"study":"V80.1_OUTCOME_X_REGIME_DIAGNOSTIC"}
+@app.get("/v80-1-status")
+async def v801_status():
+    return {**MODE_INFO,"status":"OK","panel":"V80.1_OUTCOME_X_REGIME_DIAGNOSTIC","trading":False,"orders":False,
+      "active_strategy_changed":False,"v74_prospective_unchanged":True,"study":V801_STATE,"generated_utc":utc_now()}
