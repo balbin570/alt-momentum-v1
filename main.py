@@ -18244,3 +18244,134 @@ async def v88_start():
 async def v88_status():
     s=await asyncio.to_thread(v88_get)
     return {**MODE_INFO,"status":"OK","panel":"V88_CAUSAL_AUDIT_V86_4_FACTOR","trading":False,"orders":False,"entry_gate":False,"v61_unchanged":True,"v74_unchanged":True,"study":s,"generated_utc":utc_now()}
+
+# ============================================================
+# V89 — FORWARD SHADOW: V66 CONFIRM10 + V88 CAUSAL QUALITY
+# PAPER/RESEARCH ONLY. No entry gate: records ALL frozen V66 CONFIRM10 Top1 entries.
+# Quality score is observational only (0-2 vs 3-4). TIME120 frozen exit.
+# V32/V61/V74 unchanged.
+# ============================================================
+V89_THRESH={"alt30":0.412776,"btc30":0.234763,"disp30":0.574416,"breakout_change_pct":0.801574}
+V89_SCAN_SECONDS=60
+V89_STATE={"open":[],"closed":[],"seen":[],"last_scan":None,"errors":[],"started_utc":None}
+V89_TASK=None
+
+def v89_db_init():
+    if not V21_DB_URL:return False
+    with v21_db_connect() as conn:
+      with conn.cursor() as cur:
+        cur.execute("""CREATE TABLE IF NOT EXISTS alt_v89_shadow_state(
+          id INTEGER PRIMARY KEY,payload JSONB NOT NULL,updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())""")
+      conn.commit()
+    return True
+
+def v89_save():
+    if not V21_DB_URL:return False
+    with v21_db_connect() as conn:
+      with conn.cursor() as cur:
+        cur.execute("""INSERT INTO alt_v89_shadow_state(id,payload,updated_at) VALUES(1,%s::jsonb,NOW())
+          ON CONFLICT(id) DO UPDATE SET payload=EXCLUDED.payload,updated_at=NOW()""",(json.dumps(V89_STATE,default=str),))
+      conn.commit()
+    return True
+
+def v89_load():
+    global V89_STATE
+    if not V21_DB_URL:return
+    v89_db_init()
+    with v21_db_connect() as conn:
+      with conn.cursor() as cur:
+        cur.execute("SELECT payload FROM alt_v89_shadow_state WHERE id=1");r=cur.fetchone()
+    if r and isinstance(r[0],dict):V89_STATE=r[0]
+
+def v89_perf(rows):
+    vals=[float(x.get("net_pct",0)) for x in rows if x.get("net_pct") is not None]
+    if not vals:return {"n":0,"mean_net_pct":None,"win_rate_pct":None,"profit_factor":None}
+    w=[x for x in vals if x>0];l=[x for x in vals if x<0]
+    pf=(sum(w)/abs(sum(l))) if l else (999.0 if w else None)
+    return {"n":len(vals),"mean_net_pct":round(sum(vals)/len(vals),4),
+      "win_rate_pct":round(100*len(w)/len(vals),2),"profit_factor":round(pf,4) if pf is not None else None}
+
+async def v89_scan_once():
+    scan_utc=utc_now()
+    try:
+      async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
+        uni=await build_universe(client);syms=[u["symbol"] for u in uni if u["symbol"]!="BTCUSDT"][:40]
+        sem=asyncio.Semaphore(12)
+        async def one(sym):
+          async with sem:
+            try:return sym,await asyncio.wait_for(v74_candles(client,sym,90),25),None
+            except Exception as e:return sym,None,f"{type(e).__name__}: {e}"
+        vals=await asyncio.gather(*[one(x) for x in syms])
+        data={s:c for s,c,e in vals if c and len(c)>=55};errs=[{"symbol":s,"error":e} for s,c,e in vals if e]
+        btc=await v74_candles(client,"BTCUSDT",90)
+        if len(btc)<55:raise RuntimeError("BTC candles insufficient")
+
+        # Frozen TIME120 exit using live BID.
+        now=alt_now_ms();still=[]
+        for p in V89_STATE.get("open",[]):
+          if now<int(p["exit_due_ms"]):still.append(p);continue
+          q=await live_quote(client,p["symbol"]);xp=float(q["bid"]) if q else None
+          if xp is None:
+            cc=data.get(p["symbol"],[]);xp=float(cc[-1]["close"]) if cc else float(p["entry_price"])
+          gross=v74_pct(float(p["entry_price"]),xp);net=gross-0.15
+          p.update(exit_price=xp,exit_utc=utc_now(),exit_reason="TIME120",gross_pct=round(gross,4),cost_pct=0.15,net_pct=round(net,4),status="CLOSED_SHADOW")
+          V89_STATE.setdefault("closed",[]).append(p)
+          await alt_safe_send(f"ALT V89 SHADOW CIKIS\nCoin: {p['symbol']}\nKalite: {p['v88_score']}/4 - {p['v88_label']}\nNet: {p['net_pct']}%\nCikis: TIME120\nPAPER/GOZLEMSEL - GERCEK EMIR YOK","V89_EXIT",p["symbol"])
+        V89_STATE["open"]=still;V89_STATE["closed"]=V89_STATE.get("closed",[])[-1000:]
+
+        # Causal market context: all candles here are completed before live entry.
+        b30=v74_pct(btc[-7]["close"],btc[-1]["close"])
+        a30=[v74_pct(c[-7]["close"],c[-1]["close"]) for c in data.values() if len(c)>=7]
+        alt30=(sum(a30)/len(a30)) if a30 else -999
+        disp30=statistics.pstdev(a30) if len(a30)>=2 else -999
+
+        # Frozen V66 CONFIRM10 Top1 candidate: breakout + two completed rising closes.
+        candidates=[]
+        for sym,c in data.items():
+          if len(c)<25:continue
+          i=len(c)-3;bo=c[i];ch=v74_pct(bo["open"],bo["close"]);av=sum(x["volume"] for x in c[i-20:i])/20;vr=(bo["volume"]/av) if av>0 else 0
+          if ch<0.50 or vr<1.20:continue
+          if not(c[i+1]["close"]>bo["close"] and c[i+2]["close"]>c[i+1]["close"]):continue
+          candidates.append({"symbol":sym,"breakout_time":bo["open_time"],"breakout_change_pct":ch,"volume_ratio":vr,"breakout_close":bo["close"],"confirm2_close":c[i+2]["close"]})
+        candidates.sort(key=lambda x:(x["breakout_change_pct"],x["volume_ratio"]),reverse=True)
+        accepted=None
+        if candidates:
+          e=candidates[0];key=f'{e["symbol"]}:{e["breakout_time"]}';seen=set(V89_STATE.get("seen",[]));already=any(p["symbol"]==e["symbol"] for p in V89_STATE.get("open",[]))
+          if key not in seen and not already:
+            q=await live_quote(client,e["symbol"])
+            if q and q["spread_pct"]<=SPREAD_MAX_PCT:
+              factors={"alt30":alt30,"btc30":b30,"disp30":disp30,"breakout_change_pct":float(e["breakout_change_pct"])}
+              passed={k:(factors[k]>=V89_THRESH[k]) for k in V89_THRESH};score=sum(1 for x in passed.values() if x);label="YUKSEK" if score>=3 else ("ORTA" if score==2 else "DUSUK")
+              ep=float(q["ask"]);entry_ms=alt_now_ms();p={**e,"entry_price":ep,"entry_utc":utc_now(),"entry_ms":entry_ms,"exit_due_ms":entry_ms+120*60*1000,"status":"OPEN_SHADOW","execution_version":"V89_V66_CONFIRM10_CAUSAL_QUALITY_TIME120","spread_pct":round(float(q["spread_pct"]),4),"alt30_pct":round(alt30,6),"btc30_pct":round(b30,6),"disp30_pct":round(disp30,6),"v88_score":score,"v88_label":label,"v88_factor_pass":passed,"entry_gate":False}
+              V89_STATE.setdefault("open",[]).append(p);accepted=p
+              await alt_safe_send(f"ALT V89 SHADOW GIRIS\nCoin: {e['symbol']}\nV88 Kalite: {score}/4 - {label} (gozlemsel)\nBreakout: {e['breakout_change_pct']:.3f}% | Vol: {e['volume_ratio']:.2f}x\nALT30: {alt30:.3f}% | BTC30: {b30:.3f}% | Disp30: {disp30:.3f}\nGiris ask: {ep}\nTIME120 | PAPER - GERCEK EMIR YOK","V89_ENTRY",e["symbol"])
+            seen.add(key);V89_STATE["seen"]=list(seen)[-2000:]
+        V89_STATE["last_scan"]={"utc":scan_utc,"symbols":len(data),"errors":len(errs),"confirm10_candidates":len(candidates),"accepted":accepted["symbol"] if accepted else None,"alt30_pct":round(alt30,4),"btc30_pct":round(b30,4),"disp30_pct":round(disp30,4)}
+        V89_STATE["errors"]=errs[-20:];v89_save();return V89_STATE["last_scan"]
+    except Exception as e:
+      V89_STATE["last_scan"]={"utc":scan_utc,"error":f"{type(e).__name__}: {e}"}
+      try:v89_save()
+      except Exception:pass
+      return V89_STATE["last_scan"]
+
+async def v89_loop():
+    while True:
+      try:await v89_scan_once()
+      except Exception:pass
+      await asyncio.sleep(V89_SCAN_SECONDS)
+
+@app.on_event("startup")
+async def v89_startup():
+    global V89_TASK
+    try:v89_load()
+    except Exception:pass
+    if not V89_STATE.get("started_utc"):V89_STATE["started_utc"]=utc_now()
+    if V89_TASK is None:V89_TASK=asyncio.create_task(v89_loop())
+
+@app.get("/v89-scan-now")
+async def v89_scan_now():return {"status":"OK","paper_only":True,"scan":await v89_scan_once()}
+
+@app.get("/v89-status")
+async def v89_status():
+    cl=V89_STATE.get("closed",[]);low=[x for x in cl if int(x.get("v88_score",-1))<=2];high=[x for x in cl if int(x.get("v88_score",-1))>=3]
+    return {**MODE_INFO,"status":"OK","panel":"V89_FORWARD_V66_CAUSAL_QUALITY_SHADOW","trading":False,"orders":False,"entry_gate":False,"active_strategy_changed":False,"v32_unchanged":True,"v61_unchanged":True,"v74_unchanged":True,"frozen_entry":"V66_CONFIRM_10M_TOP1","frozen_exit":"TIME120","quality_thresholds":V89_THRESH,"quality_use":"OBSERVATIONAL_ONLY_NOT_ENTRY_GATE","last_scan":V89_STATE.get("last_scan"),"open_count":len(V89_STATE.get("open",[])),"closed_count":len(cl),"performance":{"all":v89_perf(cl),"score_0_2":v89_perf(low),"score_3_4":v89_perf(high)},"open":V89_STATE.get("open",[])[-20:],"recent_closed":cl[-30:],"errors":V89_STATE.get("errors",[])[-10:],"started_utc":V89_STATE.get("started_utc"),"generated_utc":utc_now()}
