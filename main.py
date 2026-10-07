@@ -15378,3 +15378,219 @@ async def v77_status():
     return {**MODE_INFO,"status":"OK","panel":"V77_REGIME_SHIFT_DIAGNOSTIC",
       "trading":False,"orders":False,"active_strategy_changed":False,
       "v74_prospective_unchanged":True,"study":V77_STATE,"generated_utc":utc_now()}
+
+
+# ============================================================
+# V78 â€” REGIME STRUCTURE VALIDATION
+# Frozen entry/exit: V66 CONFIRM_10M + TIME120.
+# Tests 24h BTC/ALT regime + dispersion structure.
+# Research only; no orders; active V61/V74 unchanged.
+# ============================================================
+V78_STATE={"status":"IDLE","progress":{},"result":None,"error":None,"started_utc":None,"finished_utc":None}
+V78_TASK=None
+V78_RUN_KEY="V78_REGIME_STRUCTURE_VALIDATION"
+
+def v78_db_init():
+    if not V21_DB_URL:return False
+    with v21_db_connect() as conn:
+      with conn.cursor() as cur:
+        cur.execute("""CREATE TABLE IF NOT EXISTS alt_v78_validation_state(
+          run_key TEXT PRIMARY KEY,payload JSONB NOT NULL,updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())""")
+      conn.commit()
+    return True
+
+def v78_save():
+    if not V21_DB_URL:return
+    v78_db_init()
+    with v21_db_connect() as conn:
+      with conn.cursor() as cur:
+        cur.execute("""INSERT INTO alt_v78_validation_state(run_key,payload,updated_at)
+          VALUES(%s,%s::jsonb,NOW()) ON CONFLICT(run_key) DO UPDATE
+          SET payload=EXCLUDED.payload,updated_at=NOW()""",(V78_RUN_KEY,json.dumps(V78_STATE,default=str)))
+      conn.commit()
+
+def v78_load():
+    if not V21_DB_URL:return None
+    v78_db_init()
+    with v21_db_connect() as conn:
+      with conn.cursor() as cur:
+        cur.execute("SELECT payload FROM alt_v78_validation_state WHERE run_key=%s",(V78_RUN_KEY,));r=cur.fetchone()
+    return r[0] if r else None
+
+def v78_pf(nets):
+    pos=sum(x for x in nets if x>0);neg=-sum(x for x in nets if x<0)
+    return round(pos/neg,4) if neg>0 else (999.0 if pos>0 else 0.0)
+
+def v78_ci(nets):
+    if not nets:return [None,None]
+    # deterministic bootstrap for reproducibility
+    import random
+    rr=random.Random(7801);n=len(nets);means=[]
+    for _ in range(1200):
+      means.append(sum(nets[rr.randrange(n)] for __ in range(n))/n)
+    means.sort()
+    return [round(means[int(.025*len(means))],4),round(means[int(.975*len(means))-1],4)]
+
+def v78_metrics(rows):
+    nets=[float(r["net"]) for r in rows]
+    if not nets:return {"n":0,"mean_net_pct":None,"median_net_pct":None,"win_rate_pct":None,"profit_factor":None,"mean_95ci":[None,None]}
+    return {"n":len(nets),"mean_net_pct":round(sum(nets)/len(nets),4),
+      "median_net_pct":round(statistics.median(nets),4),
+      "win_rate_pct":round(100*sum(x>0 for x in nets)/len(nets),2),
+      "profit_factor":v78_pf(nets),"mean_95ci":v78_ci(nets)}
+
+def v78_blocks(rows):
+    if not rows:return []
+    z=sorted(rows,key=lambda r:r["entry_time_ms"]);n=len(z);out=[]
+    for b in range(4):
+      a=(b*n)//4;e=((b+1)*n)//4
+      q=z[a:e]
+      if not q:continue
+      m=v78_metrics(q)
+      m.update(block=b+1,start_day=q[0]["day"],end_day=q[-1]["day"])
+      out.append(m)
+    return out
+
+def v78_recreate(store,btc,cost=.15,entry_slip=.10):
+    import bisect
+    btc_times=[int(x["open_time"]) for x in btc]
+    btc_c=array("d",[float(x["close"]) for x in btc])
+    cand=v66_candidates(store)
+    out=[];busy={}
+    for tm,si,i,ch,vr in cand:
+      d=store[si];o,c,t=d["o"],d["c"],d["t"]
+      if i+3>=len(o) or i+2>=len(c):continue
+      breakout=float(c[i]);ei=i+3
+      if not(c[i+1]>breakout and c[i+2]>c[i+1]):continue
+      etm=int(t[ei])
+      if busy.get(si,0)>etm:continue
+      end=min(len(o)-1,ei+24)
+      ep=float(o[ei])*(1+entry_slip/100);xp=float(o[end])
+      net=((xp/ep)-1)*100-cost
+      busy[si]=int(t[end])
+
+      bi=bisect.bisect_right(btc_times,etm)-1
+      if bi<288:continue
+      btc30=v77_ret(btc_c,bi,6);btc4=v77_ret(btc_c,bi,48);btc24=v77_ret(btc_c,bi,288)
+      a30=[];a4=[];a24=[]
+      for od in store.values():
+        j=bisect.bisect_right(od["t"],etm)-1
+        if j<0:continue
+        for bars,bucket in ((6,a30),(48,a4),(288,a24)):
+          x=v77_ret(od["c"],j,bars)
+          if x is not None:bucket.append(x)
+      if not a30 or not a24:continue
+      alt30=sum(a30)/len(a30);alt4=sum(a4)/len(a4) if a4 else None;alt24=sum(a24)/len(a24)
+      # Frozen V70 base cohort remains the parent cohort.
+      if not(btc30>0 and alt30>0):continue
+      out.append({"day":datetime.fromtimestamp(etm/1000,timezone.utc).strftime("%Y-%m-%d"),
+        "entry_time_ms":etm,"net":float(net),"btc30":btc30,"btc4":btc4,"btc24":btc24,
+        "alt30":alt30,"alt4":alt4,"alt24":alt24,
+        "disp30":statistics.pstdev(a30) if len(a30)>1 else None,
+        "breakout_change_pct":float(ch),"volume_ratio":float(vr)})
+    return out
+
+def v78_group(rows,pred):
+    q=[r for r in rows if pred(r)]
+    return {**v78_metrics(q),"chronological_blocks":v78_blocks(q)}
+
+def v78_eval(rows):
+    # Predeclared sign-based regime groups; no fitted numeric BTC/ALT thresholds.
+    result={}
+    result["CONTROL_BASE_V70"]=v78_group(rows,lambda r:True)
+    result["BTC24_POSITIVE"]=v78_group(rows,lambda r:r["btc24"]>0)
+    result["BTC24_NEGATIVE_OR_ZERO"]=v78_group(rows,lambda r:r["btc24"]<=0)
+    result["ALT24_POSITIVE"]=v78_group(rows,lambda r:r["alt24"]>0)
+    result["ALT24_NEGATIVE_OR_ZERO"]=v78_group(rows,lambda r:r["alt24"]<=0)
+    result["BTC24_AND_ALT24_POSITIVE"]=v78_group(rows,lambda r:r["btc24"]>0 and r["alt24"]>0)
+    result["BTC24_OR_ALT24_NONPOSITIVE"]=v78_group(rows,lambda r:not(r["btc24"]>0 and r["alt24"]>0))
+
+    # Continuity: 4h and 24h both positive vs not; no tuned cutpoint.
+    result["BTC4H24H_AND_ALT4H24H_POSITIVE"]=v78_group(rows,lambda r:
+      r["btc4"] is not None and r["alt4"] is not None and r["btc4"]>0 and r["btc24"]>0 and r["alt4"]>0 and r["alt24"]>0)
+
+    # Dispersion tertiles are descriptive structural ranks, not fixed optimized thresholds.
+    valid=sorted(r["disp30"] for r in rows if r["disp30"] is not None)
+    if valid:
+      q1=valid[int((len(valid)-1)/3)];q2=valid[int(2*(len(valid)-1)/3)]
+      result["DISPERSION_TERTILES"]={
+        "cutpoints_descriptive":[round(q1,5),round(q2,5)],
+        "LOW":v78_group(rows,lambda r:r["disp30"] is not None and r["disp30"]<=q1),
+        "MID":v78_group(rows,lambda r:r["disp30"] is not None and q1<r["disp30"]<=q2),
+        "HIGH":v78_group(rows,lambda r:r["disp30"] is not None and r["disp30"]>q2)}
+      pos=[r for r in rows if r["btc24"]>0 and r["alt24"]>0]
+      result["POSITIVE_24H_WITH_DISPERSION_TERTILES"]={
+        "LOW":v78_group(pos,lambda r:r["disp30"] is not None and r["disp30"]<=q1),
+        "MID":v78_group(pos,lambda r:r["disp30"] is not None and q1<r["disp30"]<=q2),
+        "HIGH":v78_group(pos,lambda r:r["disp30"] is not None and r["disp30"]>q2)}
+    return result
+
+async def v78_run():
+    global V78_STATE
+    V78_STATE={"status":"RUNNING","progress":{"stage":"load_frozen_cache","done":0,"total":40},
+      "result":None,"error":None,"started_utc":utc_now(),"finished_utc":None}
+    try:v78_save()
+    except Exception:pass
+    try:
+      with v21_db_connect() as conn:
+        with conn.cursor() as cur:
+          cur.execute("""SELECT symbol FROM alt_v75_symbol_cache WHERE run_key=%s AND symbol<>%s
+            ORDER BY updated_at ASC LIMIT 40""",(V75_RUN_KEY,"__BTCUSDT__"))
+          syms=[x[0] for x in cur.fetchall()]
+      store={};failed=[]
+      for idx,sym in enumerate(syms,1):
+        c=v75_cache_get(sym)
+        if isinstance(c,list) and len(c)>=500:store[len(store)]=v76_compact(c)
+        else:failed.append(sym)
+        c=None
+        V78_STATE["progress"]={"stage":"compact_rebuild","done":idx,"total":len(syms)}
+        if idx%4==0:
+          v78_save();await asyncio.sleep(.05)
+      btc=v75_cache_get("__BTCUSDT__")
+      if not isinstance(btc,list):raise RuntimeError("V75 BTC cache missing")
+      V78_STATE["progress"]={"stage":"evaluate_older_oos","done":len(syms),"total":len(syms)};v78_save()
+      older=await asyncio.to_thread(v78_recreate,store,btc,.15,.10)
+      older_eval=await asyncio.to_thread(v78_eval,older)
+
+      # Newer comparison uses V77/V76 available cache only if it contains dates beyond older OOS.
+      # We do not fabricate a second sample. Report availability explicitly.
+      max_day=max((r["day"] for r in older),default=None)
+      V78_STATE.update(status="DONE",progress={"stage":"done","done":len(syms),"total":len(syms)},finished_utc=utc_now(),
+        result={"validation":"V78_REGIME_STRUCTURE_FROZEN_BASE_V70",
+          "frozen_entry":"V66_CONFIRM_10M_TOP1","frozen_exit":"TIME120",
+          "parent_cohort":"BTC30>0 AND ALT breadth30>0",
+          "OLDER_INDEPENDENT_OOS":older_eval,
+          "sample":{"base_trades":len(older),"last_trade_day":max_day,"symbols_used":len(store),"symbols_failed":failed,
+            "source":"V75 durable older-OOS cache"},
+          "newer_40d_note":"Not synthesized from the older-only cache. A separate newer frozen cache is required for a truly independent second-window comparison.",
+          "guardrails":["No fitted BTC24/ALT24 numeric thresholds; sign tests only.",
+            "Dispersion tertiles are descriptive rank buckets, not promoted thresholds.",
+            "Every main group reports N, mean, median, WR, PF, bootstrap 95% CI and four chronological blocks.",
+            "Frozen V66 entry and TIME120 exit unchanged.","No OOS threshold search.",
+            "Current top-volume universe has survivorship-bias limitation.",
+            "V74/V61 execution unchanged.","Research/paper only; no orders."]})
+      v78_save()
+    except Exception as e:
+      V78_STATE.update(status="ERROR",error=f"{type(e).__name__}: {e}",finished_utc=utc_now())
+      try:v78_save()
+      except Exception:pass
+
+@app.get("/v78-start")
+async def v78_start():
+    global V78_TASK
+    if V78_TASK is not None and not V78_TASK.done():
+      return {"status":"ALREADY_RUNNING","progress":V78_STATE.get("progress")}
+    v78_db_init();V78_TASK=asyncio.create_task(v78_run())
+    return {"status":"STARTED","paper_only":True,"study":"V78_REGIME_STRUCTURE_VALIDATION"}
+
+@app.get("/v78-status")
+async def v78_status():
+    global V78_STATE
+    if V78_STATE.get("status")=="IDLE":
+      try:
+        old=v78_load()
+        if old:V78_STATE=old
+      except Exception:pass
+    return {**MODE_INFO,"status":"OK","panel":"V78_REGIME_STRUCTURE_VALIDATION",
+      "trading":False,"orders":False,"active_strategy_changed":False,
+      "v74_prospective_unchanged":True,"study":V78_STATE,"generated_utc":utc_now()}
