@@ -15711,21 +15711,34 @@ async def v79_run(symbols=40,days=40):
         uni=await build_universe(universe_client)
       syms=[x["symbol"] for x in uni[:symbols] if isinstance(x,dict) and x.get("symbol")]
       if not syms:raise RuntimeError("No symbols from current cleaned universe")
-      fetch_syms=list(dict.fromkeys(syms+["BTCUSDT"]))
+      fetch_syms=list(dict.fromkeys(["BTCUSDT"]+syms))
       raw={};failed=[];fetch_errors={}
-      async with httpx.AsyncClient(timeout=30) as data_client:
-        for idx,sym in enumerate(fetch_syms,1):
-          try:
-            x=await v79_fetch_klines(sym,start_ms,now_ms,data_client)
-            if len(x)>=500:
-              raw[sym]=x
-            else:
-              failed.append(sym);fetch_errors[sym]=f"only_{len(x)}_candles"
-          except Exception as e:
-            failed.append(sym);fetch_errors[sym]=f"{type(e).__name__}: {e}"
-          V79_STATE["progress"]={"stage":"fetch_newer_40d","done":idx,"total":len(fetch_syms),
-            "ok":len(raw),"failed":len(failed)}
-          if idx%4==0:v79_save()
+      # V79.3 bounded downloader: one bad symbol cannot freeze the study.
+      sem=asyncio.Semaphore(4)
+      async with httpx.AsyncClient(timeout=httpx.Timeout(20.0,connect=10.0)) as data_client:
+        async def one(sym):
+          async with sem:
+            try:
+              x=await asyncio.wait_for(v79_fetch_klines(sym,start_ms,now_ms,data_client),timeout=90)
+              return sym,x,None
+            except asyncio.TimeoutError:
+              return sym,[],"TIMEOUT_90S"
+            except Exception as e:
+              return sym,[],f"{type(e).__name__}: {e}"
+        tasks=[asyncio.create_task(one(sym)) for sym in fetch_syms]
+        done_count=0
+        for fut in asyncio.as_completed(tasks):
+          sym,x,err=await fut
+          done_count+=1
+          if len(x)>=500:
+            raw[sym]=x
+          else:
+            failed.append(sym)
+            fetch_errors[sym]=err or f"only_{len(x)}_candles"
+          V79_STATE["progress"]={"stage":"fetch_newer_40d","done":done_count,"total":len(fetch_syms),
+            "ok":len(raw),"failed":len(failed),"last_symbol":sym,
+            "last_error":fetch_errors.get(sym)}
+          v79_save()
       if "BTCUSDT" not in raw:
         raise RuntimeError("BTCUSDT newer-window data unavailable; detail="+fetch_errors.get("BTCUSDT","unknown"))
       # compact only selected alts; BTC separate
@@ -15780,6 +15793,6 @@ async def v79_status():
         old=v79_load()
         if old:V79_STATE=old
       except Exception:pass
-    return {**MODE_INFO,"status":"OK","panel":"V79_NEWER_40D_DISPERSION_VALIDATION",
+    return {**MODE_INFO,"status":"OK","panel":"V79.3_NEWER_40D_DISPERSION_VALIDATION_NOHANG",
       "trading":False,"orders":False,"active_strategy_changed":False,
       "v74_prospective_unchanged":True,"study":V79_STATE,"generated_utc":utc_now()}
