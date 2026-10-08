@@ -18375,3 +18375,120 @@ async def v89_scan_now():return {"status":"OK","paper_only":True,"scan":await v8
 async def v89_status():
     cl=V89_STATE.get("closed",[]);low=[x for x in cl if int(x.get("v88_score",-1))<=2];high=[x for x in cl if int(x.get("v88_score",-1))>=3]
     return {**MODE_INFO,"status":"OK","panel":"V89_FORWARD_V66_CAUSAL_QUALITY_SHADOW","trading":False,"orders":False,"entry_gate":False,"active_strategy_changed":False,"v32_unchanged":True,"v61_unchanged":True,"v74_unchanged":True,"frozen_entry":"V66_CONFIRM_10M_TOP1","frozen_exit":"TIME120","quality_thresholds":V89_THRESH,"quality_use":"OBSERVATIONAL_ONLY_NOT_ENTRY_GATE","last_scan":V89_STATE.get("last_scan"),"open_count":len(V89_STATE.get("open",[])),"closed_count":len(cl),"performance":{"all":v89_perf(cl),"score_0_2":v89_perf(low),"score_3_4":v89_perf(high)},"open":V89_STATE.get("open",[])[-20:],"recent_closed":cl[-30:],"errors":V89_STATE.get("errors",[])[-10:],"started_utc":V89_STATE.get("started_utc"),"generated_utc":utc_now()}
+
+# V90 - READ-ONLY COUNTERFACTUAL EXIT RESEARCH FOR V89 CLOSED SHADOWS
+# Does not mutate V89 state or any paper strategy.
+V90_HORIZONS = (30, 60, 90, 120)
+
+
+def v90_stats(values):
+    if not values:
+        return {"n": 0, "mean_net_pct": None, "win_rate_pct": None, "profit_factor": None}
+    w = [v for v in values if v > 0]
+    l = [v for v in values if v < 0]
+    pf = sum(w) / abs(sum(l)) if l else (None if w else 0.0)
+    return {"n": len(values), "mean_net_pct": round(sum(values)/len(values), 4),
+            "win_rate_pct": round(100*len(w)/len(values), 2),
+            "profit_factor": round(pf, 4) if pf is not None else None}
+
+
+def v90_replay(trade, raw):
+    entry_ms = int(trade["entry_ms"])
+    entry = float(trade["entry_price"])
+    # First fully observed minute strictly after live entry. The partial entry
+    # minute is intentionally excluded (unknown pre/post entry price ordering).
+    first_open = ((entry_ms // 60000) + 1) * 60000
+    candles = [k for k in raw if first_open <= int(k[0]) and int(k[6]) <= entry_ms + 120*60000]
+    candles.sort(key=lambda k: int(k[0]))
+    if not candles:
+        return None, "NO_COMPLETE_POST_ENTRY_CANDLES"
+    expected = first_open
+    for k in candles:
+        if int(k[0]) != expected:
+            return None, "MISSING_1M_CANDLE"
+        expected += 60000
+    if len(candles) < 118:
+        return None, "INSUFFICIENT_1M_CANDLES"
+    cost = 0.15
+    results = {}
+    for mins in V90_HORIZONS:
+        target = entry_ms + mins*60000
+        # Candle open at/after requested duration; up to 1m late.
+        after = next((k for k in raw if int(k[0]) >= target), None)
+        if after is None or int(after[0]) > target + 60000:
+            return None, "MISSING_TIME_EXIT_OPEN"
+        results[f"TIME{mins}"] = (float(after[1])/entry - 1)*100 - cost
+    stop_level = entry*0.97
+    trailing_active = False
+    peak = entry
+    stop_out = None
+    trailing_out = None
+    for k in candles:
+        op, hi, lo = float(k[1]), float(k[2]), float(k[3])
+        if stop_out is None and lo <= stop_level:
+            stop_out = (min(op, stop_level)/entry - 1)*100 - cost
+        if trailing_out is None:
+            # Conservative intrabar ordering: check previously established
+            # trailing stop before crediting this minute's new high.
+            if trailing_active:
+                level = peak*0.985
+                if lo <= level:
+                    trailing_out = (min(op, level)/entry - 1)*100 - cost
+            if trailing_out is None:
+                peak = max(peak, hi)
+                if peak >= entry*1.02:
+                    trailing_active = True
+    results["STOP3_OR_TIME120"] = stop_out if stop_out is not None else results["TIME120"]
+    results["TRAIL_2_1_5_OR_TIME120"] = trailing_out if trailing_out is not None else results["TIME120"]
+    return results, None
+
+
+@app.get("/v90-exit-study")
+async def v90_exit_study(limit: int = Query(default=100, ge=1, le=200)):
+    # Snapshot, read-only: do not touch any live/paper state.
+    trades = [dict(x) for x in V89_STATE.get("closed", []) if x.get("entry_ms") and x.get("entry_price")]
+    trades = trades[-limit:]
+    semaphore = asyncio.Semaphore(4)
+    async with httpx.AsyncClient(timeout=httpx.Timeout(35.0)) as client:
+        async def one(t):
+            async with semaphore:
+                try:
+                    start = int(t["entry_ms"])
+                    raw = await get_json(client, "/api/v3/klines", {
+                        "symbol": t["symbol"], "interval": "1m",
+                        "startTime": start - 60000,
+                        "endTime": start + 122*60000,
+                        "limit": 150})
+                    r, err = v90_replay(t, raw)
+                    return t, r, err
+                except Exception as exc:
+                    return t, None, f"{type(exc).__name__}: {str(exc)[:160]}"
+        rows = await asyncio.gather(*(one(t) for t in trades))
+    good = [(t, r) for t, r, err in rows if r is not None]
+    failed = [{"symbol": t["symbol"], "entry_utc": t.get("entry_utc"), "error": err}
+              for t, r, err in rows if r is None]
+    keys = [f"TIME{m}" for m in V90_HORIZONS] + ["STOP3_OR_TIME120", "TRAIL_2_1_5_OR_TIME120"]
+    def group(items):
+        return {key: v90_stats([r[key] for _, r in items]) for key in keys}
+    return {**MODE_INFO, "status": "OK" if not failed else "PARTIAL",
+            "panel": "V90_READ_ONLY_V89_EXIT_COUNTERFACTUAL",
+            "no_state_mutations": True, "real_orders": False,
+            "source_closed_count": len(V89_STATE.get("closed", [])),
+            "requested": len(trades), "analyzed": len(good), "failed_count": len(failed),
+            "cost_pct": 0.15,
+            "all": group(good),
+            "score_0_2": group([(t,r) for t,r in good if int(t.get("v88_score", -1)) <= 2]),
+            "score_3_4": group([(t,r) for t,r in good if int(t.get("v88_score", -1)) >= 3]),
+            "per_trade": [{"symbol": t["symbol"], "entry_utc": t.get("entry_utc"),
+                           "score": t.get("v88_score"), "actual_v89_net_pct": t.get("net_pct"),
+                           "counterfactual": {k: round(v,4) for k,v in r.items()}}
+                          for t,r in good],
+            "failures": failed,
+            "limitations": [
+                "Historical counterfactuals, not forward-executed exits.",
+                "Entry minute excluded because the pre/post-entry sequence is unknown; early stops may be missed.",
+                "1m OHLC has no intraminute event ordering; trailing stop assumes prior peak and conservative gap handling.",
+                "Stops may fill worse than modeled in real markets; fixed 0.15% costs exclude variable slippage.",
+                "TIME120 replay uses 1m candle OPEN, while V89 uses live BID around 120m; differences are expected.",
+                "Only already-closed V89 positions are studied; selection and market-regime biases remain."
+            ], "generated_utc": utc_now()}
