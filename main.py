@@ -18747,3 +18747,94 @@ async def v92_failed_rally_study(limit: int = Query(default=1000, ge=1, le=1000)
             "Small groups, multiple comparisons and outliers can create misleading apparent effects.",
             "No entry filters are proposed or applied; independent out-of-sample validation is required."
         ], "generated_utc": utc_now()}
+
+
+# V93 — independent prospective observational cohort; NO V89/V91 mutation.
+V93_THRESHOLDS = {"alt30_pct": 0.175735, "disp30_pct": 1.118592}
+V93_ACTIVATION_MS = None
+V93_ACTIVATION_ERROR = None
+
+def v93_init():
+    global V93_ACTIVATION_MS, V93_ACTIVATION_ERROR
+    try:
+        if not V21_DB_URL:
+            raise RuntimeError("Persistent database is not configured")
+        with v21_db_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""CREATE TABLE IF NOT EXISTS alt_v93_cohort_state (
+                    id INTEGER PRIMARY KEY, started_ms BIGINT NOT NULL)""")
+                cur.execute("SELECT started_ms FROM alt_v93_cohort_state WHERE id=1")
+                row = cur.fetchone()
+                if row:
+                    V93_ACTIVATION_MS = int(row[0])
+                else:
+                    now = alt_now_ms()
+                    cur.execute("""INSERT INTO alt_v93_cohort_state(id,started_ms)
+                        VALUES(1,%s) ON CONFLICT(id) DO NOTHING""", (now,))
+                    cur.execute("SELECT started_ms FROM alt_v93_cohort_state WHERE id=1")
+                    V93_ACTIVATION_MS = int(cur.fetchone()[0])
+            conn.commit()
+        V93_ACTIVATION_ERROR = None
+    except Exception as exc:
+        V93_ACTIVATION_ERROR = f"{type(exc).__name__}: {str(exc)[:200]}"
+
+@app.on_event("startup")
+async def v93_startup():
+    v93_init()
+
+@app.get("/v93-market-euphoria-study")
+async def v93_market_euphoria_study():
+    if V93_ACTIVATION_MS is None:
+        return {**MODE_INFO, "status": "NOT_READY",
+            "panel": "V93_PROSPECTIVE_MARKET_EUPHORIA",
+            "error": V93_ACTIVATION_ERROR or "V93 activation timestamp not persisted",
+            "paper_only": True, "real_orders": False}
+    rows = [dict(t) for t in V89_STATE.get("closed", [])
+        if v92_numeric(t.get("net_pct")) is not None
+        and int(t.get("entry_ms") or 0) >= V93_ACTIVATION_MS]
+    def stats(rr):
+        return v92_summary(rr)
+    def feature_split(field):
+        threshold = V93_THRESHOLDS[field]
+        valid = [(v92_numeric(t.get(field)), t) for t in rows]
+        valid = [(v,t) for v,t in valid if v is not None]
+        low = [t for v,t in valid if v < threshold]
+        high = [t for v,t in valid if v >= threshold]
+        return {"fixed_threshold": threshold, "available_n": len(valid),
+            "missing_n": len(rows)-len(valid),
+            "below": stats(low), "at_or_above": stats(high)}
+    both = {"low_alt_low_disp": [], "low_alt_high_disp": [],
+        "high_alt_low_disp": [], "high_alt_high_disp": []}
+    missing = 0
+    for t in rows:
+        a = v92_numeric(t.get("alt30_pct"))
+        d = v92_numeric(t.get("disp30_pct"))
+        if a is None or d is None:
+            missing += 1
+            continue
+        key = ("high_alt" if a >= V93_THRESHOLDS["alt30_pct"] else "low_alt")
+        key += ("_high_disp" if d >= V93_THRESHOLDS["disp30_pct"] else "_low_disp")
+        both[key].append(t)
+    return {**MODE_INFO, "status": "OK",
+        "panel": "V93_PROSPECTIVE_MARKET_EUPHORIA",
+        "paper_only": True, "real_orders": False, "read_only": True,
+        "v89_unchanged": True, "v91_unchanged": True,
+        "new_entries_only": True, "activation_ms": V93_ACTIVATION_MS,
+        "source": "V89_CLOSED_AFTER_V93_ACTIVATION",
+        "fixed_thresholds_from_v92_25_trade_exploration": V93_THRESHOLDS,
+        "closed_n": len(rows), "all": stats(rows),
+        "alt30": feature_split("alt30_pct"),
+        "disp30": feature_split("disp30_pct"),
+        "joint_groups": {k: stats(v) for k,v in both.items()},
+        "joint_missing_n": missing,
+        "recent": [{"symbol": t.get("symbol"), "entry_utc": t.get("entry_utc"),
+            "net_pct": t.get("net_pct"), "alt30_pct": t.get("alt30_pct"),
+            "disp30_pct": t.get("disp30_pct")} for t in rows[-20:]],
+        "limitations": [
+            "Prospective observational cohort, not randomized; association is not causation.",
+            "Fixed thresholds were selected after viewing V92 data and require independent validation.",
+            "Only V89-selected entries are included, not all candidates.",
+            "Correlated alt30/disp30 and small subgroup sizes can mislead.",
+            "Closed trades only; open trades are excluded until V89 exit.",
+            "No trading rules, entry gates or live orders are changed."
+        ], "generated_utc": utc_now()}
