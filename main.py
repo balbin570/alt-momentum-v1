@@ -18492,3 +18492,176 @@ async def v90_exit_study(limit: int = Query(default=100, ge=1, le=200)):
                 "TIME120 replay uses 1m candle OPEN, while V89 uses live BID around 120m; differences are expected.",
                 "Only already-closed V89 positions are studied; selection and market-regime biases remain."
             ], "generated_utc": utc_now()}
+
+
+# ============================================================
+# V91: FORWARD, PAPER-ONLY PAIRED 60m vs FROZEN V89 120m
+# New V89 entries only, no edits to V89 / V32 / V61 / V74.
+# Persisted independently in Postgres when configured.
+# ============================================================
+V91_STATE = {"started_ms": None, "trades": {}, "errors": [], "last_check_utc": None}
+V91_TASK = None
+V91_LOCK = None
+V91_POLL_SECONDS = 15
+V91_MAX_EXIT_DELAY_MS = 90_000
+
+
+def v91_key(p):
+    return f'{p["symbol"]}:{int(p["entry_ms"])}'
+
+
+def v91_db_init():
+    if not V21_DB_URL:
+        return False
+    with v21_db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""CREATE TABLE IF NOT EXISTS alt_v91_forward_state (
+                id INTEGER PRIMARY KEY, payload JSONB NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())""")
+        conn.commit()
+    return True
+
+
+def v91_save():
+    if not V21_DB_URL:
+        return False
+    with v21_db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""INSERT INTO alt_v91_forward_state(id,payload,updated_at)
+                VALUES(1,%s::jsonb,NOW()) ON CONFLICT(id)
+                DO UPDATE SET payload=EXCLUDED.payload,updated_at=NOW()""",
+                (json.dumps(V91_STATE,default=str),))
+        conn.commit()
+    return True
+
+
+def v91_load():
+    global V91_STATE
+    if not V21_DB_URL:
+        return
+    v91_db_init()
+    with v21_db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT payload FROM alt_v91_forward_state WHERE id=1")
+            r=cur.fetchone()
+    if r and isinstance(r[0],dict):
+        V91_STATE=r[0]
+
+
+async def v91_check_once():
+    global V91_LOCK
+    if V91_LOCK is None:
+        V91_LOCK=asyncio.Lock()
+    async with V91_LOCK:
+        now=alt_now_ms()
+        V91_STATE["last_check_utc"]=utc_now()
+        trades=V91_STATE.setdefault("trades",{})
+        errors=V91_STATE.setdefault("errors",[])
+        started=int(V91_STATE["started_ms"])
+        # Snapshot only. V89 is never mutated.
+        v89_open=list(V89_STATE.get("open",[]))
+        v89_closed=list(V89_STATE.get("closed",[]))
+        for p in v89_open+v89_closed:
+            try:
+                entry_ms=int(p["entry_ms"])
+                if entry_ms < started:
+                    continue
+                key=v91_key(p)
+                if key not in trades:
+                    trades[key]={"symbol":p["symbol"],"entry_ms":entry_ms,
+                        "entry_utc":p.get("entry_utc"),"entry_price":float(p["entry_price"]),
+                        "score":p.get("v88_score"),"due60_ms":entry_ms+60*60*1000,
+                        "status60":"WAITING", "exit60":None,"exit120":None}
+            except Exception as exc:
+                errors.append(f"register: {type(exc).__name__}: {str(exc)[:120]}")
+        closed_map={v91_key(p):p for p in v89_closed if p.get("entry_ms")}
+        due=[]
+        for key,t in trades.items():
+            if t["status60"]=="WAITING" and now>=t["due60_ms"]:
+                if now-t["due60_ms"]>V91_MAX_EXIT_DELAY_MS:
+                    t["status60"]="MISSED_WINDOW"
+                    t["missed_by_seconds"]=round((now-t["due60_ms"])/1000,1)
+                else:
+                    due.append((key,t))
+        if due:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
+                for key,t in due:
+                    try:
+                        q=await live_quote(client,t["symbol"])
+                        if not q or not q.get("bid"):
+                            raise ValueError("LIVE_BID_UNAVAILABLE")
+                        bid=float(q["bid"])
+                        sampled_ms=alt_now_ms()
+                        if sampled_ms-t["due60_ms"]>V91_MAX_EXIT_DELAY_MS:
+                            t["status60"]="MISSED_WINDOW"
+                            continue
+                        t["exit60"]={"bid":bid,"sampled_ms":sampled_ms,
+                            "sampled_utc":utc_now(),"delay_seconds":round((sampled_ms-t["due60_ms"])/1000,2),
+                            "net_pct":round((bid/t["entry_price"]-1)*100-0.15,4)}
+                        t["status60"]="CAPTURED"
+                    except Exception as exc:
+                        errors.append(f'{t["symbol"]} 60m: {type(exc).__name__}: {str(exc)[:120]}')
+        for key,t in trades.items():
+            p=closed_map.get(key)
+            if p and t["exit120"] is None and p.get("net_pct") is not None:
+                t["exit120"]={"net_pct":float(p["net_pct"]),
+                    "exit_utc":p.get("exit_utc"),"exit_price":p.get("exit_price"),
+                    "source":"V89_ACTUAL_PAPER_TIME120"}
+        V91_STATE["errors"]=errors[-30:]
+        # Bound storage while keeping paired results long enough for evaluation.
+        if len(trades)>3000:
+            old=sorted(trades, key=lambda k:trades[k]["entry_ms"])[:-3000]
+            for k in old:del trades[k]
+        try:v91_save()
+        except Exception as exc:
+            V91_STATE["errors"].append(f"DB_SAVE: {type(exc).__name__}: {str(exc)[:120]}")
+        return {"tracked":len(trades),"captured60":sum(t["status60"]=="CAPTURED" for t in trades.values())}
+
+
+async def v91_loop():
+    while True:
+        try:await v91_check_once()
+        except Exception as exc:
+            V91_STATE.setdefault("errors",[]).append(f"LOOP: {type(exc).__name__}: {str(exc)[:120]}")
+        await asyncio.sleep(V91_POLL_SECONDS)
+
+
+@app.on_event("startup")
+async def v91_startup():
+    global V91_TASK
+    try:v91_load()
+    except Exception as exc:
+        V91_STATE.setdefault("errors",[]).append(f"LOAD: {type(exc).__name__}: {str(exc)[:120]}")
+    if V91_STATE.get("started_ms") is None:
+        V91_STATE["started_ms"]=alt_now_ms()
+        try:v91_save()
+        except Exception:pass
+    if V91_TASK is None:
+        V91_TASK=asyncio.create_task(v91_loop())
+
+
+@app.get("/v91-status")
+async def v91_status():
+    trades=sorted(V91_STATE.get("trades",{}).values(),key=lambda x:x["entry_ms"])
+    paired=[t for t in trades if t.get("exit60") and t.get("exit120")]
+    def group(rows):
+        a=[float(t["exit60"]["net_pct"]) for t in rows]
+        b=[float(t["exit120"]["net_pct"]) for t in rows]
+        return {"n":len(rows),"TIME60":v90_stats(a),"TIME120_V89":v90_stats(b),
+            "mean_60_minus_120_pct":round(sum(x-y for x,y in zip(a,b))/len(rows),4) if rows else None,
+            "time60_better_count":sum(x>y for x,y in zip(a,b))}
+    return {**MODE_INFO,"status":"OK","panel":"V91_FORWARD_PAIRED_TIME60_VS_V89_TIME120",
+        "paper_only":True,"real_orders":False,"v89_unchanged":True,
+        "new_entries_only":True,"started_ms":V91_STATE.get("started_ms"),
+        "tracked_count":len(trades),"waiting_60_count":sum(t["status60"]=="WAITING" for t in trades),
+        "missed_60_count":sum(t["status60"]=="MISSED_WINDOW" for t in trades),
+        "paired_count":len(paired),"all":group(paired),
+        "score_0_2":group([t for t in paired if t.get("score") is not None and int(t["score"])<=2]),
+        "score_3_4":group([t for t in paired if t.get("score") is not None and int(t["score"])>=3]),
+        "recent":trades[-30:],"errors":V91_STATE.get("errors",[])[-10:],
+        "last_check_utc":V91_STATE.get("last_check_utc"),"generated_utc":utc_now(),
+        "limitations":["Only entries created after V91 activation are included.",
+          "60m uses observed live BID within 90 seconds of target; missed windows are excluded.",
+          "120m uses V89 actual paper exit BID, not an independent execution.",
+          "Poll/deployment outages may cause missing observations.",
+          "0.15 percent fixed roundtrip cost; no variable slippage or real orders."]}
