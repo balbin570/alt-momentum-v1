@@ -18665,3 +18665,85 @@ async def v91_status():
           "120m uses V89 actual paper exit BID, not an independent execution.",
           "Poll/deployment outages may cause missing observations.",
           "0.15 percent fixed roundtrip cost; no variable slippage or real orders."]}
+
+
+# V92 - READ-ONLY FAILED-RALLY DIAGNOSTICS (V89 CLOSED PAPER TRADES)
+# Descriptive analysis only; no new filters, signals, orders or strategy mutations.
+V92_FEATURES = (
+    ("breakout_change_pct", "breakout_change_pct"),
+    ("alt30_pct", "alt30_pct"),
+    ("btc30_pct", "btc30_pct"),
+    ("disp30_pct", "disp30_pct"),
+    ("spread_pct", "spread_pct"),
+    ("v88_score", "v88_score"),
+    ("volume_ratio", "volume_ratio"),
+)
+
+
+def v92_numeric(value):
+    try:
+        n = float(value)
+        return n if math.isfinite(n) else None
+    except (ValueError, TypeError, OverflowError):
+        return None
+
+
+def v92_summary(trades):
+    vals = [v92_numeric(t.get("net_pct")) for t in trades]
+    vals = [x for x in vals if x is not None]
+    out = v90_stats(vals)
+    out["losing_count"] = sum(x < 0 for x in vals)
+    out["flat_count"] = sum(x == 0 for x in vals)
+    out["loss_le_minus3_count"] = sum(x <= -3 for x in vals)
+    return out
+
+
+@app.get("/v92-failed-rally-study")
+async def v92_failed_rally_study(limit: int = Query(default=1000, ge=1, le=1000)):
+    # Snapshot existing V89 closed trades only. No calls to Binance, no writes.
+    rows = [dict(t) for t in V89_STATE.get("closed", [])
+            if v92_numeric(t.get("net_pct")) is not None][-limit:]
+    winners = [t for t in rows if float(t["net_pct"]) > 0]
+    losers = [t for t in rows if float(t["net_pct"]) < 0]
+    feature_results = {}
+    for label, key in V92_FEATURES:
+        valid = [(v92_numeric(t.get(key)), t) for t in rows]
+        valid = [(v, t) for v, t in valid if v is not None]
+        valid.sort(key=lambda item: item[0])
+        if not valid:
+            feature_results[label] = {"available_n": 0, "missing_n": len(rows)}
+            continue
+        mid = len(valid) // 2
+        low = [t for _, t in valid[:mid]]
+        high = [t for _, t in valid[mid:]]
+        # Median split is exploratory, including ties; NOT an entry rule.
+        win_vals = sorted(v for v,t in valid if float(t["net_pct"]) > 0)
+        lose_vals = sorted(v for v,t in valid if float(t["net_pct"]) < 0)
+        def median(vals):
+            n=len(vals)
+            return round((vals[(n-1)//2]+vals[n//2])/2,6) if n else None
+        feature_results[label] = {
+            "available_n": len(valid), "missing_n": len(rows)-len(valid),
+            "median_all": median([v for v,_ in valid]),
+            "median_winners": median(win_vals),
+            "median_losers": median(lose_vals),
+            "lower_half": v92_summary(low), "upper_half": v92_summary(high),
+            "split_method": "ranked_halves_exploratory_ties_possible"
+        }
+    return {**MODE_INFO, "status": "OK", "panel": "V92_FAILED_RALLY_DIAGNOSTICS",
+        "paper_only": True, "real_orders": False, "read_only": True,
+        "v89_unchanged": True, "v91_unchanged": True,
+        "source": "V89_CLOSED_SHADOWS", "closed_n": len(rows),
+        "all": v92_summary(rows), "winners": v92_summary(winners),
+        "losers": v92_summary(losers),
+        "features": feature_results,
+        "worst_10": [{"symbol":t.get("symbol"),"entry_utc":t.get("entry_utc"),
+            "net_pct":t.get("net_pct"),"score":t.get("v88_score")}
+            for t in sorted(rows,key=lambda t:float(t["net_pct"]))[:10]],
+        "limitations": [
+            "Descriptive in-sample comparisons; no causal inference or validated predictive power.",
+            "Features reflect the existing V89 selected-entry population, not all altcoin candidates.",
+            "Only features recorded at entry can be studied; missing volume ratio is reported explicitly.",
+            "Small groups, multiple comparisons and outliers can create misleading apparent effects.",
+            "No entry filters are proposed or applied; independent out-of-sample validation is required."
+        ], "generated_utc": utc_now()}
