@@ -18838,3 +18838,18 @@ async def v93_market_euphoria_study():
             "Closed trades only; open trades are excluded until V89 exit.",
             "No trading rules, entry gates or live orders are changed."
         ], "generated_utc": utc_now()}
+
+
+# V32 GECMIS ISLEMLER - SADECE OKUMA
+@app.get("/alt-v32-trades-export")
+async def alt_v32_trades_export():
+    trades = V32_STATE.get("closed", [])
+
+    return {
+        **MODE_INFO,
+        "status": "OK",
+        "strategy": "V32",
+        "trade_count": len(trades),
+        "trades": trades,
+        "generated_utc": utc_now(),
+    }
