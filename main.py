@@ -8705,6 +8705,8 @@ async def v32_scan_once():
             ok_entry, skip_reason = await apply_live_entry(client, pos, price, V32_HOLD_MS)
             pos["execution_version"] = V55_EXECUTION_VERSION
             pos.update(v61_entry_context(good.get(e["symbol"]), good.get("BTCUSDT"), int(e["entry_open_time"]), pos.get("entry_price") or price))
+            # V94: observational V62-style filter, no effect on entry/exit.
+            pos.update(v94_candidate_tag(good.get(e["symbol"]), int(e["entry_open_time"]), pos.get("spread_pct"), pos.get("entry_live_ms")))
             # V87: informational V86 score only; never blocks the paper entry.
             pos.update(v87_quality_at_entry(good, e))
             pos["risk_engine"] = {
@@ -18868,3 +18870,127 @@ async def alt_v32_trades_export(
         "generated_utc": utc_now(),
     }
 
+
+
+# ============================================================
+# V94 — V62 SPREAD/VOLUME SHADOW COHORT (V32 PAPER ENTRIES)
+# Observational only. Does not gate V32, V55, V87, V89 or V91.
+# Frozen thresholds, prospective new entries only; no real orders.
+# ============================================================
+V94_SPREAD_MAX_PCT = 0.10
+V94_VOL_MIN = 1.0
+V94_VOL_MAX_EXCLUSIVE = 5.0
+
+def v94_candidate_tag(candles, entry_open_ms, spread_pct, entry_live_ms):
+    """Tag a V32 paper entry with an independently auditable, causal filter.
+
+    Use only fully closed candles at the intended entry-open timestamp.
+    Missing spread or absent live fill reference fails closed for the shadow
+    cohort; this never blocks the baseline V32 paper position.
+    """
+    tag = {
+        "v94_version": "V94_V62_SPREAD_VOLUME_OBSERVATIONAL",
+        "v94_observational_only": True,
+        "v94_spread_max_pct": V94_SPREAD_MAX_PCT,
+        "v94_vol_min": V94_VOL_MIN,
+        "v94_vol_max_exclusive": V94_VOL_MAX_EXCLUSIVE,
+        "v94_shadow_pass": False,
+        "v94_reason": "MISSING_DATA",
+        "v94_vol_ratio": None,
+    }
+    try:
+        entry_ms = int(entry_open_ms)
+        # Reproduce V61 volume windows using only fully completed bars.
+        prior = sorted(
+            (c for c in (candles or [])
+             if int(c.get("open_time", entry_ms)) < entry_ms
+             and int(c.get("close_time", entry_ms)) < entry_ms),
+            key=lambda c: int(c["open_time"]),
+        )
+        if len(prior) < 60:
+            tag["v94_reason"] = "INSUFFICIENT_CLOSED_CANDLES"
+            return tag
+        recent = prior[-3:]
+        baseline = prior[-51:-3]
+        v_base = sum(float(c["volume"]) for c in baseline) / len(baseline)
+        if v_base <= 0:
+            tag["v94_reason"] = "INVALID_BASE_VOLUME"
+            return tag
+        ratio = (sum(float(c["volume"]) for c in recent) / 3.0) / v_base
+        tag["v94_vol_ratio"] = round(ratio, 6)
+        if spread_pct is None or entry_live_ms is None:
+            tag["v94_reason"] = "MISSING_LIVE_SPREAD_OR_ENTRY"
+            return tag
+        spread = float(spread_pct)
+        if not math.isfinite(spread) or not math.isfinite(ratio):
+            tag["v94_reason"] = "NONFINITE_VALUE"
+            return tag
+        if spread > V94_SPREAD_MAX_PCT:
+            tag["v94_reason"] = "SPREAD_GT_0_10"
+        elif ratio < V94_VOL_MIN:
+            tag["v94_reason"] = "VOLUME_LT_1"
+        elif ratio >= V94_VOL_MAX_EXCLUSIVE:
+            tag["v94_reason"] = "VOLUME_GTE_5"
+        else:
+            tag["v94_shadow_pass"] = True
+            tag["v94_reason"] = "PASS"
+        return tag
+    except (TypeError, ValueError, KeyError, ZeroDivisionError) as exc:
+        tag["v94_reason"] = "TAG_ERROR_" + type(exc).__name__
+        return tag
+
+
+@app.get("/v94-spread-volume-shadow")
+async def v94_spread_volume_shadow():
+    """Read-only matched V32 paper outcomes; no independent shadow fills."""
+    opened = [p for p in V32_STATE.get("open", {}).values()
+              if p.get("v94_version") == "V94_V62_SPREAD_VOLUME_OBSERVATIONAL"]
+    closed = [p for p in V32_STATE.get("closed", [])
+              if p.get("v94_version") == "V94_V62_SPREAD_VOLUME_OBSERVATIONAL"]
+    def stats(rows):
+        values = [float(p["net_pct"]) for p in rows
+                  if p.get("net_pct") is not None]
+        if not values:
+            return {"n": 0, "mean_net_pct": None,
+                    "win_rate_pct": None, "profit_factor": None}
+        wins = [v for v in values if v > 0]
+        losses = [v for v in values if v < 0]
+        pf = sum(wins) / abs(sum(losses)) if losses else None
+        return {"n": len(values), "mean_net_pct": round(sum(values)/len(values),4),
+                "win_rate_pct": round(100*len(wins)/len(values),2),
+                "profit_factor": round(pf,4) if pf is not None else None}
+    passed = [p for p in closed if p.get("v94_shadow_pass") is True]
+    rejected = [p for p in closed if p.get("v94_shadow_pass") is not True]
+    reasons = {}
+    for p in opened + closed:
+        reason = p.get("v94_reason", "UNKNOWN")
+        reasons[reason] = reasons.get(reason, 0) + 1
+    return {**MODE_INFO, "status": "OK",
+            "panel": "V94_V62_SPREAD_VOLUME_SHADOW",
+            "research_only": True, "read_only": True,
+            "entry_gate": False, "real_orders": False,
+            "v32_entry_exit_unchanged": True, "v55_risk_unchanged": True,
+            "v87_v89_v91_unchanged": True,
+            "new_entries_only": True,
+            "thresholds": {"spread_max_pct": V94_SPREAD_MAX_PCT,
+                           "vol_ratio_min": V94_VOL_MIN,
+                           "vol_ratio_max_exclusive": V94_VOL_MAX_EXCLUSIVE},
+            "tagged_open_n": len(opened), "tagged_closed_n": len(closed),
+            "closed_all_baseline": stats(closed),
+            "closed_shadow_pass": stats(passed),
+            "closed_shadow_reject": stats(rejected),
+            "reason_counts_open_and_closed": reasons,
+            "recent_closed": [{"key": p.get("key"), "symbol": p.get("symbol"),
+                               "net_pct": p.get("net_pct"),
+                               "shadow_pass": p.get("v94_shadow_pass"),
+                               "reason": p.get("v94_reason"),
+                               "spread_pct": p.get("spread_pct"),
+                               "vol_ratio": p.get("v94_vol_ratio")}
+                              for p in closed[-20:]],
+            "limitations": [
+                "Matched subset of V32 paper entries, not an independently executed portfolio.",
+                "V32 cooldown and capacity rules remain unchanged; rejected shadow candidates may affect later opportunities.",
+                "Original 25-trade filter result was in-sample and needs independent forward validation.",
+                "No entry is blocked; baseline V32 paper positions and stops are unchanged.",
+                "No live quote or live entry reference means shadow filter fails closed."
+            ], "generated_utc": utc_now()}
