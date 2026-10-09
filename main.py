@@ -8707,6 +8707,8 @@ async def v32_scan_once():
             pos.update(v61_entry_context(good.get(e["symbol"]), good.get("BTCUSDT"), int(e["entry_open_time"]), pos.get("entry_price") or price))
             # V94: observational V62-style filter, no effect on entry/exit.
             pos.update(v94_candidate_tag(good.get(e["symbol"]), int(e["entry_open_time"]), pos.get("spread_pct"), pos.get("entry_live_ms")))
+            # V95: observational momentum/volume filter; never blocks the paper entry.
+            pos.update(v95_momentum_volume_tag(pos))
             # V87: informational V86 score only; never blocks the paper entry.
             pos.update(v87_quality_at_entry(good, e))
             pos["risk_engine"] = {
@@ -18994,3 +18996,152 @@ async def v94_spread_volume_shadow():
                 "No entry is blocked; baseline V32 paper positions and stops are unchanged.",
                 "No live quote or live entry reference means shadow filter fails closed."
             ], "generated_utc": utc_now()}
+
+
+# ============================================================
+# V95 — MOMENTUM / VOLUME OBSERVATIONAL SHADOW COHORT
+# Prospective tags on new V32 paper entries only.
+# No entry gate, no exit/risk changes, no real orders.
+# ============================================================
+V95_VOL_MAX_EXCLUSIVE = 5.0
+
+
+def v95_momentum_volume_tag(pos):
+    """Tag an entry using only V61 causal entry-context fields."""
+    tag = {
+        "v95_version": "V95_MOMENTUM_VOLUME_OBSERVATIONAL",
+        "v95_observational_only": True,
+        "v95_volume_max_exclusive": V95_VOL_MAX_EXCLUSIVE,
+        "v95_shadow_pass": False,
+        "v95_reason": "MISSING_CONTEXT",
+        "v95_momentum_30m_pct": None,
+        "v95_momentum_60m_pct": None,
+        "v95_vol_ratio_15m_vs_4h": None,
+    }
+    try:
+        raw30 = pos.get("ctx_ret_30m_pct")
+        raw60 = pos.get("ctx_ret_60m_pct")
+        rawvol = pos.get("ctx_vol_ratio_15m_vs_4h")
+        if raw30 is None or raw60 is None or rawvol is None:
+            return tag
+
+        mom30 = float(raw30)
+        mom60 = float(raw60)
+        vol = float(rawvol)
+        if not all(math.isfinite(x) for x in (mom30, mom60, vol)) or vol < 0:
+            tag["v95_reason"] = "INVALID_CONTEXT"
+            return tag
+
+        tag["v95_momentum_30m_pct"] = round(mom30, 4)
+        tag["v95_momentum_60m_pct"] = round(mom60, 4)
+        tag["v95_vol_ratio_15m_vs_4h"] = round(vol, 4)
+
+        reasons = []
+        if mom30 < 0:
+            reasons.append("MOMENTUM_30M_NEGATIVE")
+        if mom60 < 0:
+            reasons.append("MOMENTUM_60M_NEGATIVE")
+        if vol >= V95_VOL_MAX_EXCLUSIVE:
+            reasons.append("VOLUME_GTE_5")
+
+        if reasons:
+            tag["v95_reason"] = "|".join(reasons)
+        else:
+            tag["v95_shadow_pass"] = True
+            tag["v95_reason"] = "PASS"
+        return tag
+    except (TypeError, ValueError, OverflowError):
+        tag["v95_reason"] = "INVALID_CONTEXT"
+        return tag
+
+
+@app.get("/v95-momentum-volume-shadow")
+async def v95_momentum_volume_shadow():
+    """Read-only outcomes for V95-tagged V32 paper trades."""
+    version = "V95_MOMENTUM_VOLUME_OBSERVATIONAL"
+    opened = [
+        p for p in V32_STATE.get("open", {}).values()
+        if p.get("v95_version") == version
+    ]
+    closed = [
+        p for p in V32_STATE.get("closed", [])
+        if p.get("v95_version") == version
+    ]
+
+    def stats(rows):
+        values = []
+        for p in rows:
+            try:
+                value = p.get("net_pct")
+                if value is not None and math.isfinite(float(value)):
+                    values.append(float(value))
+            except (TypeError, ValueError):
+                continue
+        if not values:
+            return {
+                "n": 0, "mean_net_pct": None,
+                "win_rate_pct": None, "profit_factor": None,
+            }
+        wins = [v for v in values if v > 0]
+        losses = [v for v in values if v < 0]
+        pf = sum(wins) / abs(sum(losses)) if losses else None
+        return {
+            "n": len(values),
+            "mean_net_pct": round(sum(values) / len(values), 4),
+            "win_rate_pct": round(100 * len(wins) / len(values), 2),
+            "profit_factor": round(pf, 4) if pf is not None else None,
+        }
+
+    passed = [p for p in closed if p.get("v95_shadow_pass") is True]
+    flagged = [p for p in closed if p.get("v95_shadow_pass") is not True]
+    reasons = {}
+    for p in opened + closed:
+        reason = p.get("v95_reason", "UNKNOWN")
+        reasons[reason] = reasons.get(reason, 0) + 1
+
+    return {
+        **MODE_INFO,
+        "status": "OK",
+        "panel": "V95_MOMENTUM_VOLUME_SHADOW",
+        "research_only": True,
+        "read_only": True,
+        "entry_gate": False,
+        "real_orders": False,
+        "v32_entry_exit_unchanged": True,
+        "v55_risk_unchanged": True,
+        "v94_unchanged": True,
+        "new_entries_only": True,
+        "thresholds": {
+            "momentum_30m_min_pct": 0.0,
+            "momentum_60m_min_pct": 0.0,
+            "vol_ratio_max_exclusive": V95_VOL_MAX_EXCLUSIVE,
+        },
+        "tagged_open_n": len(opened),
+        "tagged_closed_n": len(closed),
+        "closed_all_tagged": stats(closed),
+        "closed_shadow_pass": stats(passed),
+        "closed_shadow_flagged": stats(flagged),
+        "reason_counts_open_and_closed": reasons,
+        "recent_closed": [
+            {
+                "key": p.get("key"),
+                "symbol": p.get("symbol"),
+                "net_pct": p.get("net_pct"),
+                "shadow_pass": p.get("v95_shadow_pass"),
+                "reason": p.get("v95_reason"),
+                "momentum_30m_pct": p.get("v95_momentum_30m_pct"),
+                "momentum_60m_pct": p.get("v95_momentum_60m_pct"),
+                "vol_ratio_15m_vs_4h": p.get("v95_vol_ratio_15m_vs_4h"),
+            }
+            for p in closed[-20:]
+        ],
+        "limitations": [
+            "Prospective observational tags on matched V32 paper trades; not an independently executed portfolio.",
+            "Thresholds were chosen after inspecting prior sample results and need independent forward validation.",
+            "V32 cooldown/capacity and V55 risk rules remain unchanged.",
+            "Missing entry-context fields are flagged and do not block entries.",
+            "No live orders are sent.",
+        ],
+        "generated_utc": utc_now(),
+    }
+
