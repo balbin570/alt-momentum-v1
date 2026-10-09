@@ -6053,6 +6053,8 @@ V47_STARTED_UTC = utc_now()
 V47_SEEN_KEYS = {"V27": set(), "V32": set()}
 V48_LAST_V32_RESULT = {"result": None, "captured_utc": None}
 V51_V32_SCAN_HISTORY = []
+# V96: observational TOP3 cohort snapshot; no trade/selection impact.
+V96_TOP3_HISTORY = []
 V43_STARTED_UTC = utc_now()
 
 # =========================
@@ -8617,6 +8619,50 @@ async def v32_scan_once():
             row = dict(e)
             row["alt_market_mean_30m_pct"] = alt_mean
             eligible.append(row)
+
+        # V96 observation: record top 3 eligible symbols per cohort BEFORE TOP1
+        # selection and all order-related checks. No additional HTTP requests.
+        # Bound RAM to 100 snapshots; do not persist or modify paper state.
+        for _sig_t, _group in cohort.items():
+            _sorted = sorted(
+                _group,
+                key=lambda x: (
+                    x.get("wait_end_change_pct", 0.0),
+                    x.get("relative_momentum_z", 0.0),
+                    x.get("cross_section_percentile", 0.0),
+                ),
+                reverse=True,
+            )
+            _items = []
+            for _rank, _e in enumerate(_sorted[:3], 1):
+                _symbol = _e.get("symbol")
+                _key = f'{_symbol}:{_e.get("entry_open_time")}'
+                _prior = [
+                    int(x.get("entry_open_time", 0))
+                    for x in V32_STATE["closed"] if x.get("symbol") == _symbol
+                ]
+                _items.append({
+                    "rank": _rank, "symbol": _symbol, "key": _key,
+                    "entry_open_time": _e.get("entry_open_time"),
+                    "continuation_60m_pct": round(float(_e.get("wait_end_change_pct", 0)), 4),
+                    "relative_momentum_z": round(float(_e.get("relative_momentum_z", 0)), 4),
+                    "cross_section_percentile": round(float(_e.get("cross_section_percentile", 0)), 4),
+                    "seen_key": _key in V32_STATE["seen_signal_keys"],
+                    "already_open": _symbol in V32_STATE["open"],
+                    "cooldown_60m": bool(_prior and _e.get("entry_open_time", 0) - max(_prior) < 3600000),
+                })
+            _record = {
+                "captured_utc": utc_now(),
+                "signal_time_ms": _sig_t,
+                "eligible_in_cohort": len(_group),
+                "candidates": _items,
+            }
+            # Update a repeated cohort rather than fill RAM with duplicates.
+            V96_TOP3_HISTORY[:] = [
+                r for r in V96_TOP3_HISTORY if r["signal_time_ms"] != _sig_t
+            ]
+            V96_TOP3_HISTORY.append(_record)
+            del V96_TOP3_HISTORY[:-100]
 
         # Frozen TOP1 selection per original signal cohort.
         cohort = {}
@@ -11538,6 +11584,24 @@ async def v50_status():
         "historical_entry_open_time_preserved": True,
         "delay_reference": "actionable_time_ms = observation checkpoint candle close_time + 1ms",
         "note": "Completed-candle forward timing correction only; frozen strategy thresholds unchanged.",
+        "generated_utc": utc_now(),
+    }
+
+
+@app.get("/v96-top3-observe")
+async def v96_top3_observe():
+    """Read-only TOP1/TOP2/TOP3 research data, RAM only."""
+    return {
+        **MODE_INFO,
+        "status": "OK",
+        "panel": "V96_TOP3_OBSERVATIONAL",
+        "research_only": True,
+        "trading": False,
+        "orders": False,
+        "strategy_thresholds_changed": False,
+        "history_count": len(V96_TOP3_HISTORY),
+        "history": list(V96_TOP3_HISTORY),
+        "note": "No fallback orders, no extra market calls. In-memory snapshots reset on restart.",
         "generated_utc": utc_now(),
     }
 
