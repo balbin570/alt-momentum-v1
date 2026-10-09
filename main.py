@@ -6053,6 +6053,64 @@ V47_STARTED_UTC = utc_now()
 V47_SEEN_KEYS = {"V27": set(), "V32": set()}
 V48_LAST_V32_RESULT = {"result": None, "captured_utc": None}
 V51_V32_SCAN_HISTORY = []
+
+# V96: bounded, read-only TOP3 snapshots. Never changes paper selection.
+V96_TOP3_HISTORY = []
+V96_TOP3_LAST_ERROR = None
+
+def v96_record_top3(cohort, state):
+    """Observe already-eligible candidates; never raise into the V32 scanner."""
+    global V96_TOP3_LAST_ERROR
+    try:
+        for signal_ms, group in cohort.items():
+            ranked_group = sorted(
+                group,
+                key=lambda e: (
+                    e.get("wait_end_change_pct", 0.0),
+                    e.get("relative_momentum_z", 0.0),
+                    e.get("cross_section_percentile", 0.0),
+                ),
+                reverse=True,
+            )
+            candidates = []
+            for rank, e in enumerate(ranked_group[:3], start=1):
+                symbol = e["symbol"]
+                entry_ms = int(e["entry_open_time"])
+                key = f"{symbol}:{entry_ms}"
+                prior = [
+                    int(p.get("entry_open_time") or 0)
+                    for p in state["closed"]
+                    if p.get("symbol") == symbol
+                ]
+                candidates.append({
+                    "rank": rank,
+                    "symbol": symbol,
+                    "key": key,
+                    "entry_open_time": entry_ms,
+                    "continuation_60m_pct": round(float(e["wait_end_change_pct"]), 4),
+                    "relative_momentum_z": round(float(e["relative_momentum_z"]), 4),
+                    "cross_section_percentile": round(float(e["cross_section_percentile"]), 4),
+                    "seen_key": key in state["seen_signal_keys"],
+                    "already_open": symbol in state["open"],
+                    "cooldown_60m": bool(prior and entry_ms - max(prior) < 3600000),
+                })
+            record = {
+                "captured_utc": utc_now(),
+                "signal_time_ms": signal_ms,
+                "eligible_in_cohort": len(group),
+                "candidates": candidates,
+            }
+            V96_TOP3_HISTORY[:] = [
+                row for row in V96_TOP3_HISTORY
+                if row["signal_time_ms"] != signal_ms
+            ]
+            V96_TOP3_HISTORY.append(record)
+            del V96_TOP3_HISTORY[:-100]
+        V96_TOP3_LAST_ERROR = None
+    except Exception as exc:
+        V96_TOP3_LAST_ERROR = f"{type(exc).__name__}: {exc}"
+        # Observation failures must never interrupt entry/exit/stop logic.
+
 V43_STARTED_UTC = utc_now()
 
 # =========================
@@ -8635,6 +8693,9 @@ async def v32_scan_once():
             )
             if group:
                 top1_rows.append(group[0])
+
+        # V96 observation: cohort is now defined; safe even if observer fails.
+        v96_record_top3(cohort, V32_STATE)
 
         now_ms_for_freshness = alt_now_ms()
         freshness_ms = 10 * 60 * 1000
@@ -11541,6 +11602,24 @@ async def v50_status():
         "generated_utc": utc_now(),
     }
 
+
+
+@app.get("/v96-top3-observe")
+async def v96_top3_observe():
+    return {
+        **MODE_INFO,
+        "status": "OK",
+        "panel": "V96_TOP3_OBSERVATIONAL",
+        "research_only": True,
+        "trading": False,
+        "orders": False,
+        "strategy_thresholds_changed": False,
+        "history_count": len(V96_TOP3_HISTORY),
+        "history": list(V96_TOP3_HISTORY),
+        "observer_error": V96_TOP3_LAST_ERROR,
+        "note": "Observation only. No additional market calls, no fallback entries. RAM resets on restart.",
+        "generated_utc": utc_now(),
+    }
 
 @app.get("/v51-status")
 async def v51_status():
