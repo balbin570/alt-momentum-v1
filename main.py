@@ -18841,8 +18841,22 @@ async def v93_market_euphoria_study():
 
 
 # V32 GECMIS ISLEMLER - SADECE OKUMA
+
+from fastapi import Header, HTTPException
+import os
+
 @app.get("/alt-v32-trades-export")
-async def alt_v32_trades_export():
+async def alt_v32_trades_export(
+    x_api_key: str = Header(default="")
+):
+    expected_key = os.environ.get("V32_EXPORT_API_KEY")
+
+    if not expected_key or x_api_key != expected_key:
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized"
+        )
+
     trades = V32_STATE.get("closed", [])
 
     return {
@@ -18853,3 +18867,4 @@ async def alt_v32_trades_export():
         "trades": trades,
         "generated_utc": utc_now(),
     }
+
