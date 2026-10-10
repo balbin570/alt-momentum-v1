@@ -20457,3 +20457,188 @@ async def atr_partial_tp90_v104(
         return {**MODE_INFO,'status':'ERROR','signal':False,
                 'study':'V104_ATR_PARTIAL_TP_DIAGNOSTIC',
                 'error':str(exc),'generated_utc':utc_now()}
+
+
+# ============================================================
+# V105 EXECUTION AUDIT — diagnostic only; V96–V104 unchanged
+# Conservative strict alternative: no TP1+TP2 within same 5m bar;
+# TP1 break-even/trail starts NEXT bar; stop checked before target.
+# ============================================================
+def _v105_strict(candles,idx,direction,atr,cost):
+    entry=float(candles[idx]['open'])
+    if entry<=0 or atr is None or atr<=0 or idx+24>=len(candles):
+        return None
+    sign=1 if direction=='LONG' else -1
+    stop=entry-sign*2*atr
+    tp1=entry+sign*1.5*atr
+    tp2=entry+sign*3*atr
+    remain=1.0; stage=0; gross=0.0; fills=[]; extreme=entry
+    ambiguous=0
+    def record(qty,price,reason,minute):
+        nonlocal remain,gross
+        qty=min(qty,remain)
+        if qty<=1e-10:return
+        part=qty*sign*(price/entry-1)*100
+        gross+=part; remain-=qty
+        fills.append({'reason':reason,'minute':minute,
+                      'fraction':round(qty,4),
+                      'weighted_gross_pp':round(part,6),
+                      'allocated_cost_pp':round(cost*qty,6),
+                      'weighted_net_pp':round(part-cost*qty,6)})
+    for step in range(24):
+        bar=candles[idx+step]; op=float(bar['open'])
+        hi=float(bar['high']);lo=float(bar['low']);minute=step*5
+        stop_gap=(op<=stop) if sign==1 else (op>=stop)
+        stop_hit=(lo<=stop) if sign==1 else (hi>=stop)
+        target=tp1 if stage==0 else tp2
+        target_hit=(hi>=target) if sign==1 else (lo<=target)
+        if stop_hit and target_hit:ambiguous+=1
+        if stop_gap:
+            record(remain,op,'STOP_GAP',minute);break
+        # Existing stop wins if same candle contains stop and target.
+        if stop_hit:
+            record(remain,stop,'STOP',minute);break
+        target_gap=(op>=target) if sign==1 else (op<=target)
+        if target_hit:
+            if stage==0:
+                record(.50,op if target_gap else tp1,'TP1_GAP' if target_gap else 'TP1',minute)
+                stage=1
+                stop=max(stop,entry) if sign==1 else min(stop,entry)
+                # Do not use this candle's extremes for trailing.
+                extreme=entry
+                continue
+            if stage==1:
+                record(.25,op if target_gap else tp2,'TP2_GAP' if target_gap else 'TP2',minute)
+                stage=2
+        # Trail after TP1, using only bars strictly after TP1 bar.
+        if stage>=1:
+            extreme=max(extreme,hi) if sign==1 else min(extreme,lo)
+            proposed=extreme-sign*2*atr
+            stop=max(stop,proposed) if sign==1 else min(stop,proposed)
+    if remain>1e-10:
+        record(remain,float(candles[idx+24]['open']),'TIME_120',120)
+    return {'net_pct':gross-cost,'gross_pct':gross,'fills':fills,
+            'tp1_hit':stage>=1,'tp2_hit':stage>=2,
+            'ambiguous_bar_count':ambiguous}
+
+
+def _v105_rows(candles,symbol):
+    events=_v99_events(candles,symbol)
+    indices={int(c['open_time']):i for i,c in enumerate(candles)}
+    atrs=_v104_atr14(candles)
+    rows=[]
+    for e in events:
+        idx=indices.get(e['entry_open_time'])
+        if idx is None or idx<15 or idx+24>=len(candles):continue
+        atr=atrs[idx-1]
+        old=_v104_simulate(candles,idx,e['reversal_direction'],atr,ROUND_TRIP_COST_PCT)
+        new=_v105_strict(candles,idx,e['reversal_direction'],atr,ROUND_TRIP_COST_PCT)
+        if old is None or new is None:continue
+        rows.append({'symbol':symbol,'entry_open_time':e['entry_open_time'],
+                     'direction':e['reversal_direction'],'volume_ratio':e['volume_ratio'],
+                     'baseline':e['outcomes'][120]['net'],
+                     'v104':old['net_pct'],'strict':new['net_pct'],
+                     'old_fills':old['fills'],'strict_fills':new['fills'],
+                     'tp1_hit':new['tp1_hit'],'tp2_hit':new['tp2_hit'],
+                     'ambiguous_bar_count':new['ambiguous_bar_count']})
+    return rows
+
+
+@app.get('/atr-execution-audit90')
+async def atr_execution_audit90_v105(
+    count: int = Query(default=10,ge=5,le=20),
+    days: int = Query(default=90,ge=30,le=90),
+):
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(240.0)) as client:
+            universe=await build_universe(client)
+            selected=universe[:count]
+            sem=asyncio.Semaphore(2)
+            async def worker(item):
+                async with sem:
+                    try:
+                        candles=await get_5m_candles_days(client,item['symbol'],days)
+                        return {'ok':True,'symbol':item['symbol'],
+                                'rows':_v105_rows(candles,item['symbol'])}
+                    except Exception as exc:
+                        return {'ok':False,'symbol':item['symbol'],'error':str(exc)}
+            fetched=await asyncio.gather(*(worker(item) for item in selected))
+        good=[x for x in fetched if x['ok']]
+        failed=[{'symbol':x['symbol'],'error':x['error']} for x in fetched if not x['ok']]
+        all_rows=sorted((r for x in good for r in x['rows']),
+                        key=lambda r:(r['symbol'],r['entry_open_time']))
+        cooled=[];last={}
+        for r in all_rows:
+            sym=r['symbol'];t=r['entry_open_time']
+            if sym in last and t-last[sym]<120*60*1000:continue
+            cooled.append(r);last[sym]=t
+        times=sorted(r['entry_open_time'] for r in cooled)
+        cutoff=times[int(len(times)*2/3)] if times else None
+        results={}
+        for label,threshold in [('VOLUME_GE_1_0',1.0),('VOLUME_GE_1_5',1.5)]:
+            results[label]={}
+            for direction in ('LONG','SHORT'):
+                group=[r for r in cooled if r['direction']==direction and r['volume_ratio']>=threshold]
+                output={}
+                for split,subset in [
+                    ('all',group),
+                    ('discovery_first_2_3',[r for r in group if cutoff is not None and r['entry_open_time']<cutoff]),
+                    ('reference_last_1_3',[r for r in group if cutoff is not None and r['entry_open_time']>=cutoff]),
+                ]:
+                    old=_v103_stats([r['v104'] for r in subset])
+                    strict=_v103_stats([r['strict'] for r in subset])
+                    base=_v103_stats([r['baseline'] for r in subset])
+                    reasons={}
+                    for r in subset:
+                        for f in r['strict_fills']:
+                            reason=f['reason']
+                            bucket=reasons.setdefault(reason,{'fill_count':0,'total_closed_fraction':0.0,
+                                                               'total_weighted_gross_pp':0.0,'total_allocated_cost_pp':0.0})
+                            bucket['fill_count']+=1
+                            bucket['total_closed_fraction']+=f['fraction']
+                            bucket['total_weighted_gross_pp']+=f['weighted_gross_pp']
+                            bucket['total_allocated_cost_pp']+=f['allocated_cost_pp']
+                    for v in reasons.values():
+                        for k in ('total_closed_fraction','total_weighted_gross_pp','total_allocated_cost_pp'):
+                            v[k]=round(v[k],5)
+                    output[split]={
+                        'baseline_120m':base,'v104_original':old,'v105_strict':strict,
+                        'strict_minus_v104_mean_pp':round(strict['mean_net_pct']-old['mean_net_pct'],4) if subset else None,
+                        'strict_minus_baseline_mean_pp':round(strict['mean_net_pct']-base['mean_net_pct'],4) if subset else None,
+                        'changed_trade_count':sum(abs(r['strict']-r['v104'])>1e-9 for r in subset),
+                        'ambiguous_bar_count':sum(r['ambiguous_bar_count'] for r in subset),
+                        'tp1_hit_count':sum(r['tp1_hit'] for r in subset),
+                        'tp2_hit_count':sum(r['tp2_hit'] for r in subset),
+                        'exit_fill_breakdown':reasons,
+                        'fill_fraction_integrity_failures':sum(abs(sum(f['fraction'] for f in r['strict_fills'])-1)>1e-6 for r in subset),
+                        'weighted_net_integrity_failures':sum(abs(sum(f['weighted_net_pp'] for f in r['strict_fills'])-r['strict'])>1e-4 for r in subset),
+                    }
+                results[label][direction]=output
+        return {**MODE_INFO,'status':'OK','signal':False,
+                'study':'V105_ATR_EXECUTION_AUDIT',
+                'days':days,'selected_coin_count':len(selected),
+                'successful_coin_count':len(good),'failed_coin_count':len(failed),
+                'raw_event_count':len(all_rows),'cooled_event_count':len(cooled),
+                'round_trip_cost_pct':ROUND_TRIP_COST_PCT,
+                'calendar_split_utc_ms':cutoff,
+                'strict_assumptions':[
+                    'Uses completed-bar ATR14 at entry and same frozen 2 ATR stop, 1.5 ATR TP1, 3 ATR TP2.',
+                    'If stop and TP target touched in one 5m bar, assume stop executed first.',
+                    'TP1 and TP2 cannot both fill in the same 5m candle.',
+                    'Break-even and trailing after TP1 activate only from next 5m candle.',
+                    'Trailing stop updated after each completed eligible candle, not within it.',
+                    'Each partial fill pays pro-rata share of fixed 0.15% round-trip cost.',
+                    'Historical diagnostic only; no real or paper orders.',
+                ],
+                'results':results,'failed':failed,'generated_utc':utc_now(),
+                'limitations':[
+                    'Strict engine is an alternate OHLC assumption, not a reconstruction of true intrabar order.',
+                    'Current coin universe and reused 90-day sample are not independent forward data.',
+                    'TP2 may not be reachable if remaining shares stop out earlier; no exchange fill simulation.',
+                    'Short financing, spreads, slippage and real-time data delays not fully modeled.',
+                    'Existing V96–V104 endpoints and paper signals remain unchanged.',
+                ]}
+    except Exception as exc:
+        return {**MODE_INFO,'status':'ERROR','signal':False,
+                'study':'V105_ATR_EXECUTION_AUDIT',
+                'error':str(exc),'generated_utc':utc_now()}
