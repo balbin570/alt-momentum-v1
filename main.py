@@ -20255,3 +20255,205 @@ async def integrity_audit90_v103(
         return {**MODE_INFO,'status':'ERROR','signal':False,
                 'study':'V103_BACKTEST_INTEGRITY_AUDIT',
                 'error':str(exc),'generated_utc':utc_now()}
+
+
+# ==============================================================
+# V104 ATR + PARTIAL TP RESEARCH — NO ORDERS / NO V96 MODIFICATION
+# Frozen test specification:
+# ATR14 on completed 5m candles, SL 2 ATR, TP1 1.5 ATR (50%),
+# TP2 3 ATR (25%), last 25% trails by 2 ATR after TP1.
+# Break-even stop after TP1; 120-minute time exit.
+# Conservative OHLC: opening gaps then stop BEFORE any TP if both
+# levels appear in same bar. No fill improvement beyond stop/target.
+# ==============================================================
+
+def _v104_atr14(candles):
+    n=len(candles)
+    result=[None]*n
+    if n<16:
+        return result
+    tr=[0.0]*n
+    for i in range(1,n):
+        high=float(candles[i]['high']); low=float(candles[i]['low'])
+        prev=float(candles[i-1]['close'])
+        tr[i]=max(high-low,abs(high-prev),abs(low-prev))
+    value=sum(tr[1:15])/14
+    result[14]=value
+    for i in range(15,n):
+        value=(value*13+tr[i])/14
+        result[i]=value
+    return result
+
+
+def _v104_simulate(candles, idx, direction, atr, cost_pct):
+    entry=float(candles[idx]['open'])
+    if entry<=0 or atr is None or atr<=0 or idx+24>=len(candles):
+        return None
+    sign=1 if direction=='LONG' else -1
+    stop=entry-sign*2*atr
+    tp1=entry+sign*1.5*atr
+    tp2=entry+sign*3*atr
+    remaining=1.0
+    tp1_done=False; tp2_done=False
+    trail_active=False
+    extreme=entry
+    weighted_gross=0.0
+    fills=[]
+    def fill(fraction, price, why, minute):
+        nonlocal remaining,weighted_gross
+        fraction=min(fraction,remaining)
+        if fraction<=1e-10:
+            return
+        weighted_gross+=fraction*sign*(price/entry-1)*100
+        remaining=max(0.0,remaining-fraction)
+        fills.append({'fraction':round(fraction,4),'minute':minute,'reason':why})
+    for step in range(24):
+        bar=candles[idx+step]
+        op=float(bar['open']); hi=float(bar['high']); lo=float(bar['low'])
+        minute=step*5
+        # Opening gaps: fill at open, not at optimistic target/stop.
+        stop_gap=(op<=stop) if sign==1 else (op>=stop)
+        if stop_gap:
+            fill(remaining,op,'STOP_GAP',minute)
+            break
+        if not tp1_done and ((op>=tp1) if sign==1 else (op<=tp1)):
+            fill(.50,op,'TP1_GAP',minute); tp1_done=True
+            stop=max(stop,entry) if sign==1 else min(stop,entry)
+            trail_active=True
+        if tp1_done and not tp2_done and ((op>=tp2) if sign==1 else (op<=tp2)):
+            fill(.25,op,'TP2_GAP',minute); tp2_done=True
+        if remaining<=1e-10:
+            break
+        # Conservative same-bar ordering: check stop before targets.
+        stop_hit=(lo<=stop) if sign==1 else (hi>=stop)
+        if stop_hit:
+            fill(remaining,stop,'STOP',minute)
+            break
+        if not tp1_done and ((hi>=tp1) if sign==1 else (lo<=tp1)):
+            fill(.50,tp1,'TP1',minute); tp1_done=True
+            stop=max(stop,entry) if sign==1 else min(stop,entry)
+            trail_active=True
+        if tp1_done and not tp2_done and ((hi>=tp2) if sign==1 else (lo<=tp2)):
+            fill(.25,tp2,'TP2',minute); tp2_done=True
+        # Trail moves AFTER the bar closes: no intra-bar lookahead.
+        if trail_active:
+            extreme=max(extreme,hi) if sign==1 else min(extreme,lo)
+            proposed=extreme-sign*2*atr
+            stop=max(stop,proposed) if sign==1 else min(stop,proposed)
+    if remaining>1e-10:
+        fill(remaining,float(candles[idx+24]['open']),'TIME_120',120)
+    return {
+        'net_pct':weighted_gross-cost_pct,
+        'tp1_hit':tp1_done,'tp2_hit':tp2_done,
+        'fills':fills,
+    }
+
+
+def _v104_build_rows(candles,symbol):
+    events=_v99_events(candles,symbol)
+    indices={int(c['open_time']):i for i,c in enumerate(candles)}
+    atrs=_v104_atr14(candles)
+    rows=[]
+    for e in events:
+        idx=indices.get(e['entry_open_time'])
+        if idx is None or idx+24>=len(candles) or idx<15:
+            continue
+        # ATR from last COMPLETED bar only, never entry bar.
+        atr=atrs[idx-1]
+        sim=_v104_simulate(candles,idx,e['reversal_direction'],atr,ROUND_TRIP_COST_PCT)
+        if sim is None:
+            continue
+        rows.append({'symbol':symbol,'entry_open_time':e['entry_open_time'],
+                     'direction':e['reversal_direction'],
+                     'volume_ratio':e['volume_ratio'],
+                     'baseline_net_pct':e['outcomes'][120]['net'],
+                     'atr_net_pct':sim['net_pct'],
+                     'tp1_hit':sim['tp1_hit'],
+                     'tp2_hit':sim['tp2_hit'],
+                     'fills':sim['fills']})
+    return rows
+
+
+@app.get('/atr-partial-tp90')
+async def atr_partial_tp90_v104(
+    count: int = Query(default=10,ge=5,le=20),
+    days: int = Query(default=90,ge=30,le=90),
+):
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(240.0)) as client:
+            universe=await build_universe(client)
+            selected=universe[:count]
+            sem=asyncio.Semaphore(2)
+            async def worker(item):
+                async with sem:
+                    try:
+                        candles=await get_5m_candles_days(client,item['symbol'],days)
+                        return {'ok':True,'symbol':item['symbol'],
+                                'rows':_v104_build_rows(candles,item['symbol'])}
+                    except Exception as exc:
+                        return {'ok':False,'symbol':item['symbol'],'error':str(exc)}
+            fetched=await asyncio.gather(*(worker(item) for item in selected))
+        good=[x for x in fetched if x['ok']]
+        failed=[{'symbol':x['symbol'],'error':x['error']} for x in fetched if not x['ok']]
+        all_rows=sorted((r for x in good for r in x['rows']),
+                        key=lambda r:(r['symbol'],r['entry_open_time']))
+        cooled=[];last={}
+        for r in all_rows:
+            sym=r['symbol'];t=r['entry_open_time']
+            if sym in last and t-last[sym]<120*60*1000:
+                continue
+            cooled.append(r);last[sym]=t
+        times=sorted(r['entry_open_time'] for r in cooled)
+        cutoff=times[int(len(times)*2/3)] if times else None
+        results={}
+        for variant,threshold in [('VOLUME_GE_1_0',1.0),('VOLUME_GE_1_5',1.5)]:
+            results[variant]={}
+            for direction in ('LONG','SHORT'):
+                group=[r for r in cooled if r['volume_ratio']>=threshold and r['direction']==direction]
+                result={}
+                for split,subset in [
+                    ('all',group),
+                    ('discovery_first_2_3',[r for r in group if cutoff is not None and r['entry_open_time']<cutoff]),
+                    ('reference_last_1_3',[r for r in group if cutoff is not None and r['entry_open_time']>=cutoff]),
+                ]:
+                    base=_v103_stats([r['baseline_net_pct'] for r in subset])
+                    atr=_v103_stats([r['atr_net_pct'] for r in subset])
+                    result[split]={
+                        'baseline_120m':base,'atr_partial_tp':atr,
+                        'mean_delta_pp':round(atr['mean_net_pct']-base['mean_net_pct'],4) if subset else None,
+                        'tp1_hit_count':sum(r['tp1_hit'] for r in subset),
+                        'tp2_hit_count':sum(r['tp2_hit'] for r in subset),
+                    }
+                results[variant][direction]=result
+        return {**MODE_INFO,'status':'OK','signal':False,
+                'study':'V104_ATR_PARTIAL_TP_DIAGNOSTIC',
+                'days':days,'selected_coin_count':len(selected),
+                'successful_coin_count':len(good),'failed_coin_count':len(failed),
+                'raw_event_count':len(all_rows),'cooled_event_count':len(cooled),
+                'round_trip_cost_pct':ROUND_TRIP_COST_PCT,
+                'calendar_split_utc_ms':cutoff,
+                'settings':{
+                    'atr':'Wilder ATR14, last fully completed 5m bar before entry',
+                    'stop_loss':'2 ATR from entry',
+                    'tp1':'1.5 ATR favorable; close 50%',
+                    'tp2':'3 ATR favorable; close 25% of original',
+                    'trailing':'Remaining 25% trails 2 ATR after TP1; trail updated only after completed bar',
+                    'break_even':'After TP1, stop for remainder moves to entry, not fee-adjusted',
+                    'max_holding_minutes':120,
+                    'intrabar_priority':'open gap first; then stop before TP; trail updates after bar',
+                    'cost':'0.15% applied once to full weighted round trip',
+                    'cooldown_minutes':120,
+                },
+                'results':results,'failed':failed,'generated_utc':utc_now(),
+                'limitations':[
+                    'Historical exploratory diagnostic, NOT an independent forward test.',
+                    'Same-bar stop-first ordering is conservative but OHLC cannot reveal actual tick sequence.',
+                    '5m gap and liquidity execution modeled approximately; spread/slippage may exceed fixed cost.',
+                    'Fixed ATR based on pre-entry 5m bars; no dynamic ATR recalculation.',
+                    'No leverage, funding, liquidation, exchange filters or portfolio capital simulation.',
+                    'No live trades, paper orders, V96 modifications or strategy deployment.',
+                ]}
+    except Exception as exc:
+        return {**MODE_INFO,'status':'ERROR','signal':False,
+                'study':'V104_ATR_PARTIAL_TP_DIAGNOSTIC',
+                'error':str(exc),'generated_utc':utc_now()}
