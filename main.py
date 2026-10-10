@@ -21668,3 +21668,119 @@ async def historical_funnel_v115(days: int = Query(default=90, ge=7, le=90)):
         return {**MODE_INFO,'status':'ERROR','signal':False,
                 'study':'V115_HISTORICAL_FUNNEL','generated_utc':utc_now(),
                 'error_type':type(exc).__name__}
+
+
+# V116: descriptive historical candidate timing, isolated from V112 storage.
+@app.get('/candidate-timing-v116')
+async def candidate_timing_v116(days: int = Query(default=90, ge=7, le=90)):
+    from bisect import bisect_right
+    from collections import Counter, defaultdict
+    from statistics import median
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    failures=[]
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(240.0)) as client:
+            sem=asyncio.Semaphore(3)
+            async def fetch(sym):
+                async with sem:
+                    try:
+                        rows=await get_5m_candles_days(client,sym,days)
+                        return sym,[c for c in rows if int(c['close_time'])<=now_ms],None
+                    except Exception as exc:
+                        return sym,[],type(exc).__name__
+            fetched=await asyncio.gather(*(fetch(sym) for sym in _V106_SYMBOLS))
+        data={sym:rows for sym,rows,err in fetched if err is None}
+        failures=[{'symbol':sym,'error_type':err} for sym,rows,err in fetched if err]
+        btc=data.get('BTCUSDT',[])
+        btc_close=[float(c['close']) for c in btc]
+        btc_times=[int(c['close_time']) for c in btc]
+        ema144=_v109_ema(btc_close,144)
+        ema576=_v109_ema(btc_close,576)
+        candidates=[]
+        per_symbol=Counter()
+        for sym in _V106_SYMBOLS:
+            cs=data.get(sym,[]);n=len(cs)
+            if n<580:continue
+            highs=[float(c['high']) for c in cs]
+            lows=[float(c['low']) for c in cs]
+            closes=[float(c['close']) for c in cs]
+            volumes=[float(c['volume']) for c in cs]
+            widths=[None]*n
+            for j in range(11,n):
+                low=min(lows[j-11:j+1])
+                widths[j]=(max(highs[j-11:j+1])-low)/low*100 if low>0 else None
+            for i in range(110,n-1):
+                base=[w for w in widths[i-73:i-1] if w is not None]
+                if len(base)!=72 or widths[i-1] is None:continue
+                bm=median(base)
+                if bm<=0 or widths[i-1]>.65*bm:continue
+                ceiling=max(highs[i-24:i]);floor=min(lows[i-24:i])
+                direction='SHORT' if closes[i]>ceiling else ('LONG' if closes[i]<floor else None)
+                if direction is None:continue
+                avg=sum(volumes[i-20:i])/20
+                if avg<=0:continue
+                ratio=volumes[i]/avg
+                confirm=next((k for k in range(i+1,min(i+7,n)) if floor<=closes[k]<=ceiling),None)
+                if confirm is None or confirm+1>=n:continue
+                entry_ms=int(cs[confirm+1]['open_time'])
+                ix=bisect_right(btc_times,entry_ms-1)-1
+                if ix<0 or ema144[ix] is None or ema576[ix] is None:continue
+                if not btc_close[ix]<ema144[ix]<ema576[ix]:continue
+                if direction!='LONG' or ratio<1.5:continue
+                candidates.append({'symbol':sym,'entry_ms':entry_ms,'ratio':round(ratio,4)})
+                per_symbol[sym]+=1
+        candidates.sort(key=lambda x:(x['entry_ms'],x['symbol']))
+        # Independent 120-minute cooldown per symbol; no global suppression.
+        last_by_symbol={}
+        cooldown=[]
+        for c in candidates:
+            previous=last_by_symbol.get(c['symbol'])
+            if previous is None or c['entry_ms']-previous>=120*60*1000:
+                cooldown.append(c)
+                last_by_symbol[c['symbol']]=c['entry_ms']
+        def date_key(ms):
+            return datetime.fromtimestamp(ms/1000,timezone.utc).strftime('%Y-%m-%d')
+        def daily_stats(rows):
+            count=Counter(date_key(c['entry_ms']) for c in rows)
+            return [{'date_utc':d,'candidates':count[d]} for d in sorted(count)]
+        days_utc=sorted({date_key(int(c['open_time'])) for cs in data.values() for c in cs})
+        # Only days fully covered in the returned BTC candle series.
+        btc_days=Counter(date_key(int(c['open_time'])) for c in btc)
+        full_days=sorted(d for d,n in btc_days.items() if n>=288)
+        raw_daily=Counter(date_key(c['entry_ms']) for c in candidates)
+        cd_daily=Counter(date_key(c['entry_ms']) for c in cooldown)
+        daily=[{'date_utc':d,'raw_candidates':raw_daily[d],
+                'cooldown_candidates':cd_daily[d]} for d in full_days]
+        gaps=[]
+        for a,b in zip(cooldown,cooldown[1:]):
+            gaps.append(round((b['entry_ms']-a['entry_ms'])/60000,2))
+        return {**MODE_INFO,'status':'PARTIAL' if failures else 'OK','signal':False,
+            'study':'V116_HISTORICAL_CANDIDATE_TIMING','generated_utc':utc_now(),
+            'requested_days':days,'historical_raw_candidates':len(candidates),
+            'historical_after_per_symbol_120m_cooldown':len(cooldown),
+            'cooldown_removed':len(candidates)-len(cooldown),
+            'raw_by_symbol':dict(per_symbol),
+            'cooldown_by_symbol':dict(Counter(c['symbol'] for c in cooldown)),
+            'fully_covered_utc_days':len(full_days),
+            'full_days_without_raw_candidates':sum(raw_daily[d]==0 for d in full_days),
+            'full_days_without_cooldown_candidates':sum(cd_daily[d]==0 for d in full_days),
+            'daily_full_utc_days':daily,
+            'raw_daily_nonzero':daily_stats(candidates),
+            'cooldown_daily_nonzero':daily_stats(cooldown),
+            'max_daily_raw_candidates':max(raw_daily.values(),default=0),
+            'max_daily_cooldown_candidates':max(cd_daily.values(),default=0),
+            'fetch_failures':failures,'writes_to_database':False,
+            'prospective_observations_added':0,
+            'limitations':[
+                'Historical diagnostic only; not prospective validation or a performance backtest.',
+                'Candidate logic matches V115; V112 live freshness and actual scheduler timing are not simulated.',
+                'Cooldown is per symbol and 120 minutes from accepted entry; verify exact live V112 cooldown implementation separately.',
+                'Only UTC days with >=288 fetched BTC candles are used for zero-day statistics.',
+                'Overlapping setups before cooldown are not independent trades.',
+                'No reliable capture-rate estimate without persisted actual polling and candidate timestamps.',
+                'No trading, orders, signals, or modification of V112 collection.'
+            ]}
+    except Exception as exc:
+        return {**MODE_INFO,'status':'ERROR','signal':False,
+                'study':'V116_HISTORICAL_CANDIDATE_TIMING',
+                'generated_utc':utc_now(),'error_type':type(exc).__name__}
