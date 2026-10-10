@@ -19986,3 +19986,144 @@ async def early_exit90_v101(
         return {**MODE_INFO,'status':'ERROR','signal':False,
                 'study':'V101_15M_EARLY_EXIT_DIAGNOSTIC',
                 'error':str(exc),'generated_utc':utc_now()}
+
+
+# ============================================================
+# V102 EXIT TIMING GRID — DIAGNOSTIC ONLY
+# V99 entries and 120-minute per-symbol cooldown preserved.
+# All decisions use already observed 5m OPEN prices.
+# 15m exit requires a 10m decision; 20/30/60m exits use
+# the 15m decision. 30/60/120m positive-path holds.
+# ============================================================
+def _v102_rows(candles, symbol):
+    events = _v99_events(candles, symbol)
+    indices = {int(c['open_time']): i for i, c in enumerate(candles)}
+    rows = []
+    for event in events:
+        idx = indices.get(event['entry_open_time'])
+        if idx is None or idx + 24 >= len(candles):
+            continue
+        entry = float(candles[idx]['open'])
+        if entry <= 0:
+            continue
+        direction = 1 if event['reversal_direction'] == 'LONG' else -1
+        def net(minutes):
+            return direction * (float(candles[idx + minutes//5]['open']) / entry - 1) * 100 - ROUND_TRIP_COST_PCT
+        ret10 = net(10) + ROUND_TRIP_COST_PCT
+        ret15 = net(15) + ROUND_TRIP_COST_PCT
+        policies = {}
+        for bad_exit in (15, 20, 30, 60):
+            for good_hold in (30, 60, 120):
+                # To execute at 15m, decision must be made at 10m.
+                observed = ret10 if bad_exit == 15 else ret15
+                exit_min = bad_exit if observed <= 0 else good_hold
+                policies[f'BAD_{bad_exit}_GOOD_{good_hold}'] = net(exit_min)
+        rows.append({
+            'symbol': symbol,
+            'entry_open_time': event['entry_open_time'],
+            'direction': event['reversal_direction'],
+            'volume_ratio': event['volume_ratio'],
+            'baseline_net_pct': net(120),
+            'policies': policies,
+        })
+    return rows
+
+
+def _v102_metrics(vals):
+    if not vals:
+        return {'n':0,'mean_net_pct':None,'profit_factor':None,'win_rate_pct':None}
+    wins=sum(v for v in vals if v>0)
+    gain=sum(v for v in vals if v>0)
+    loss=-sum(v for v in vals if v<0)
+    return {
+        'n':len(vals),
+        'mean_net_pct':round(mean(vals),4),
+        'profit_factor':round(gain/loss,4) if loss else None,
+        'win_rate_pct':round(100*wins/len(vals),2),
+    }
+
+
+@app.get('/exit-timing90')
+async def exit_timing90_v102(
+    count: int = Query(default=10,ge=5,le=20),
+    days: int = Query(default=90,ge=30,le=90),
+):
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(240.0)) as client:
+            universe=await build_universe(client)
+            selected=universe[:count]
+            sem=asyncio.Semaphore(2)
+            async def worker(item):
+                async with sem:
+                    try:
+                        candles=await get_5m_candles_days(client,item['symbol'],days)
+                        return {'ok':True,'symbol':item['symbol'],
+                                'rows':_v102_rows(candles,item['symbol'])}
+                    except Exception as exc:
+                        return {'ok':False,'symbol':item['symbol'],'error':str(exc)}
+            fetched=await asyncio.gather(*(worker(item) for item in selected))
+        good=[x for x in fetched if x['ok']]
+        failed=[{'symbol':x['symbol'],'error':x['error']} for x in fetched if not x['ok']]
+        all_rows=sorted((r for x in good for r in x['rows']),
+                        key=lambda r:(r['symbol'],r['entry_open_time']))
+        cooled=[]; last={}
+        for r in all_rows:
+            sym=r['symbol']; t=r['entry_open_time']
+            if sym in last and t-last[sym]<120*60*1000:
+                continue
+            cooled.append(r); last[sym]=t
+        times=sorted(r['entry_open_time'] for r in cooled)
+        cutoff=times[int(len(times)*2/3)] if times else None
+        names=[f'BAD_{b}_GOOD_{g}' for b in (15,20,30,60) for g in (30,60,120)]
+        results={}
+        for label,threshold in [('VOLUME_GE_1_0',1.0),('VOLUME_GE_1_5',1.5)]:
+            results[label]={}
+            for direction in ('LONG','SHORT'):
+                group=[r for r in cooled if r['volume_ratio']>=threshold and r['direction']==direction]
+                discovery=[r for r in group if cutoff is not None and r['entry_open_time']<cutoff]
+                reference=[r for r in group if cutoff is not None and r['entry_open_time']>=cutoff]
+                candidates=[]
+                for name in names:
+                    candidates.append({
+                        'policy':name,
+                        'all':_v102_metrics([r['policies'][name] for r in group]),
+                        'discovery_first_2_3':_v102_metrics([r['policies'][name] for r in discovery]),
+                        'reference_last_1_3':_v102_metrics([r['policies'][name] for r in reference]),
+                    })
+                # Choose ONLY on discovery; report reference without re-selection.
+                eligible=[c for c in candidates if c['discovery_first_2_3']['n']>=30]
+                chosen=max(eligible,key=lambda c:c['discovery_first_2_3']['mean_net_pct']) if eligible else None
+                results[label][direction]={
+                    'baseline_120m':{
+                        'all':_v102_metrics([r['baseline_net_pct'] for r in group]),
+                        'discovery_first_2_3':_v102_metrics([r['baseline_net_pct'] for r in discovery]),
+                        'reference_last_1_3':_v102_metrics([r['baseline_net_pct'] for r in reference]),
+                    },
+                    'selected_on_discovery':chosen['policy'] if chosen else None,
+                    'selected_policy_metrics':chosen,
+                    'all_candidate_policies':candidates,
+                }
+        return {**MODE_INFO,'status':'OK','signal':False,
+                'study':'V102_EXIT_TIMING_GRID_DIAGNOSTIC',
+                'base_events':'V99_CONFIRMED_FALSE_BREAKOUT',
+                'days':days,'selected_coin_count':len(selected),
+                'successful_coin_count':len(good),'failed_coin_count':len(failed),
+                'raw_event_count':len(all_rows),'cooled_event_count':len(cooled),
+                'round_trip_cost_pct':ROUND_TRIP_COST_PCT,
+                'decision':'BAD_15 uses 10m observation; BAD_20/30/60 use 15m observation; <=0 triggers early exit',
+                'execution':'All exits use subsequent 5m OPEN at named minute; otherwise GOOD_30/60/120 exit',
+                'calendar_split_utc_ms':cutoff,
+                'selection':'Max mean net on discovery only; reference reported without reselection',
+                'results':results,'failed':failed,'generated_utc':utc_now(),
+                'limitations':[
+                    'Exploratory and not independent of V99-V101 research; multiple policies tested.',
+                    'BAD_15 necessarily uses 10m rather than 15m observation to avoid same-instant execution.',
+                    'Fixed 0.15% cost; variable slippage/spread and short financing excluded.',
+                    'Current-universe selection bias and overlapping signals across symbols.',
+                    'No executable portfolio, stop orders, paper orders, or real trading.',
+                    'V96-V101 code remains unchanged.',
+                ]}
+    except Exception as exc:
+        return {**MODE_INFO,'status':'ERROR','signal':False,
+                'study':'V102_EXIT_TIMING_GRID_DIAGNOSTIC',
+                'error':str(exc),'generated_utc':utc_now()}
