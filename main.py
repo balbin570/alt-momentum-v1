@@ -21561,3 +21561,110 @@ async def candidate_funnel_v114():
         return {**MODE_INFO,'status':'ERROR','signal':False,
                 'study':'V114_CANDIDATE_FUNNEL_DIAGNOSTIC',
                 'generated_utc':utc_now(),'error_type':type(exc).__name__}
+
+
+# V115: Historical funnel attribution; read-only, no database writes.
+# Historical candidates are NOT prospective observations.
+@app.get('/historical-funnel-v115')
+async def historical_funnel_v115(days: int = Query(default=90, ge=7, le=90)):
+    from bisect import bisect_right
+    from collections import Counter
+    from statistics import median
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    keys = ('evaluated_candles','width_valid','compression_pass','breakout_pass',
+            'volume_valid','confirmation_pass','entry_candle_available',
+            'btc_regime_available','btc_downtrend','long_direction',
+            'volume_ge_1_5','final_candidates')
+    total = Counter({k:0 for k in keys})
+    by_symbol = {}
+    failed = []
+    try:
+        # 90 days = ~260k candles across 10 symbols; requests can take time.
+        async with httpx.AsyncClient(timeout=httpx.Timeout(240.0)) as client:
+            sem = asyncio.Semaphore(3)
+            async def fetch(sym):
+                async with sem:
+                    try:
+                        rows = await get_5m_candles_days(client, sym, days)
+                        return sym, [c for c in rows if int(c['close_time']) <= now_ms], None
+                    except Exception as exc:
+                        return sym, [], type(exc).__name__
+            fetched = await asyncio.gather(*(fetch(s) for s in _V106_SYMBOLS))
+        data = {s:cs for s,cs,e in fetched if e is None}
+        failed = [{'symbol':s,'error_type':e} for s,cs,e in fetched if e]
+        btc = data.get('BTCUSDT', [])
+        btc_cl = [float(c['close']) for c in btc]
+        btc_times = [int(c['close_time']) for c in btc]
+        ema144 = _v109_ema(btc_cl, 144)
+        ema576 = _v109_ema(btc_cl, 576)
+        for sym in _V106_SYMBOLS:
+            if sym not in data: continue
+            cs = data[sym]; n=len(cs)
+            local = Counter({k:0 for k in keys})
+            if n < 580:
+                by_symbol[sym]={'status':'INSUFFICIENT_CANDLES','candles':n,'funnel':dict(local)}
+                continue
+            h=[float(c['high']) for c in cs]
+            l=[float(c['low']) for c in cs]
+            cl=[float(c['close']) for c in cs]
+            vol=[float(c['volume']) for c in cs]
+            widths=[None]*n
+            for j in range(11,n):
+                low=min(l[j-11:j+1])
+                widths[j]=(max(h[j-11:j+1])-low)/low*100 if low>0 else None
+            # Candidate logic follows V112 exactly, except that historical
+            # freshness is intentionally omitted and separately disclosed.
+            for i in range(110,n-1):
+                local['evaluated_candles']+=1
+                base=[w for w in widths[i-73:i-1] if w is not None]
+                if len(base)!=72 or widths[i-1] is None:continue
+                local['width_valid']+=1
+                bm=median(base)
+                if bm<=0 or widths[i-1]>.65*bm:continue
+                local['compression_pass']+=1
+                ceiling=max(h[i-24:i]); floor=min(l[i-24:i])
+                direction='SHORT' if cl[i]>ceiling else ('LONG' if cl[i]<floor else None)
+                if direction is None:continue
+                local['breakout_pass']+=1
+                avg=sum(vol[i-20:i])/20
+                if avg<=0:continue
+                local['volume_valid']+=1
+                ratio=vol[i]/avg
+                confirm=next((k for k in range(i+1,min(i+7,n)) if floor<=cl[k]<=ceiling),None)
+                if confirm is None:continue
+                local['confirmation_pass']+=1
+                entry_idx=confirm+1
+                if entry_idx>=n:continue
+                local['entry_candle_available']+=1
+                entry_ms=int(cs[entry_idx]['open_time'])
+                ix=bisect_right(btc_times,entry_ms-1)-1
+                if ix<0 or ema144[ix] is None or ema576[ix] is None:continue
+                local['btc_regime_available']+=1
+                if not (btc_cl[ix]<ema144[ix]<ema576[ix]):continue
+                local['btc_downtrend']+=1
+                if direction!='LONG':continue
+                local['long_direction']+=1
+                if ratio<1.5:continue
+                local['volume_ge_1_5']+=1
+                local['final_candidates']+=1
+            total.update(local)
+            by_symbol[sym]={'status':'OK','candles':n,'funnel':dict(local)}
+        counts=dict(total)
+        return {**MODE_INFO,'status':'PARTIAL' if failed else 'OK','signal':False,
+                'study':'V115_HISTORICAL_FUNNEL','generated_utc':utc_now(),
+                'requested_days':days,'funnel_order':list(keys),
+                'funnel':counts,'by_symbol':by_symbol,'fetch_failures':failed,
+                'writes_to_database':False,'prospective_observations_added':0,
+                'limitations':[
+                    'Historical descriptive diagnostic only; not independent validation or prospective evidence.',
+                    'Freshness filter is intentionally omitted: historical candidates cannot be fresh at call time.',
+                    'Overlapping candidate windows can count related setups multiple times; no cooldown is applied.',
+                    'The final_candidates count is not a trade count or backtest performance result.',
+                    'All funnel stages are sequential; later-stage zero counts do not identify independent blockers.',
+                    'BTC EMA uses fetched historical warmup only; earliest observations may lack regime context.',
+                    'No trading, orders, signals, or changes to V112 entry rules.'
+                ]}
+    except Exception as exc:
+        return {**MODE_INFO,'status':'ERROR','signal':False,
+                'study':'V115_HISTORICAL_FUNNEL','generated_utc':utc_now(),
+                'error_type':type(exc).__name__}
