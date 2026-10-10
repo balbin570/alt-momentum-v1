@@ -20127,3 +20127,131 @@ async def exit_timing90_v102(
         return {**MODE_INFO,'status':'ERROR','signal':False,
                 'study':'V102_EXIT_TIMING_GRID_DIAGNOSTIC',
                 'error':str(exc),'generated_utc':utc_now()}
+
+
+# ============================================================
+# V103 BACKTEST INTEGRITY AUDIT — RESEARCH ONLY
+# Does not change any V96–V102 route, signal, order or policy.
+# ============================================================
+def _v103_stats(vals):
+    if not vals:
+        return {'n':0,'mean_net_pct':None,'win_rate_pct':None,
+                'profit_factor':None,'wins':0,'losses':0,'breakeven':0}
+    winners=[v for v in vals if v>0]
+    losers=[v for v in vals if v<0]
+    return {'n':len(vals),'mean_net_pct':round(mean(vals),4),
+            'win_rate_pct':round(100*len(winners)/len(vals),2),
+            'profit_factor':round(sum(winners)/(-sum(losers)),4) if losers else None,
+            'wins':len(winners),'losses':len(losers),
+            'breakeven':len(vals)-len(winners)-len(losers)}
+
+
+@app.get('/integrity-audit90')
+async def integrity_audit90_v103(
+    count: int = Query(default=10,ge=5,le=20),
+    days: int = Query(default=90,ge=30,le=90),
+):
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(240.0)) as client:
+            universe=await build_universe(client)
+            selected=universe[:count]
+            sem=asyncio.Semaphore(2)
+            async def worker(item):
+                async with sem:
+                    try:
+                        candles=await get_5m_candles_days(client,item['symbol'],days)
+                        events=_v99_events(candles,item['symbol'])
+                        rows=_v102_rows(candles,item['symbol'])
+                        return {'ok':True,'symbol':item['symbol'],'events':events,'rows':rows}
+                    except Exception as exc:
+                        return {'ok':False,'symbol':item['symbol'],'error':str(exc)}
+            fetched=await asyncio.gather(*(worker(item) for item in selected))
+        good=[x for x in fetched if x['ok']]
+        failed=[{'symbol':x['symbol'],'error':x['error']} for x in fetched if not x['ok']]
+        events=sorted((e for x in good for e in x['events']),
+                      key=lambda e:(e['symbol'],e['entry_open_time']))
+        rows=sorted((r for x in good for r in x['rows']),
+                    key=lambda r:(r['symbol'],r['entry_open_time']))
+        last={}; cooled=[]
+        for r in rows:
+            t=r['entry_open_time']; sym=r['symbol']
+            if sym in last and t-last[sym]<120*60*1000:
+                continue
+            cooled.append(r); last[sym]=t
+        times=sorted(r['entry_open_time'] for r in cooled)
+        cutoff=times[int(len(times)*2/3)] if times else None
+        # Cross-check V99 net outcomes with independently reconstructed V102 baseline.
+        event_lookup={(e['symbol'],e['entry_open_time']):e for e in events}
+        discrepancies=[]
+        for r in cooled:
+            e=event_lookup.get((r['symbol'],r['entry_open_time']))
+            if e is None:
+                discrepancies.append({'symbol':r['symbol'],'time':r['entry_open_time'],'issue':'event_missing'})
+            elif abs(e['outcomes'][120]['net']-r['baseline_net_pct'])>1e-9:
+                discrepancies.append({'symbol':r['symbol'],'time':r['entry_open_time'],'issue':'baseline_mismatch'})
+        names=[f'BAD_{b}_GOOD_{g}' for b in (15,20,30,60) for g in (30,60,120)]
+        results={}
+        for variant,threshold in [('VOLUME_GE_1_0',1.0),('VOLUME_GE_1_5',1.5)]:
+            results[variant]={}
+            for direction in ('LONG','SHORT'):
+                group=[r for r in cooled if r['volume_ratio']>=threshold and r['direction']==direction]
+                discovery=[r for r in group if cutoff is not None and r['entry_open_time']<cutoff]
+                reference=[r for r in group if cutoff is not None and r['entry_open_time']>=cutoff]
+                candidates=[{
+                    'policy':name,
+                    'discovery':_v103_stats([r['policies'][name] for r in discovery]),
+                    'reference':_v103_stats([r['policies'][name] for r in reference])
+                } for name in names]
+                eligible=[x for x in candidates if x['discovery']['n']>=30]
+                chosen=max(eligible,key=lambda x:x['discovery']['mean_net_pct']) if eligible else None
+                results[variant][direction]={
+                    'baseline_120m':{
+                        'all':_v103_stats([r['baseline_net_pct'] for r in group]),
+                        'discovery':_v103_stats([r['baseline_net_pct'] for r in discovery]),
+                        'reference':_v103_stats([r['baseline_net_pct'] for r in reference]),
+                    },
+                    'selected_on_discovery':chosen,
+                    'policy_count':len(candidates),
+                    'all_discovery_means_negative':all(x['discovery']['mean_net_pct'] is None or x['discovery']['mean_net_pct']<0 for x in candidates),
+                    'any_reference_positive':any(x['reference']['mean_net_pct'] is not None and x['reference']['mean_net_pct']>0 for x in candidates),
+                }
+        # Synthetic tests for metric invariants, independent of live data.
+        synthetic={
+            'two_wins_one_loss':_v103_stats([1.0,2.0,-1.0]),
+            'all_losses':_v103_stats([-0.1,-0.2]),
+            'zero_returns':_v103_stats([0.0,0.0]),
+        }
+        assert synthetic['two_wins_one_loss']['win_rate_pct']==66.67
+        assert synthetic['two_wins_one_loss']['profit_factor']==3.0
+        assert synthetic['all_losses']['win_rate_pct']==0.0
+        assert synthetic['zero_returns']['win_rate_pct']==0.0
+        return {**MODE_INFO,'status':'OK','signal':False,
+                'study':'V103_BACKTEST_INTEGRITY_AUDIT',
+                'days':days,'selected_coin_count':len(selected),
+                'successful_coin_count':len(good),'failed_coin_count':len(failed),
+                'raw_event_count':len(events),'cooled_event_count':len(cooled),
+                'round_trip_cost_pct':ROUND_TRIP_COST_PCT,
+                'calendar_split_utc_ms':cutoff,
+                'checks':{
+                    'synthetic_metric_tests_passed':True,
+                    'baseline_reconstruction_match':len(discrepancies)==0,
+                    'baseline_discrepancy_count':len(discrepancies),
+                    'baseline_discrepancy_examples':discrepancies[:5],
+                    'correct_win_rate_formula':'100 * count(net_return > 0) / n',
+                    'v102_win_rate_bug':'V102 used sum(positive_return_values)/n rather than count(positive_returns)/n',
+                    'selection_uses_discovery_only':True,
+                    'reference_is_not_independent_of_prior_hypothesis_development':True,
+                    'execution_timing':'BAD_15: observe 10m, exit 15m; other BAD: observe 15m, exit 20/30/60m',
+                },
+                'results':results,'failed':failed,'generated_utc':utc_now(),
+                'limitations':[
+                    'Recomputes baseline and policies from the same historical candles, not external independent verification.',
+                    'Current coin universe, 90d window and research hypotheses were repeatedly inspected.',
+                    'Only the V103 report corrects win-rate; legacy V102 endpoint is intentionally unchanged.',
+                    'Fixed round-trip cost omits variable spread/slippage and short funding.',
+                    'No real trading, paper order, or V96 policy changes.',
+                ]}
+    except Exception as exc:
+        return {**MODE_INFO,'status':'ERROR','signal':False,
+                'study':'V103_BACKTEST_INTEGRITY_AUDIT',
+                'error':str(exc),'generated_utc':utc_now()}
