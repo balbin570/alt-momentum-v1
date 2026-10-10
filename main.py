@@ -21842,3 +21842,123 @@ async def poll_coverage_v117(hours: int = Query(default=24, ge=1, le=168)):
                 'study':'V117_POLL_COVERAGE','generated_utc':utc_now(),
                 'error_type':type(exc).__name__,
                 'error':'Read-only PostgreSQL audit failed; check Render logs.'}
+
+
+# V118: Three predefined research strategies, fixed 120m exit, chronological holdout.
+# Historical simulation only. No orders, no prospective DB writes.
+@app.get('/strategy-comparison-v118')
+async def strategy_comparison_v118(days: int = Query(default=90, ge=30, le=90)):
+    from collections import defaultdict
+    from statistics import mean
+    import math
+    now_ms=int(datetime.now(timezone.utc).timestamp()*1000)
+    cutoff_ms=now_ms-int(days*86400000/3)  # Last third of calendar period is untouched holdout.
+    strategies=('TREND_PULLBACK','SQUEEZE_BREAKOUT','MEAN_REVERSION')
+    costs=(0.15,0.20,0.25,0.30)
+    all_trades=defaultdict(list)
+    errors=[]
+    async with httpx.AsyncClient(timeout=httpx.Timeout(240.0)) as client:
+        sem=asyncio.Semaphore(3)
+        async def fetch(sym):
+            async with sem:
+                try:
+                    cs=await get_5m_candles_days(client,sym,days)
+                    return sym,[c for c in cs if int(c['close_time'])<=now_ms],None
+                except Exception as exc:
+                    return sym,[],type(exc).__name__
+        fetched=await asyncio.gather(*(fetch(s) for s in _V106_SYMBOLS))
+    for sym,cs,err in fetched:
+        if err:
+            errors.append({'symbol':sym,'error_type':err})
+            continue
+        n=len(cs)
+        if n<700:
+            errors.append({'symbol':sym,'error_type':'INSUFFICIENT_CANDLES'})
+            continue
+        close=[float(c['close']) for c in cs]
+        high=[float(c['high']) for c in cs]
+        low=[float(c['low']) for c in cs]
+        volume=[float(c['volume']) for c in cs]
+        times=[int(c['open_time']) for c in cs]
+        ema20=_v109_ema(close,20)
+        ema50=_v109_ema(close,50)
+        ema144=_v109_ema(close,144)
+        # Wilder RSI and ATR: all indicators use only the closed signal candle.
+        rsi=[None]*n
+        ag=sum(max(close[k]-close[k-1],0) for k in range(1,15))/14
+        al=sum(max(close[k-1]-close[k],0) for k in range(1,15))/14
+        for i in range(14,n):
+            if i>14:
+                d=close[i]-close[i-1]
+                ag=(ag*13+max(d,0))/14
+                al=(al*13+max(-d,0))/14
+            rsi[i]=100 if al==0 else 100-100/(1+ag/al)
+        atr=[None]*n
+        tr=[high[0]-low[0]]+[max(high[i]-low[i],abs(high[i]-close[i-1]),abs(low[i]-close[i-1])) for i in range(1,n)]
+        av=sum(tr[1:15])/14
+        for i in range(14,n):
+            if i>14: av=(av*13+tr[i])/14
+            atr[i]=av
+        last_entry={k:-10**18 for k in strategies}
+        for i in range(200,n-25):
+            if any(v is None for v in (ema20[i],ema50[i],ema144[i],rsi[i],atr[i])):continue
+            if times[i+1]-times[i]!=300000:continue
+            if times[i+24]-times[i+1]!=23*300000:continue
+            if close[i]<=0 or atr[i]<=0:continue
+            vbase=sum(volume[i-20:i])/20
+            vr=volume[i]/vbase if vbase>0 else 0
+            # A: rising trend, pullback to EMA20 and bullish recovery; long only.
+            a=(ema20[i]>ema50[i]>ema144[i] and close[i]>ema20[i]
+               and low[i-1]<=ema20[i-1]*1.003 and close[i]>close[i-1]
+               and 45<=rsi[i]<=70 and vr>=0.8)
+            # B: narrow 20-bar range relative to ATR, then volume-confirmed upside break.
+            prior_hi=max(high[i-20:i]);prior_lo=min(low[i-20:i])
+            b=((prior_hi-prior_lo)/close[i-1]<0.025 and close[i]>prior_hi
+               and vr>=1.5 and close[i]>ema50[i])
+            # C: oversold below medium trend, bullish reversal; long only.
+            c=(rsi[i-1]<30 and rsi[i]>rsi[i-1] and close[i]<ema50[i]
+               and (ema20[i]-close[i])/close[i]>=0.01 and close[i]>close[i-1])
+            entry=float(cs[i+1]['open'])
+            # Exit at next candle open exactly 24 5m bars after entry (120m).
+            exit_price=float(cs[i+25]['open'])
+            if times[i+25]-times[i+1]!=24*300000 or entry<=0:continue
+            gross=(exit_price/entry-1)*100
+            for key,passed in zip(strategies,(a,b,c)):
+                if not passed or times[i+1]-last_entry[key]<120*60000:continue
+                last_entry[key]=times[i+1]
+                all_trades[key].append({'symbol':sym,'entry_ms':times[i+1],
+                                        'gross_pct':gross})
+    def metrics(trades,cost):
+        net=[t['gross_pct']-cost for t in trades]
+        pos=sum(x for x in net if x>0)
+        neg=-sum(x for x in net if x<0)
+        return {'n':len(net),'mean_net_pct':round(mean(net),5) if net else None,
+                'win_rate_pct':round(100*sum(x>0 for x in net)/len(net),2) if net else None,
+                'profit_factor':round(pos/neg,4) if neg>0 else (None if not net else 'NO_LOSSES'),
+                'sum_net_pct_points':round(sum(net),4)}
+    report={}
+    for key in strategies:
+        rows=sorted(all_trades[key],key=lambda t:t['entry_ms'])
+        dev=[t for t in rows if t['entry_ms']<cutoff_ms]
+        holdout=[t for t in rows if t['entry_ms']>=cutoff_ms]
+        report[key]={
+            'all':{str(cost):metrics(rows,cost) for cost in costs},
+            'development':{str(cost):metrics(dev,cost) for cost in costs},
+            'holdout_last_third':{str(cost):metrics(holdout,cost) for cost in costs},
+            'by_symbol':{sym:sum(t['symbol']==sym for t in rows) for sym in _V106_SYMBOLS}}
+    return {**MODE_INFO,'status':'PARTIAL' if errors else 'OK','signal':False,
+        'study':'V118_THREE_STRATEGY_COMPARISON','generated_utc':utc_now(),
+        'requested_days':days,'timeframe':'5m','horizon_minutes':120,
+        'cost_pct_round_trip':[0.15,0.20,0.25,0.30],
+        'holdout_start_utc':datetime.fromtimestamp(cutoff_ms/1000,timezone.utc).isoformat(),
+        'strategies':report,'fetch_failures':errors,
+        'writes_to_database':False,'prospective_observations_added':0,
+        'limitations':[
+            'Exploratory historical simulation, not independently verified and not live execution.',
+            'Three strategy definitions are exploratory and must be frozen before future independent validation.',
+            'Indicators use completed signal candles; entry and exit are next-bar opens, not executable fills.',
+            'Cost scenarios subtract a fixed round-trip percentage; slippage and market impact may exceed these assumptions.',
+            '120-minute holding period, per-symbol 120-minute cooldown, long-only; overlapping symbols can be correlated.',
+            'Chronological holdout is still exposed to researcher selection if used to choose or tune the winner.',
+            'No orders, trading, signals, or changes to V112 collection.'
+        ]}
