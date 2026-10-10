@@ -22171,3 +22171,170 @@ async def regime_analysis_v119(days: int = Query(default=90, ge=30, le=90)):
             'Chronological holdout is still exposed to researcher selection if used to choose or tune the winner.',
             'No orders, trading, signals, or changes to V112 collection.'
         ]}
+
+
+@app.get('/squeeze-robustness-v120')
+async def squeeze_robustness_v120(days: int = Query(default=90, ge=30, le=90)):
+    from collections import defaultdict
+    from statistics import mean
+    import math
+    now_ms=int(datetime.now(timezone.utc).timestamp()*1000)
+    cutoff_ms=now_ms-int(days*86400000/3)  # Last third of calendar period is untouched holdout.
+    strategies=('TREND_PULLBACK','SQUEEZE_BREAKOUT','MEAN_REVERSION')
+    costs=(0.15,0.20,0.25,0.30)
+    all_trades=defaultdict(list)
+    errors=[]
+    async with httpx.AsyncClient(timeout=httpx.Timeout(240.0)) as client:
+        sem=asyncio.Semaphore(3)
+        async def fetch(sym):
+            async with sem:
+                try:
+                    cs=await get_5m_candles_days(client,sym,days)
+                    return sym,[c for c in cs if int(c['close_time'])<=now_ms],None
+                except Exception as exc:
+                    return sym,[],type(exc).__name__
+        fetched=await asyncio.gather(*(fetch(s) for s in _V106_SYMBOLS))
+    # BTC regime and volatility computed strictly from completed BTC 5m candles.
+    # Regime at signal candle timestamp; no future information used.
+    btc_rows=next((cs for sym,cs,err in fetched if sym=='BTCUSDT' and not err),[])
+    btc_close=[float(c['close']) for c in btc_rows]
+    btc_high=[float(c['high']) for c in btc_rows]
+    btc_low=[float(c['low']) for c in btc_rows]
+    btc_e144=_v109_ema(btc_close,144) if btc_rows else []
+    btc_e576=_v109_ema(btc_close,576) if btc_rows else []
+    btc_regimes={}
+    if btc_rows:
+        tr_b=[btc_high[0]-btc_low[0]]+[max(btc_high[j]-btc_low[j],abs(btc_high[j]-btc_close[j-1]),abs(btc_low[j]-btc_close[j-1])) for j in range(1,len(btc_rows))]
+        for j in range(576,len(btc_rows)):
+            if btc_close[j]<=0 or btc_e144[j] is None or btc_e576[j] is None:continue
+            # Mean true range of preceding 14 bars including completed signal bar.
+            atr_pct=100*sum(tr_b[j-13:j+1])/14/btc_close[j]
+            trend=('UP' if btc_close[j]>btc_e144[j]>btc_e576[j] else
+                   'DOWN' if btc_close[j]<btc_e144[j]<btc_e576[j] else 'MIXED')
+            vol=('LOW' if atr_pct<0.25 else 'HIGH' if atr_pct>=0.60 else 'MEDIUM')
+            btc_regimes[int(btc_rows[j]['open_time'])]=(trend,vol,round(atr_pct,5))
+    for sym,cs,err in fetched:
+        if err:
+            errors.append({'symbol':sym,'error_type':err})
+            continue
+        n=len(cs)
+        if n<700:
+            errors.append({'symbol':sym,'error_type':'INSUFFICIENT_CANDLES'})
+            continue
+        close=[float(c['close']) for c in cs]
+        high=[float(c['high']) for c in cs]
+        low=[float(c['low']) for c in cs]
+        volume=[float(c['volume']) for c in cs]
+        times=[int(c['open_time']) for c in cs]
+        ema20=_v109_ema(close,20)
+        ema50=_v109_ema(close,50)
+        ema144=_v109_ema(close,144)
+        # Wilder RSI and ATR: all indicators use only the closed signal candle.
+        rsi=[None]*n
+        ag=sum(max(close[k]-close[k-1],0) for k in range(1,15))/14
+        al=sum(max(close[k-1]-close[k],0) for k in range(1,15))/14
+        for i in range(14,n):
+            if i>14:
+                d=close[i]-close[i-1]
+                ag=(ag*13+max(d,0))/14
+                al=(al*13+max(-d,0))/14
+            rsi[i]=100 if al==0 else 100-100/(1+ag/al)
+        atr=[None]*n
+        tr=[high[0]-low[0]]+[max(high[i]-low[i],abs(high[i]-close[i-1]),abs(low[i]-close[i-1])) for i in range(1,n)]
+        av=sum(tr[1:15])/14
+        for i in range(14,n):
+            if i>14: av=(av*13+tr[i])/14
+            atr[i]=av
+        last_entry={k:-10**18 for k in strategies}
+        for i in range(200,n-25):
+            if any(v is None for v in (ema20[i],ema50[i],ema144[i],rsi[i],atr[i])):continue
+            if times[i+1]-times[i]!=300000:continue
+            if times[i+24]-times[i+1]!=23*300000:continue
+            if close[i]<=0 or atr[i]<=0:continue
+            vbase=sum(volume[i-20:i])/20
+            vr=volume[i]/vbase if vbase>0 else 0
+            # A: rising trend, pullback to EMA20 and bullish recovery; long only.
+            a=(ema20[i]>ema50[i]>ema144[i] and close[i]>ema20[i]
+               and low[i-1]<=ema20[i-1]*1.003 and close[i]>close[i-1]
+               and 45<=rsi[i]<=70 and vr>=0.8)
+            # B: narrow 20-bar range relative to ATR, then volume-confirmed upside break.
+            prior_hi=max(high[i-20:i]);prior_lo=min(low[i-20:i])
+            b=((prior_hi-prior_lo)/close[i-1]<0.025 and close[i]>prior_hi
+               and vr>=1.5 and close[i]>ema50[i])
+            # C: oversold below medium trend, bullish reversal; long only.
+            c=(rsi[i-1]<30 and rsi[i]>rsi[i-1] and close[i]<ema50[i]
+               and (ema20[i]-close[i])/close[i]>=0.01 and close[i]>close[i-1])
+            entry=float(cs[i+1]['open'])
+            # Exit at next candle open exactly 24 5m bars after entry (120m).
+            exit_price=float(cs[i+25]['open'])
+            if times[i+25]-times[i+1]!=24*300000 or entry<=0:continue
+            gross=(exit_price/entry-1)*100
+            for key,passed in zip(strategies,(a,b,c)):
+                if not passed or times[i+1]-last_entry[key]<120*60000:continue
+                last_entry[key]=times[i+1]
+                regime=btc_regimes.get(times[i])
+                all_trades[key].append({'symbol':sym,'entry_ms':times[i+1],
+                                        'gross_pct':gross, 'exit_ms':times[i+25],
+                                        'btc_trend':regime[0] if regime else 'UNKNOWN',
+                                        'btc_volatility':regime[1] if regime else 'UNKNOWN'})
+    # Analyze the selected V119 subgroup without changing signal generation.
+    from collections import Counter
+    import statistics
+    selected=sorted([t for t in all_trades['SQUEEZE_BREAKOUT']
+        if t['entry_ms']>=cutoff_ms and t['btc_volatility']=='MEDIUM'],
+        key=lambda t:(t['entry_ms'],t['symbol']))
+    def diagnostic(cost):
+        net=sorted([t['gross_pct']-cost for t in selected],reverse=True)
+        n=len(net)
+        total=sum(net)
+        pos=sum(x for x in net if x>0)
+        neg=-sum(x for x in net if x<0)
+        result={'cost_pct':cost,'n':n,'mean_net_pct':round(total/n,5) if n else None,
+            'median_net_pct':round(statistics.median(net),5) if n else None,
+            'profit_factor':round(pos/neg,4) if neg else None,
+            'win_rate_pct':round(100*sum(x>0 for x in net)/n,2) if n else None,
+            'top_5_net_pct': [round(x,5) for x in net[:5]],
+            'top_5_sum_pct_points':round(sum(net[:5]),5),
+            'total_sum_pct_points':round(total,5),
+            'mean_without_best_1_pct':round(sum(net[1:])/(n-1),5) if n>1 else None,
+            'mean_without_best_3_pct':round(sum(net[3:])/(n-3),5) if n>3 else None,
+            'mean_without_best_5_pct':round(sum(net[5:])/(n-5),5) if n>5 else None,
+            'positive_days':None}
+        return result
+    from datetime import datetime as _dt
+    daily={}
+    for t in selected:
+        day=_dt.fromtimestamp(t['entry_ms']/1000,timezone.utc).date().isoformat()
+        daily.setdefault(day,[]).append(t)
+    daily_rows=[{'utc_day':day,'n':len(ts),
+        'sum_net_pct_points_at_015':round(sum(t['gross_pct']-.15 for t in ts),5),
+        'mean_net_pct_at_015':round(sum(t['gross_pct']-.15 for t in ts)/len(ts),5)}
+        for day,ts in sorted(daily.items())]
+    simultaneous=0
+    overlap_pairs=0
+    for i,t in enumerate(selected):
+        concurrent=sum(u['entry_ms']<=t['entry_ms']<u['exit_ms'] for u in selected[:i])
+        if concurrent: simultaneous+=1
+        overlap_pairs+=concurrent
+    symbol_counts=dict(Counter(t['symbol'] for t in selected))
+    trades=[{'symbol':t['symbol'],
+        'entry_utc':_dt.fromtimestamp(t['entry_ms']/1000,timezone.utc).isoformat(),
+        'gross_pct':round(t['gross_pct'],5),
+        'net_pct_at_015':round(t['gross_pct']-.15,5)} for t in selected]
+    return {**MODE_INFO,'status':'PARTIAL' if errors else 'OK','signal':False,
+        'study':'V120_SQUEEZE_MEDIUM_VOL_ROBUSTNESS',
+        'generated_utc':utc_now(),'requested_days':days,
+        'selection':'SQUEEZE_BREAKOUT / BTC MEDIUM VOL / LAST CALENDAR THIRD',
+        'holdout_start_utc':_dt.fromtimestamp(cutoff_ms/1000,timezone.utc).isoformat(),
+        'volatility_definition':'BTC 5m ATR14 / close between 0.25% and 0.60% at signal',
+        'scenarios':{str(cost):diagnostic(cost) for cost in costs},
+        'distinct_utc_days':len(daily),'daily_distribution':daily_rows,
+        'symbols':symbol_counts,'trades_with_prior_open_position':simultaneous,
+        'overlapping_trade_pairs':overlap_pairs,
+        'trade_details':trades,'fetch_failures':errors,
+        'writes_to_database':False,'prospective_observations_added':0,
+        'limitations':['Research subgroup selected after inspecting V119: not independent validation.',
+            'All symbols can overlap; sum of trade returns is not portfolio PnL.',
+            'V119 strategy and volatility regime calculations copied without changes.',
+            'Historical next-bar open prices and fixed costs are not guaranteed executable fills.',
+            'No trading, orders, paper-state changes or V112 database writes.']}
