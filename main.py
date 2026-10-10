@@ -21277,3 +21277,123 @@ async def prospective_audit_v111():
         return {**MODE_INFO,'status':'ERROR','signal':False,
                 'study':'V111_LOCAL_PROSPECTIVE_OBSERVATION_AUDIT',
                 'error':str(exc),'generated_utc':utc_now()}
+
+
+# V112: durable prospective PostgreSQL observations, isolated schema.
+# Requires DATABASE_URL and external 5-minute scheduler. Read-only market access.
+@app.get('/prospective-audit-v112')
+async def prospective_audit_v112():
+    from bisect import bisect_right
+    now_ms=int(datetime.now(timezone.utc).timestamp()*1000)
+    url=os.getenv('DATABASE_URL','').strip()
+    if not url:
+        return {**MODE_INFO,'status':'ERROR','study':'V112_POSTGRES_PROSPECTIVE_AUDIT','error':'DATABASE_URL missing','signal':False}
+    try:
+        # V112 writes only to its own qualified schema and tables; V7 tables are untouched.
+        with psycopg.connect(url,connect_timeout=15) as con:
+            with con.cursor() as cur:
+                cur.execute('CREATE SCHEMA IF NOT EXISTS alt_momentum_v112')
+                cur.execute('CREATE TABLE IF NOT EXISTS alt_momentum_v112.observations (id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, observed_ms BIGINT NOT NULL, symbol TEXT NOT NULL, entry_ms BIGINT NOT NULL, direction TEXT NOT NULL, entry_price DOUBLE PRECISION NOT NULL, volume_ratio DOUBLE PRECISION NOT NULL, btc_regime TEXT NOT NULL, UNIQUE(symbol,entry_ms,direction))')
+                cur.execute('CREATE TABLE IF NOT EXISTS alt_momentum_v112.outcomes (observation_id BIGINT PRIMARY KEY REFERENCES alt_momentum_v112.observations(id), exit_price DOUBLE PRECISION NOT NULL, gross_pct DOUBLE PRECISION NOT NULL, settled_ms BIGINT NOT NULL)')
+                cur.execute('CREATE TABLE IF NOT EXISTS alt_momentum_v112.polls (polled_ms BIGINT PRIMARY KEY, observed_added INTEGER NOT NULL, settled_added INTEGER NOT NULL, failures INTEGER NOT NULL)')
+                con.commit()
+                added=0;settled=0;skipped_stale=0
+                async with httpx.AsyncClient(timeout=httpx.Timeout(240.0)) as client:
+                    sem=asyncio.Semaphore(2)
+                    async def worker(sym):
+                        async with sem:
+                            try:
+                                cs=await get_5m_candles_days(client,sym,3)
+                                cs=[c for c in cs if int(c['close_time'])<=now_ms]
+                                return sym,cs,None
+                            except Exception as e:return sym,[],str(e)
+                    fetched=await asyncio.gather(*(worker(sym) for sym in _V106_SYMBOLS))
+                data={sym:cs for sym,cs,err in fetched if err is None}
+                failed=[{'symbol':sym,'error':err} for sym,cs,err in fetched if err]
+                btc=data.get('BTCUSDT',[])
+                btc_close=[float(c['close']) for c in btc]
+                btc_times=[int(c['close_time']) for c in btc]
+                fast=_v109_ema(btc_close,144);slow=_v109_ema(btc_close,576)
+                added=0;settled=0;skipped_stale=0
+                for sym,cs in data.items():
+                    n=len(cs)
+                    if n<580:continue
+                    o=[float(c['open']) for c in cs];h=[float(c['high']) for c in cs]
+                    l=[float(c['low']) for c in cs];cl=[float(c['close']) for c in cs]
+                    v=[float(c['volume']) for c in cs]
+                    widths=[None]*n
+                    for j in range(11,n):
+                        low=min(l[j-11:j+1]);widths[j]=(max(h[j-11:j+1])-low)/low*100 if low>0 else None
+                    # Only recently completed entry candles (up to 15 minutes old) may be recorded.
+                    # This prevents old historical signals from being called prospective.
+                    for i in range(max(110,n-12),n-1):
+                        base=[w for w in widths[i-73:i-1] if w is not None]
+                        if len(base)!=72 or widths[i-1] is None:continue
+                        bm=median(base)
+                        if bm<=0 or widths[i-1]>.65*bm:continue
+                        ceiling=max(h[i-24:i]);floor=min(l[i-24:i])
+                        direction='SHORT' if cl[i]>ceiling else ('LONG' if cl[i]<floor else None)
+                        if not direction:continue
+                        avg=sum(v[i-20:i])/20
+                        if avg<=0:continue
+                        ratio=v[i]/avg
+                        confirm=next((k for k in range(i+1,min(i+7,n)) if floor<=cl[k]<=ceiling),None)
+                        if confirm is None:continue
+                        entry_idx=confirm+1
+                        if entry_idx>=n:continue
+                        entry_ms=int(cs[entry_idx]['open_time'])
+                        if entry_ms<_V106_START_MS:continue
+                        if not (0<=now_ms-entry_ms<900000):
+                            skipped_stale+=1;continue
+                        ix=bisect_right(btc_times,entry_ms-1)-1
+                        if ix<0 or fast[ix] is None or slow[ix] is None:continue
+                        regime='UPTREND' if btc_close[ix]>fast[ix]>slow[ix] else ('DOWNTREND' if btc_close[ix]<fast[ix]<slow[ix] else 'MIXED')
+                        if regime!='DOWNTREND' or direction!='LONG' or ratio<1.5:continue
+                        # Do not claim an entry at the historical open is executable;
+                        # this is a delayed near-real-time paper observation only.
+                        cur.execute('INSERT INTO alt_momentum_v112.observations(observed_ms,symbol,entry_ms,direction,entry_price,volume_ratio,btc_regime) VALUES (%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(symbol,entry_ms,direction) DO NOTHING RETURNING id',(now_ms,sym,entry_ms,direction,o[entry_idx],ratio,regime))
+                        if cur.fetchone() is not None:added+=1
+
+                con.commit()
+                cur.execute('SELECT id,symbol,entry_ms,direction,entry_price FROM alt_momentum_v112.observations WHERE id NOT IN (SELECT observation_id FROM alt_momentum_v112.outcomes)')
+                pending=cur.fetchall()
+                for oid,sym,entry_ms,direction,price in pending:
+                    cs=data.get(sym,[])
+                    lookup={int(c['open_time']):float(c['open']) for c in cs}
+                    exit_ms=entry_ms+120*60000
+                    if exit_ms not in lookup:continue
+                    exit_price=lookup[exit_ms]
+                    gross=(exit_price/price-1)*100 if direction=='LONG' else (price-exit_price)/price*100
+                    cur.execute('INSERT INTO alt_momentum_v112.outcomes(observation_id,exit_price,gross_pct,settled_ms) VALUES (%s,%s,%s,%s) ON CONFLICT(observation_id) DO NOTHING RETURNING observation_id',(oid,exit_price,gross,now_ms))
+                    if cur.fetchone() is not None:settled+=1
+                cur.execute('INSERT INTO alt_momentum_v112.polls VALUES (%s,%s,%s,%s) ON CONFLICT(polled_ms) DO NOTHING',(now_ms,added,settled,len(failed)))
+                con.commit()
+                cur.execute('SELECT o.gross_pct FROM alt_momentum_v112.outcomes o JOIN alt_momentum_v112.observations s ON s.id=o.observation_id ORDER BY s.entry_ms')
+                gross_returns=[float(r[0]) for r in cur.fetchall()]
+                cur.execute('SELECT COUNT(*) FROM alt_momentum_v112.observations')
+                count=cur.fetchone()[0]
+                cur.execute('SELECT s.symbol,s.entry_ms,s.observed_ms,s.volume_ratio,s.btc_regime,o.gross_pct FROM alt_momentum_v112.observations s LEFT JOIN alt_momentum_v112.outcomes o ON o.observation_id=s.id ORDER BY s.entry_ms DESC LIMIT 15')
+                recent=cur.fetchall()
+                cur.execute('SELECT COUNT(*),MAX(polled_ms) FROM alt_momentum_v112.polls')
+                poll_count,last_poll=cur.fetchone()
+                scenarios={str(cost):_v103_stats([g-cost for g in gross_returns]) for cost in (0.15,0.20,0.25,0.35)}
+                return {**MODE_INFO,'status':'PARTIAL' if failed else 'OK','signal':False,
+                        'study':'V112_POSTGRES_PROSPECTIVE_AUDIT','generated_utc':utc_now(),
+                        'observation_count':count,'new_observations_this_call':added,
+                        'settled_count':len(gross_returns),'new_settlements_this_call':settled,
+                        'cost_scenarios':scenarios,
+                        'recent':[{'symbol':r[0],'entry_ms':r[1],'observed_ms':r[2],
+                                   'volume_ratio':round(r[3],4),'btc_regime':r[4],
+                                   'gross_pct':round(r[5],5) if r[5] is not None else None} for r in recent],
+                        'poll_count':poll_count,'last_poll_ms':last_poll,
+                        'skipped_stale_candidates':skipped_stale,'failed':failed,
+                        'storage':'POSTGRES_SCHEMA_alt_momentum_v112',
+                        'limitations':['Endpoint is pull-based; an external scheduler must invoke every 5 minutes.',
+                                       'No retrospective backfill; only observations near time of first detection.',
+                                       'Entry is observed candle open, not executable fill; latency and gaps may miss signals.',
+                                       'Costs are scenarios, not observed spread/slippage/funding.',
+                                       'Past strategy selection bias remains; no orders or trading.']}
+    except Exception as exc:
+        return {**MODE_INFO,'status':'ERROR','signal':False,'study':'V112_POSTGRES_PROSPECTIVE_AUDIT',
+                'generated_utc':utc_now(),'error_type':type(exc).__name__,
+                'error':'PostgreSQL connection or audit failed; check Render logs (secrets omitted).'}
