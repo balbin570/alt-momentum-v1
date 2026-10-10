@@ -19576,3 +19576,145 @@ async def squeeze_breakout90_v98(
         return {**MODE_INFO,'status':'ERROR','signal':False,
                 'study':'V98_VOLATILITY_SQUEEZE_BREAKOUT_DIAGNOSTIC',
                 'error':str(exc),'generated_utc':utc_now()}
+
+# ============================================================
+# V99 FALSE BREAKOUT REVERSAL — RESEARCH ONLY
+# Breakout close -> first confirmed re-entry close within 30m -> next open.
+# No V96/paper/order code is modified.
+# ============================================================
+
+def _v99_events(candles, symbol):
+    n = len(candles)
+    if n < 150:
+        return []
+    o = [float(c['open']) for c in candles]
+    h = [float(c['high']) for c in candles]
+    l = [float(c['low']) for c in candles]
+    close = [float(c['close']) for c in candles]
+    vol = [float(c['volume']) for c in candles]
+    widths = [None] * n
+    for j in range(11, n):
+        low12 = min(l[j-11:j+1])
+        widths[j] = (max(h[j-11:j+1])-low12)/low12*100 if low12 > 0 else None
+    events = []
+    for i in range(110, n-33):
+        baseline = [w for w in widths[i-73:i-1] if w is not None]
+        if len(baseline) != 72 or widths[i-1] is None:
+            continue
+        base_med = median(baseline)
+        if base_med <= 0 or widths[i-1] > .65*base_med:
+            continue
+        ceiling = max(h[i-24:i]); floor = min(l[i-24:i])
+        if close[i] > ceiling:
+            breakout = 'UP'; reversal = 'SHORT'
+        elif close[i] < floor:
+            breakout = 'DOWN'; reversal = 'LONG'
+        else:
+            continue
+        avg_volume = sum(vol[i-20:i])/20
+        if avg_volume <= 0:
+            continue
+        ratio = vol[i]/avg_volume
+        # Confirm reversal only after a fully completed subsequent candle.
+        # Require CLOSE back inside the ORIGINAL pre-breakout 24-bar range.
+        confirm_idx = None
+        for k in range(i+1, min(i+7, n-26)):
+            if floor <= close[k] <= ceiling:
+                confirm_idx = k
+                break
+        if confirm_idx is None:
+            continue
+        entry_idx = confirm_idx+1
+        entry = o[entry_idx]
+        if entry <= 0:
+            continue
+        outcomes = {}
+        for hold in (30, 60, 120):
+            exit_idx = entry_idx + hold//5
+            exit_price = o[exit_idx]
+            gross = (exit_price/entry-1)*100 if reversal == 'LONG' else (entry-exit_price)/entry*100
+            active = range(entry_idx, exit_idx)
+            if reversal == 'LONG':
+                mae = max(0., (1-min(l[k] for k in active)/entry)*100)
+            else:
+                mae = max(0., (max(h[k] for k in active)/entry-1)*100)
+            outcomes[hold] = {'net':gross-ROUND_TRIP_COST_PCT,'mae':mae}
+        events.append({'symbol':symbol,'signal_time_ms':int(candles[i]['close_time']),
+                       'confirm_time_ms':int(candles[confirm_idx]['close_time']),
+                       'entry_open_time':int(candles[entry_idx]['open_time']),
+                       'breakout_direction':breakout,'reversal_direction':reversal,
+                       'confirmation_delay_minutes':(confirm_idx-i)*5,
+                       'volume_ratio':ratio,'outcomes':outcomes})
+    return events
+
+
+@app.get('/false-breakout90')
+async def false_breakout90_v99(
+    count: int = Query(default=10, ge=5, le=20),
+    days: int = Query(default=90, ge=30, le=90),
+):
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(240.0)) as client:
+            universe = await build_universe(client)
+            selected = universe[:count]
+            sem = asyncio.Semaphore(2)
+            async def worker(item):
+                async with sem:
+                    try:
+                        candles = await get_5m_candles_days(client,item['symbol'],days)
+                        return {'symbol':item['symbol'],'ok':True,
+                                'events':_v99_events(candles,item['symbol'])}
+                    except Exception as exc:
+                        return {'symbol':item['symbol'],'ok':False,'error':str(exc)}
+            fetched = await asyncio.gather(*(worker(x) for x in selected))
+        good = [x for x in fetched if x['ok']]
+        failed = [{'symbol':x['symbol'],'error':x['error']} for x in fetched if not x['ok']]
+        all_events = sorted((e for x in good for e in x['events']),
+                            key=lambda e:(e['symbol'],e['entry_open_time']))
+        cooled=[]; last_entry={}
+        for e in all_events:
+            sym=e['symbol']; t=e['entry_open_time']
+            if sym in last_entry and t-last_entry[sym]<120*60*1000:
+                continue
+            cooled.append(e);last_entry[sym]=t
+        times=sorted(e['entry_open_time'] for e in cooled)
+        cutoff=times[int(len(times)*2/3)] if times else None
+        variants={'VOLUME_GE_1_0':1.0,'VOLUME_GE_1_5':1.5}
+        results={}
+        for name, minimum in variants.items():
+            results[name]={}
+            for direction in ('LONG','SHORT'):
+                subset=[e for e in cooled if e['volume_ratio']>=minimum and e['reversal_direction']==direction]
+                dev=[e for e in subset if cutoff is not None and e['entry_open_time']<cutoff]
+                ref=[e for e in subset if cutoff is not None and e['entry_open_time']>=cutoff]
+                results[name][direction]={str(hold):{
+                    'all':_v98_stats(subset,hold),
+                    'discovery_first_2_3':_v98_stats(dev,hold),
+                    'reference_last_1_3':_v98_stats(ref,hold),
+                } for hold in (30,60,120)}
+        return {**MODE_INFO,'status':'OK','signal':False,
+                'study':'V99_FALSE_BREAKOUT_REVERSAL_DIAGNOSTIC',
+                'days':days,'selected_coin_count':len(selected),
+                'successful_coin_count':len(good),'failed_coin_count':len(failed),
+                'squeeze_definition':'Prior 12 completed 5m bars range <= 65% of median previous 72 rolling 12-bar ranges',
+                'breakout_definition':'Completed candle close outside previous 24-bar high/low',
+                'confirmation':'First subsequent completed 5m candle CLOSE back inside ORIGINAL prior 24-bar range, within 6 candles (30m)',
+                'entry':'NEXT_5M_OPEN_AFTER_CONFIRMED_RETURN_INSIDE_RANGE',
+                'direction':'OPPOSITE_TO_ORIGINAL_BREAKOUT',
+                'volume_filters':[1.0,1.5], 'hold_minutes':[30,60,120],
+                'round_trip_cost_pct':ROUND_TRIP_COST_PCT,
+                'cooldown_minutes':120,'calendar_split_utc_ms':cutoff,
+                'raw_confirmed_event_count':len(all_events),
+                'cooled_event_count':len(cooled),
+                'results':results,'failed':failed,'generated_utc':utc_now(),
+                'limitations':['Research only: no real or paper orders.',
+                    'V99 hypothesis motivated by V98: reference period is not a truly untouched out-of-sample test.',
+                    'Current liquid universe creates survivorship bias; cross-coin signals can overlap.',
+                    'Fixed cost excludes variable spread and slippage.',
+                    'Hypothetical short excludes borrow/funding/liquidation.',
+                    'MAE is descriptive; no tested stop execution or portfolio sizing.',
+                    'First confirmation is chosen only from completed candles; entry follows confirmation.']}
+    except Exception as exc:
+        return {**MODE_INFO,'status':'ERROR','signal':False,
+                'study':'V99_FALSE_BREAKOUT_REVERSAL_DIAGNOSTIC',
+                'error':str(exc),'generated_utc':utc_now()}
