@@ -19245,3 +19245,179 @@ async def v95_momentum_volume_shadow():
         ],
         "generated_utc": utc_now(),
     }
+
+
+# ============================================================
+# V97 MEAN REVERSION SHORT DIAGNOSTIC — RESEARCH ONLY
+# Does not open paper positions, send orders, or alter V96.
+# ============================================================
+
+def _v97_candidates(candles, symbol):
+    ret30, mus, sigmas = precompute_rolling_volatility_v12(candles, 288)
+    rows = []
+    wait = 12  # 60m, twelve completed 5m bars
+    for i in range(294, len(candles) - wait - 25):
+        mom = ret30[i]
+        mu, sigma = mus[i], sigmas[i]
+        if mom is None or mom <= 0 or mu is None or sigma is None or sigma <= 0:
+            continue
+        z = (mom - mu) / sigma
+        if z < 0:
+            continue
+        # Signal candle i is completed. Observe exactly the NEXT 12 completed
+        # candles i+1 ... i+12; enter at open of i+13.
+        obs = candles[i + 1:i + 13]
+        if len(obs) != wait:
+            continue
+        reference = candles[i]['close']
+        end_price = obs[-1]['close']
+        end_change = pct_change(reference, end_price)
+        max_down = pct_change(reference, min(x['low'] for x in obs))
+        if end_change >= 0.75:
+            behavior = 'CONTINUED_UP'
+        elif max_down > -0.75 and -0.50 <= end_change < 0.75:
+            behavior = 'SHALLOW_CONSOLIDATION'
+        elif max_down <= -0.75 and end_change >= -0.25:
+            behavior = 'PULLBACK_RECOVERY'
+        else:
+            behavior = 'PULLBACK_UNRECOVERED'
+        entry_i = i + 13
+        entry = candles[entry_i]['open']
+        if entry <= 0:
+            continue
+        outcomes = {}
+        for horizon in (30, 60, 120):
+            bars = horizon // 5
+            exit_i = entry_i + bars
+            exit_price = candles[exit_i]['open']
+            gross = (entry - exit_price) / entry * 100.0
+            net = gross - ROUND_TRIP_COST_PCT
+            # Include only price excursions BEFORE the exit open.
+            during = candles[entry_i:exit_i]
+            mae = max(0.0, (max(c['high'] for c in during) / entry - 1) * 100)
+            mfe = max(0.0, (1 - min(c['low'] for c in during) / entry) * 100)
+            outcomes[horizon] = {'net': net, 'mae': mae, 'mfe': mfe}
+        rows.append({
+            'symbol': symbol, 'signal_time_ms': candles[i]['close_time'],
+            'entry_open_time': candles[entry_i]['open_time'],
+            'relative_momentum_z': z, 'behavior': behavior,
+            'outcomes': outcomes,
+        })
+    return rows
+
+
+def _v97_stats(rows, horizon):
+    values = [e['outcomes'][horizon]['net'] for e in rows]
+    if not values:
+        return {'n': 0, 'mean_net_pct': None, 'median_net_pct': None,
+                'win_rate_pct': None, 'profit_factor': None,
+                'mean_mae_pct': None, 'p95_mae_pct': None, 'max_mae_pct': None}
+    wins = sum(v for v in values if v > 0)
+    losses = -sum(v for v in values if v < 0)
+    maes = sorted(e['outcomes'][horizon]['mae'] for e in rows)
+    return {
+        'n': len(values), 'mean_net_pct': round(mean(values), 4),
+        'median_net_pct': round(median(values), 4),
+        'win_rate_pct': round(100 * sum(v > 0 for v in values) / len(values), 2),
+        'profit_factor': round(wins / losses, 4) if losses > 0 else None,
+        'mean_mae_pct': round(mean(maes), 4),
+        'p95_mae_pct': round(maes[max(0, math.ceil(len(maes) * .95) - 1)], 4),
+        'max_mae_pct': round(max(maes), 4),
+    }
+
+
+@app.get('/mean-reversion90')
+async def mean_reversion90_v97(
+    count: int = Query(default=10, ge=5, le=20),
+    days: int = Query(default=90, ge=30, le=90),
+):
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(240.0)) as client:
+            universe = await build_universe(client)
+            selected = universe[:count]
+            semaphore = asyncio.Semaphore(2)
+
+            async def worker(item):
+                async with semaphore:
+                    try:
+                        candles = await get_5m_candles_days(client, item['symbol'], days)
+                        return {'symbol': item['symbol'], 'ok': True,
+                                'rows': _v97_candidates(candles, item['symbol'])}
+                    except Exception as exc:
+                        return {'symbol': item['symbol'], 'ok': False, 'error': str(exc)}
+
+            fetched = await asyncio.gather(*(worker(x) for x in selected))
+        good = [x for x in fetched if x['ok']]
+        failed = [{'symbol': x['symbol'], 'error': x['error']}
+                  for x in fetched if not x['ok']]
+        raw = [r for x in good for r in x['rows']]
+        by_time = {}
+        for r in raw:
+            by_time.setdefault(r['signal_time_ms'], []).append(r)
+        ranked = []
+        for group in by_time.values():
+            if len(group) < 5:
+                continue
+            ordered = sorted(group, key=lambda x: (x['relative_momentum_z'], x['symbol']))
+            for j, r in enumerate(ordered):
+                copy = dict(r)
+                copy['rank_percentile'] = j / (len(ordered) - 1)
+                ranked.append(copy)
+        ranked.sort(key=lambda x: (x['symbol'], x['signal_time_ms']))
+        cooled = []
+        last = {}
+        for r in ranked:
+            symbol = r['symbol']
+            if symbol in last and r['signal_time_ms'] - last[symbol] < 60 * 60 * 1000:
+                continue
+            cooled.append(r)
+            last[symbol] = r['signal_time_ms']
+        # Single global calendar split shared by all hypotheses and coins.
+        times = sorted(r['entry_open_time'] for r in cooled)
+        cutoff = times[int(len(times) * 2 / 3)] if times else None
+        hypotheses = {
+            'Z_GE_1': lambda r: r['relative_momentum_z'] >= 1,
+            'Z_GE_2': lambda r: r['relative_momentum_z'] >= 2,
+            'Z_GE_1_TOP_20': lambda r: r['relative_momentum_z'] >= 1 and r['rank_percentile'] >= .8,
+            'Z_GE_1_TOP_20_PULLBACK_RECOVERY': lambda r: r['relative_momentum_z'] >= 1 and r['rank_percentile'] >= .8 and r['behavior'] == 'PULLBACK_RECOVERY',
+            'Z_GE_1_TOP_20_PULLBACK_UNRECOVERED': lambda r: r['relative_momentum_z'] >= 1 and r['rank_percentile'] >= .8 and r['behavior'] == 'PULLBACK_UNRECOVERED',
+        }
+        report = {}
+        for name, predicate in hypotheses.items():
+            subset = [r for r in cooled if predicate(r)]
+            dev = [r for r in subset if r['entry_open_time'] < cutoff] if cutoff else []
+            oos = [r for r in subset if r['entry_open_time'] >= cutoff] if cutoff else []
+            report[name] = {
+                str(h): {
+                    'all': _v97_stats(subset, h),
+                    'discovery_first_2_3': _v97_stats(dev, h),
+                    'reference_last_1_3': _v97_stats(oos, h),
+                } for h in (30, 60, 120)
+            }
+        return {
+            **MODE_INFO, 'status': 'OK', 'signal': False,
+            'study': 'V97_MEAN_REVERSION_SHORT_DIAGNOSTIC',
+            'days': days, 'selected_coin_count': len(selected),
+            'successful_coin_count': len(good), 'failed_coin_count': len(failed),
+            'entry': 'OPEN_AFTER_12_COMPLETED_5M_OBSERVATION_CANDLES',
+            'hold_minutes': [30, 60, 120],
+            'round_trip_cost_pct': ROUND_TRIP_COST_PCT,
+            'direction': 'HYPOTHETICAL_SHORT_ONLY',
+            'cooldown_minutes': 60,
+            'calendar_split_utc_ms': cutoff,
+            'ranked_and_cooled_observations': len(cooled),
+            'results': report, 'failed': failed, 'generated_utc': utc_now(),
+            'limitations': [
+                'No actual orders or paper positions are created.',
+                'Hypothetical spot-price short: borrow availability, borrow fees, funding and liquidation not modeled.',
+                'Fixed 0.15% cost; variable slippage/spread not modeled.',
+                'MAE is adverse intratrade excursion, not a tested stop-loss execution.',
+                'Current liquid universe introduces survivorship and selection bias.',
+                'Global calendar split is descriptive; hypotheses were motivated by earlier research, so reference is not fully independent.',
+                'Signals may overlap across coins; no executable portfolio simulation.',
+            ],
+        }
+    except Exception as exc:
+        return {**MODE_INFO, 'status': 'ERROR', 'signal': False,
+                'study': 'V97_MEAN_REVERSION_SHORT_DIAGNOSTIC',
+                'error': str(exc), 'generated_utc': utc_now()}
