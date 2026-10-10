@@ -22338,3 +22338,98 @@ async def squeeze_robustness_v120(days: int = Query(default=90, ge=30, le=90)):
             'V119 strategy and volatility regime calculations copied without changes.',
             'Historical next-bar open prices and fixed costs are not guaranteed executable fills.',
             'No trading, orders, paper-state changes or V112 database writes.']}
+
+
+# V121: read-only robustness checks, reusing the unchanged V120 selection.
+@app.get('/squeeze-day-portfolio-v121')
+async def squeeze_day_portfolio_v121(days: int = Query(default=90, ge=30, le=90)):
+    from collections import defaultdict
+    from datetime import datetime as _dt
+    import statistics as _stats
+
+    base = await squeeze_robustness_v120(days=days)
+    if base.get('status') not in ('OK', 'PARTIAL'):
+        return {**MODE_INFO, 'status':'ERROR', 'study':'V121_DAY_PORTFOLIO',
+                'error':'V120 source failed', 'source':base}
+    rows=[]
+    for t in base.get('trade_details',[]):
+        entry=int(_dt.fromisoformat(t['entry_utc']).timestamp()*1000)
+        rows.append({'symbol':t['symbol'], 'entry_ms':entry,
+                     'exit_ms':entry+120*60*1000,
+                     'gross_pct':float(t['gross_pct']),
+                     'day':t['entry_utc'][:10]})
+    rows.sort(key=lambda t:(t['entry_ms'],t['symbol']))
+    costs=(0.15,0.20,0.25,0.30)
+    def stats(ts,cost):
+        v=[t['gross_pct']-cost for t in ts]
+        if not v:return {'n':0,'mean_net_pct':None,'median_net_pct':None,'profit_factor':None,'win_rate_pct':None}
+        gains=sum(x for x in v if x>0)
+        losses=-sum(x for x in v if x<0)
+        return {'n':len(v),'mean_net_pct':round(sum(v)/len(v),5),
+                'median_net_pct':round(_stats.median(v),5),
+                'profit_factor':round(gains/losses,4) if losses else None,
+                'win_rate_pct':round(100*sum(x>0 for x in v)/len(v),2)}
+    days_seen=sorted(set(t['day'] for t in rows))
+    leave_one_day_out=[]
+    for day in days_seen:
+        remaining=[t for t in rows if t['day']!=day]
+        leave_one_day_out.append({'excluded_utc_day':day,'excluded_trades':len(rows)-len(remaining),
+            'remaining_at_015':stats(remaining,.15),'remaining_at_030':stats(remaining,.30)})
+
+    def portfolio(max_positions,cost):
+        # Equal fixed slot sizing (1/max_positions initial equity), no leverage.
+        # Closed PnL is credited at the modeled 120-minute exit, not entry.
+        # Simultaneous candidates use deterministic alphabetical tie-break.
+        equity=100.0
+        peak=100.0
+        max_dd=0.0
+        active=[]
+        accepted=[]
+        skipped=0
+        def close_due(ts):
+            nonlocal equity,peak,max_dd,active
+            due=[p for p in active if p['exit_ms']<=ts]
+            active=[p for p in active if p['exit_ms']>ts]
+            for p in sorted(due,key=lambda p:(p['exit_ms'],p['symbol'])):
+                equity+=p['notional']*p['net_pct']/100.0
+                peak=max(peak,equity)
+                max_dd=min(max_dd,100*(equity/peak-1))
+        for t in rows:
+            close_due(t['entry_ms'])
+            if len(active)>=max_positions:
+                skipped+=1
+                continue
+            # Fixed initial-capital slots, bounded by available equity.
+            notional=min(100.0/max_positions,max(0.0,equity-sum(p['notional'] for p in active)))
+            if notional<=0:
+                skipped+=1
+                continue
+            active.append({'exit_ms':t['exit_ms'],'symbol':t['symbol'],
+                           'notional':notional,'net_pct':t['gross_pct']-cost})
+            accepted.append(t)
+        if active:close_due(max(p['exit_ms'] for p in active))
+        return {'max_positions':max_positions,'cost_pct':cost,
+                'accepted_count':len(accepted),'skipped_capacity_count':skipped,
+                'ending_equity':round(equity,5),
+                'portfolio_return_pct':round(equity-100.0,5),
+                'max_closed_equity_drawdown_pct':round(max_dd,5),
+                'accepted_trade_stats':stats(accepted,cost)}
+
+    return {**MODE_INFO,'status':base['status'],'signal':False,
+        'study':'V121_SQUEEZE_DAY_PORTFOLIO_ROBUSTNESS',
+        'generated_utc':utc_now(),'requested_days':days,
+        'source_study':base['study'],'source_holdout_start_utc':base['holdout_start_utc'],
+        'trade_count':len(rows),'distinct_utc_days':len(days_seen),
+        'leave_one_day_out':leave_one_day_out,
+        'portfolios':{str(k):{str(c):portfolio(k,c) for c in costs} for k in (3,5)},
+        'fetch_failures':base.get('fetch_failures',[]),
+        'writes_to_database':False,'prospective_observations_added':0,
+        'limitations':[
+            'Reuses the V120 historical selection; this is NOT new independent forward validation.',
+            'V120 returns rounded gross_pct (5 decimal places); minor numerical rounding applies.',
+            'Portfolio assumes fixed initial-capital equal slots and 120-minute holds, no leverage.',
+            'Equity and drawdown are marked at closes only; intratrade drawdown is not measured.',
+            'Same-time trades are chosen alphabetically; other ranking policies can change results.',
+            'Leave-one-day-out is a sensitivity test, not a statistically independent holdout.',
+            'No real fills, orders, paper-state changes, V112 writes, or strategy modifications.'
+        ]}
