@@ -19718,3 +19718,139 @@ async def false_breakout90_v99(
         return {**MODE_INFO,'status':'ERROR','signal':False,
                 'study':'V99_FALSE_BREAKOUT_REVERSAL_DIAGNOSTIC',
                 'error':str(exc),'generated_utc':utc_now()}
+
+
+# ============================================================
+# V100 TRADE PATH / EXIT DIAGNOSTIC — READ-ONLY RESEARCH
+# Reuses the frozen V99 event definitions; no trading state changes.
+# ============================================================
+def _v100_stats(rows):
+    if not rows:
+        return {'n': 0, 'mean_net_pct': None, 'median_net_pct': None,
+                'win_rate_pct': None, 'profit_factor': None,
+                'mean_mfe_pct': None, 'mean_mae_pct': None,
+                'mfe_before_mae_pct': None, 'mean_first_15m_pct': None,
+                'mean_first_30m_pct': None, 'gross_positive_but_net_negative_pct': None}
+    vals = [r['net_120'] for r in rows]
+    pos = sum(x for x in vals if x > 0)
+    neg = -sum(x for x in vals if x < 0)
+    def avg(field):
+        return round(mean(r[field] for r in rows), 4)
+    return {'n':len(rows), 'mean_net_pct':round(mean(vals),4),
+            'median_net_pct':round(median(vals),4),
+            'win_rate_pct':round(100*sum(v>0 for v in vals)/len(vals),2),
+            'profit_factor':round(pos/neg,4) if neg else None,
+            'mean_mfe_pct':avg('mfe'), 'mean_mae_pct':avg('mae'),
+            'mfe_before_mae_pct':round(100*sum(r['first_favorable'] for r in rows)/len(rows),2),
+            'mean_first_15m_pct':avg('first15'),
+            'mean_first_30m_pct':avg('first30'),
+            'gross_positive_but_net_negative_pct':round(100*sum(0<r['gross_120']<=ROUND_TRIP_COST_PCT for r in rows)/len(rows),2)}
+
+
+def _v100_paths(candles, symbol):
+    events = _v99_events(candles, symbol)
+    index_by_open = {int(c['open_time']):i for i,c in enumerate(candles)}
+    rows=[]
+    for e in events:
+        idx = index_by_open.get(e['entry_open_time'])
+        if idx is None or idx+24 >= len(candles):
+            continue
+        entry = float(candles[idx]['open'])
+        if entry<=0: continue
+        side = e['reversal_direction']
+        direction = 1 if side=='LONG' else -1
+        def pnl(price): return direction*(float(price)/entry-1)*100
+        first15=pnl(candles[idx+3]['open'])
+        first30=pnl(candles[idx+6]['open'])
+        gross120=pnl(candles[idx+24]['open'])
+        # High/low order within a single candle is unknown. A tie is indeterminate.
+        best=(-float('inf'),None)
+        worst=(float('inf'),None)
+        for j in range(idx,idx+24):
+            c=candles[j]
+            favorable=pnl(c['high'] if side=='LONG' else c['low'])
+            adverse=pnl(c['low'] if side=='LONG' else c['high'])
+            if favorable>best[0]: best=(favorable,j)
+            if adverse<worst[0]: worst=(adverse,j)
+        mfe=max(0.,best[0]); mae=max(0.,-worst[0])
+        rows.append({'symbol':symbol,'entry_open_time':e['entry_open_time'],
+                     'volume_ratio':e['volume_ratio'],'direction':side,
+                     'net_120':gross120-ROUND_TRIP_COST_PCT,'gross_120':gross120,
+                     'mfe':mfe,'mae':mae,
+                     'first_favorable':best[1]<worst[1] if best[1]!=worst[1] else False,
+                     'first15':first15,'first30':first30,
+                     'net_30':first30-ROUND_TRIP_COST_PCT,
+                     'net_60':pnl(candles[idx+12]['open'])-ROUND_TRIP_COST_PCT})
+    return rows
+
+
+@app.get('/trade-path90')
+async def trade_path90_v100(
+    count: int = Query(default=10,ge=5,le=20),
+    days: int = Query(default=90,ge=30,le=90),
+):
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(240.0)) as client:
+            universe=await build_universe(client)
+            selected=universe[:count]
+            sem=asyncio.Semaphore(2)
+            async def worker(item):
+                async with sem:
+                    try:
+                        candles=await get_5m_candles_days(client,item['symbol'],days)
+                        return {'ok':True,'symbol':item['symbol'],
+                                'rows':_v100_paths(candles,item['symbol'])}
+                    except Exception as exc:
+                        return {'ok':False,'symbol':item['symbol'],'error':str(exc)}
+            fetched=await asyncio.gather(*(worker(item) for item in selected))
+        good=[x for x in fetched if x['ok']]
+        failed=[{'symbol':x['symbol'],'error':x['error']} for x in fetched if not x['ok']]
+        all_rows=sorted((r for x in good for r in x['rows']),
+                        key=lambda r:(r['symbol'],r['entry_open_time']))
+        cooled=[]; last={}
+        for r in all_rows:
+            sym=r['symbol']; t=r['entry_open_time']
+            if sym in last and t-last[sym]<120*60*1000: continue
+            cooled.append(r); last[sym]=t
+        times=sorted(r['entry_open_time'] for r in cooled)
+        cutoff=times[int(len(times)*2/3)] if times else None
+        results={}
+        for volname,threshold in [('VOLUME_GE_1_0',1.),('VOLUME_GE_1_5',1.5)]:
+            results[volname]={}
+            for direction in ('LONG','SHORT'):
+                subset=[r for r in cooled if r['volume_ratio']>=threshold and r['direction']==direction]
+                dev=[r for r in subset if cutoff is not None and r['entry_open_time']<cutoff]
+                ref=[r for r in subset if cutoff is not None and r['entry_open_time']>=cutoff]
+                results[volname][direction]={
+                    'all':_v100_stats(subset),
+                    'discovery_first_2_3':_v100_stats(dev),
+                    'reference_last_1_3':_v100_stats(ref),
+                    'mean_net_by_hold_pct':{
+                        str(h):round(mean(r['net_'+str(h)] for r in subset),4) if subset else None
+                        for h in (30,60,120)},
+                    'first_15m_positive':_v100_stats([r for r in subset if r['first15']>0]),
+                    'first_15m_nonpositive':_v100_stats([r for r in subset if r['first15']<=0]),
+                }
+        return {**MODE_INFO,'status':'OK','signal':False,
+                'study':'V100_TRADE_PATH_EXIT_DIAGNOSTIC',
+                'base_events':'V99_CONFIRMED_FALSE_BREAKOUT',
+                'days':days,'selected_coin_count':len(selected),
+                'successful_coin_count':len(good),'failed_coin_count':len(failed),
+                'raw_event_count':len(all_rows),'cooled_event_count':len(cooled),
+                'cooldown_minutes':120,'round_trip_cost_pct':ROUND_TRIP_COST_PCT,
+                'calendar_split_utc_ms':cutoff,'results':results,
+                'failed':failed,'generated_utc':utc_now(),
+                'limitations':[
+                    'Descriptive diagnostics, not a new optimized or independently validated strategy.',
+                    'First 15m positive subgroup uses future price information and is NOT an entry-time signal.',
+                    'MFE and MAE are intrabar extremes; exact high/low ordering inside one 5m candle is unknown.',
+                    'MFE-before-MAE uses distinct bar indices; same-bar ties are counted as not confirmed.',
+                    'No executable stop, target, or exit fill is simulated from intrabar extremes.',
+                    'Current-universe survivorship bias and cross-coin overlap remain.',
+                    'Fixed cost excludes spread/slippage; hypothetical shorts exclude borrow/funding.',
+                    'V96 and all paper/order mechanisms remain unchanged.'
+                ]}
+    except Exception as exc:
+        return {**MODE_INFO,'status':'ERROR','signal':False,
+                'study':'V100_TRADE_PATH_EXIT_DIAGNOSTIC',
+                'error':str(exc),'generated_utc':utc_now()}
