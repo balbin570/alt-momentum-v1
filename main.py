@@ -20736,3 +20736,98 @@ async def forward_paper_v106(days: int = Query(default=30,ge=7,le=90)):
         return {**MODE_INFO,'status':'ERROR','signal':False,
                 'study':'V106_FROZEN_FORWARD_PAPER','error':str(exc),
                 'generated_utc':utc_now()}
+
+# V107 READ-ONLY FORWARD SIGNAL VISIBILITY DIAGNOSTIC
+# Does not change V96, V99, V106, any order routes, or frozen settings.
+@app.get('/forward-signal-v107')
+async def forward_signal_v107(days: int = Query(default=7, ge=2, le=30)):
+    try:
+        now_ms=int(datetime.now(timezone.utc).timestamp()*1000)
+        async with httpx.AsyncClient(timeout=httpx.Timeout(240.0)) as client:
+            sem=asyncio.Semaphore(2)
+            async def worker(symbol):
+                async with sem:
+                    try:
+                        cs=await get_5m_candles_days(client,symbol,days)
+                        # Exclude the still-forming 5-minute candle.
+                        cs=[c for c in cs if int(c['close_time'])<=now_ms]
+                        n=len(cs)
+                        o=[float(c['open']) for c in cs]
+                        h=[float(c['high']) for c in cs]
+                        l=[float(c['low']) for c in cs]
+                        cl=[float(c['close']) for c in cs]
+                        v=[float(c['volume']) for c in cs]
+                        widths=[None]*n
+                        for j in range(11,n):
+                            lo=min(l[j-11:j+1]);widths[j]=(max(h[j-11:j+1])-lo)/lo*100 if lo>0 else None
+                        stats={'completed_candles':n,'detector_windows':0,'compression_pass':0,
+                               'breakout_pass':0,'confirmation_pass':0,'volume_ge_1_0':0,
+                               'volume_ge_1_5':0,'entries_since_start':0,
+                               'matured_since_start':0,'open_120m_since_start':0,
+                               'unconfirmed_breakouts_since_start':0}
+                        candidates=[]
+                        for i in range(110,n):
+                            base=[w for w in widths[i-73:i-1] if w is not None]
+                            if len(base)!=72 or widths[i-1] is None:continue
+                            stats['detector_windows']+=1
+                            bm=median(base)
+                            if bm<=0 or widths[i-1]>.65*bm:continue
+                            stats['compression_pass']+=1
+                            ceiling=max(h[i-24:i]);floor=min(l[i-24:i])
+                            direction='SHORT' if cl[i]>ceiling else ('LONG' if cl[i]<floor else None)
+                            if not direction:continue
+                            stats['breakout_pass']+=1
+                            avg=sum(v[i-20:i])/20
+                            ratio=v[i]/avg if avg>0 else 0
+                            # Confirm only on completed subsequent candles, within 30 minutes.
+                            k_confirm=next((k for k in range(i+1,min(i+7,n))
+                                            if floor<=cl[k]<=ceiling),None)
+                            t=int(cs[i]['close_time'])
+                            if k_confirm is None:
+                                if t>=_V106_START_MS:
+                                    stats['unconfirmed_breakouts_since_start']+=1
+                                    candidates.append({'symbol':symbol,'stage':'BREAKOUT_UNCONFIRMED',
+                                                       'direction':direction,'breakout_time_ms':t,
+                                                       'volume_ratio':round(ratio,3)})
+                                continue
+                            stats['confirmation_pass']+=1
+                            if ratio>=1:stats['volume_ge_1_0']+=1
+                            if ratio>=1.5:stats['volume_ge_1_5']+=1
+                            entry_idx=k_confirm+1
+                            if entry_idx>=n:continue
+                            entry_ms=int(cs[entry_idx]['open_time'])
+                            if entry_ms<_V106_START_MS:continue
+                            stats['entries_since_start']+=1
+                            matured=entry_idx+24<n and entry_ms+120*60000<=now_ms
+                            stats['matured_since_start' if matured else 'open_120m_since_start']+=1
+                            candidates.append({'symbol':symbol,'stage':'MATURED_120M' if matured else 'OPEN_PAPER_120M',
+                                               'direction':direction,'entry_time_ms':entry_ms,
+                                               'entry_price':o[entry_idx],
+                                               'volume_ratio':round(ratio,3),
+                                               'eligible_ge_1_0':ratio>=1,
+                                               'eligible_ge_1_5':ratio>=1.5,
+                                               'minutes_since_entry':round((now_ms-entry_ms)/60000,1)})
+                        return {'symbol':symbol,'stats':stats,'recent':candidates[-10:],'error':None}
+                    except Exception as exc:
+                        return {'symbol':symbol,'stats':None,'recent':[],'error':str(exc)}
+            fetched=await asyncio.gather(*(worker(s) for s in _V106_SYMBOLS))
+        failed=[{'symbol':x['symbol'],'error':x['error']} for x in fetched if x['error']]
+        keys=('detector_windows','compression_pass','breakout_pass','confirmation_pass',
+              'volume_ge_1_0','volume_ge_1_5','entries_since_start',
+              'matured_since_start','open_120m_since_start','unconfirmed_breakouts_since_start')
+        totals={k:sum(x['stats'][k] for x in fetched if x['stats']) for k in keys}
+        latest=sorted((r for x in fetched for r in x['recent']),
+                      key=lambda r:r.get('entry_time_ms',r.get('breakout_time_ms',0)),reverse=True)[:30]
+        return {**MODE_INFO,'status':'OK' if not failed else 'PARTIAL',
+                'signal':False,'study':'V107_FORWARD_SIGNAL_VISIBILITY',
+                'generated_utc':utc_now(),'forward_start_ms':_V106_START_MS,
+                'days_rolling_lookback':days,'symbols_fixed':list(_V106_SYMBOLS),
+                'successful_coin_count':len(fetched)-len(failed),'failed':failed,
+                'stage_totals':totals,'by_symbol':fetched,'latest_candidates':latest,
+                'note':'Read-only diagnostic. OPEN_PAPER_120M is an inferred historical candidate, not a persisted live position or order. No execution or Telegram delivery.',
+                'limitations':['No database ledger or live execution.','Same detector thresholds as V99; no parameter optimization.',
+                               'Unconfirmed breakouts may still confirm in later candles.',
+                               'Entry count is before 120-minute per-symbol cooldown.']}
+    except Exception as exc:
+        return {**MODE_INFO,'status':'ERROR','signal':False,'study':'V107_FORWARD_SIGNAL_VISIBILITY',
+                'error':str(exc),'generated_utc':utc_now()}
