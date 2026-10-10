@@ -10997,24 +10997,79 @@ def alt_daily_summary_text():
     return "ALT GUNLUK OZET (paper)\n" + block("V27", d["v27"]) + "\n" + block("V32", d["v32"])
 
 
+# Durable, cross-process daily notification reservation.
+# Claim BEFORE sending: at-most-one attempt per UTC date, even after restarts.
+# A failed/uncertain send is deliberately not retried automatically to avoid duplicates.
+def _alt_daily_claim_once(day):
+    conn = _v612_db_conn()
+    if conn is None:
+        raise RuntimeError("Daily summary skipped: PostgreSQL is not configured")
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS alt_daily_summary_delivery (
+                        summary_date DATE PRIMARY KEY,
+                        state TEXT NOT NULL,
+                        claimed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        details TEXT
+                    )
+                """)
+                cur.execute("""
+                    INSERT INTO alt_daily_summary_delivery (summary_date, state)
+                    VALUES (%s, 'CLAIMED')
+                    ON CONFLICT (summary_date) DO NOTHING
+                    RETURNING summary_date
+                """, (day,))
+                return cur.fetchone() is not None
+    finally:
+        conn.close()
+
+
+def _alt_daily_record_result(day, state, details):
+    conn = _v612_db_conn()
+    if conn is None:
+        return
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE alt_daily_summary_delivery
+                    SET state = %s, details = %s, updated_at = NOW()
+                    WHERE summary_date = %s
+                """, (state, str(details)[:1500], day))
+    finally:
+        conn.close()
+
+
 async def alt_daily_summary_loop():
     await asyncio.sleep(30)
     while True:
         try:
             now = datetime.now(timezone.utc)
-            today = now.date().isoformat()
-            if now.hour >= ALT_DAILY_HOUR_UTC and ALT_DAILY_LAST_SENT["date"] != today:
-                await alt_safe_send(alt_daily_summary_text(), "DAILY", "-")
-                ALT_DAILY_LAST_SENT["date"] = today
-        except Exception:
-            pass
+            today = now.date()
+            if now.hour >= ALT_DAILY_HOUR_UTC:
+                claimed = await asyncio.to_thread(_alt_daily_claim_once, today)
+                if claimed:
+                    try:
+                        result = await alt_safe_send(alt_daily_summary_text(), "DAILY", "-")
+                        sent = result.get("sent") is True
+                        state = "SENT" if sent else "FAILED_OR_UNKNOWN"
+                        await asyncio.to_thread(_alt_daily_record_result, today, state, result)
+                        print(f"ALT_DAILY_SUMMARY {today} {state}", flush=True)
+                    except Exception as exc:
+                        print(f"ALT_DAILY_SUMMARY {today} FAILED_OR_UNKNOWN: {exc}", flush=True)
+                ALT_DAILY_LAST_SENT["date"] = today.isoformat()
+        except Exception as exc:
+            # Fail closed: never send without a successful durable claim.
+            print(f"ALT_DAILY_SUMMARY claim error: {exc}", flush=True)
         await asyncio.sleep(300)
 
 
 @app.on_event("startup")
 async def alt_daily_summary_startup():
     asyncio.create_task(alt_daily_summary_loop())
-
 
 @app.get("/alt-daily-summary")
 async def alt_daily_summary():
