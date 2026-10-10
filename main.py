@@ -21046,3 +21046,124 @@ async def btc_regime_v109(days: int = Query(default=90,ge=30,le=90)):
     except Exception as exc:
         return {**MODE_INFO,'status':'ERROR','signal':False,
                 'study':'V109_BTC_TREND_REGIME_RESEARCH','error':str(exc),'generated_utc':utc_now()}
+
+
+# V110 — robustness of the V109 selected cohort; retrospective only.
+# Does not change detector, original routes, trade execution, or frozen forward rules.
+@app.get('/btc-regime-robustness-v110')
+async def btc_regime_robustness_v110(days: int = Query(default=90, ge=30, le=90)):
+    try:
+        from bisect import bisect_right
+        from collections import defaultdict
+        from datetime import datetime as _dt, timezone as _tz
+        async with httpx.AsyncClient(timeout=httpx.Timeout(240.0)) as client:
+            btc=await get_5m_candles_days(client,'BTCUSDT',days)
+            bt=[int(c['close_time']) for c in btc]
+            bc=[float(c['close']) for c in btc]
+            fast=_v109_ema(bc,144)
+            slow=_v109_ema(bc,576)
+            sem=asyncio.Semaphore(2)
+            async def worker(symbol):
+                async with sem:
+                    try:
+                        cs=btc if symbol=='BTCUSDT' else await get_5m_candles_days(client,symbol,days)
+                        return {'symbol':symbol,'rows':_v105_rows(cs,symbol),'error':None}
+                    except Exception as exc:
+                        return {'symbol':symbol,'rows':[],'error':str(exc)}
+            fetched=await asyncio.gather(*(worker(sym) for sym in _V106_SYMBOLS))
+        failed=[{'symbol':x['symbol'],'error':x['error']} for x in fetched if x['error']]
+        raw=sorted((r for x in fetched for r in x['rows']),key=lambda r:(r['symbol'],r['entry_open_time']))
+        cooled=[];last={}
+        for r in raw:
+            sym=r['symbol'];t=r['entry_open_time']
+            if sym in last and t-last[sym]<120*60000:continue
+            last[sym]=t
+            idx=bisect_right(bt,t-1)-1
+            if idx<0 or fast[idx] is None or slow[idx] is None:continue
+            regime=('UPTREND' if bc[idx]>fast[idx]>slow[idx] else
+                    'DOWNTREND' if bc[idx]<fast[idx]<slow[idx] else 'MIXED')
+            cooled.append({**r,'btc_regime':regime})
+        timestamps=sorted(r['entry_open_time'] for r in cooled)
+        cutoff=timestamps[int(len(timestamps)*2/3)] if timestamps else None
+        selected=sorted((r for r in cooled if r['btc_regime']=='DOWNTREND' and
+                         r['direction']=='LONG' and r['volume_ratio']>=1.5),
+                        key=lambda r:r['entry_open_time'])
+        base_cost=float(ROUND_TRIP_COST_PCT)
+        def metrics(rs,extra_cost=0.0):
+            return _v103_stats([r['baseline']-extra_cost for r in rs])
+        cost_scenarios={}
+        for cost in (0.15,0.20,0.25,0.35,0.50):
+            # Original baseline already includes the configured round-trip cost.
+            extra=cost-base_cost
+            cost_scenarios[str(cost)]={'total_round_trip_cost_pct':cost,
+                                      'baseline_120m':metrics(selected,extra)}
+        by_symbol={}
+        for sym in _V106_SYMBOLS:
+            ss=[r for r in selected if r['symbol']==sym]
+            by_symbol[sym]={'baseline_120m':metrics(ss),
+                            'atr_strict':_v103_stats([r['strict'] for r in ss]),
+                            'sum_net_percentage_points':round(sum(r['baseline'] for r in ss),5)}
+        by_day=defaultdict(list)
+        for r in selected:
+            day=_dt.fromtimestamp(r['entry_open_time']/1000,_tz.utc).strftime('%Y-%m-%d')
+            by_day[day].append(r)
+        days_sorted=sorted(by_day)
+        daily_sums=[sum(r['baseline'] for r in by_day[d]) for d in days_sorted]
+        positives=sorted((r for r in selected if r['baseline']>0),key=lambda r:r['baseline'],reverse=True)
+        remove_top=max(1,int(len(selected)*0.05)) if selected else 0
+        excluded_ids={id(r) for r in positives[:remove_top]}
+        without_top=[r for r in selected if id(r) not in excluded_ids]
+        total=sum(r['baseline'] for r in selected)
+        top5=sum(r['baseline'] for r in positives[:remove_top])
+        # Concentration: daily sums are not compounded portfolio returns; overlapping positions possible.
+        # One-day-at-a-time leave-out diagnostic tests sensitivity to single clustered days.
+        leave_one_day_out=[]
+        for day in days_sorted:
+            rest=[r for r in selected if r not in by_day[day]]
+            if rest:
+                leave_one_day_out.append({'excluded_day':day,'n':len(rest),
+                                          'mean_net_pct':round(sum(r['baseline'] for r in rest)/len(rest),5)})
+        leave_one_day_out.sort(key=lambda x:x['mean_net_pct'])
+        return {**MODE_INFO,'status':'PARTIAL' if failed else 'OK','signal':False,
+                'study':'V110_BTC_DOWNTREND_LONG_HIGH_VOLUME_ROBUSTNESS',
+                'generated_utc':utc_now(),'days':days,'symbols_fixed':list(_V106_SYMBOLS),
+                'successful_coin_count':len(fetched)-len(failed),'failed':failed,
+                'raw_event_count':len(raw),'cooled_classified_count':len(cooled),
+                'calendar_split_utc_ms':cutoff,
+                'selected_cohort':{'btc_regime':'DOWNTREND','direction':'LONG',
+                                   'volume_ratio_min':1.5,'exit':'fixed_120m',
+                                   'selection_origin':'V109 retrospective discovery'},
+                'all':{'baseline_120m':metrics(selected),
+                       'atr_strict':_v103_stats([r['strict'] for r in selected])},
+                'discovery_first_2_3':metrics([r for r in selected if cutoff is not None and r['entry_open_time']<cutoff]),
+                'reference_last_1_3':metrics([r for r in selected if cutoff is not None and r['entry_open_time']>=cutoff]),
+                'cost_scenarios':cost_scenarios,'by_symbol':by_symbol,
+                'concentration':{'active_utc_days':len(days_sorted),
+                                 'positive_day_count':sum(v>0 for v in daily_sums),
+                                 'negative_day_count':sum(v<0 for v in daily_sums),
+                                 'zero_day_count':sum(v==0 for v in daily_sums),
+                                 'top_5pct_trade_count':remove_top,
+                                 'top_5pct_positive_sum_pp':round(top5,5),
+                                 'all_trades_sum_pp':round(total,5),
+                                 'excluding_top_5pct_positive_trades':metrics(without_top),
+                                 'best_5_utc_days_by_sum_pp':sorted(
+                                     ({'utc_day':d,'n':len(by_day[d]),
+                                       'sum_net_pp':round(sum(r['baseline'] for r in by_day[d]),5)}
+                                      for d in days_sorted),key=lambda x:x['sum_net_pp'],reverse=True)[:5],
+                                 'worst_5_utc_days_by_sum_pp':sorted(
+                                     ({'utc_day':d,'n':len(by_day[d]),
+                                       'sum_net_pp':round(sum(r['baseline'] for r in by_day[d]),5)}
+                                      for d in days_sorted),key=lambda x:x['sum_net_pp'])[:5],
+                                 'leave_one_day_out_worst_5':leave_one_day_out[:5],
+                                 'leave_one_day_out_best_5':leave_one_day_out[-5:]},
+                'limitations':['Same reused 90-day data; not independent forward validation.',
+                               'V109 cohort was selected after examining many groups: selection bias.',
+                               'Cost scenarios add incremental percentage-point costs to net returns; no market impact model.',
+                               'No funding, true spread, order-book liquidity, or intrabar path reconstruction.',
+                               'Same 10-symbol basket and 120m per-symbol cooldown as V109.',
+                               'Overlapping trades may share market shocks; day sums are not portfolio returns.',
+                               'This is research-only; no orders, execution, or trading signals.']}
+    except Exception as exc:
+        return {**MODE_INFO,'status':'ERROR','signal':False,
+                'study':'V110_BTC_DOWNTREND_LONG_HIGH_VOLUME_ROBUSTNESS',
+                'error':str(exc),'generated_utc':utc_now()}
