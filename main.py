@@ -21462,3 +21462,102 @@ async def research_quality_v113():
         return {**MODE_INFO,'status':'ERROR','signal':False,'study':'V113_RESEARCH_QUALITY',
                 'generated_utc':utc_now(),'error_type':type(exc).__name__,
                 'error':'Research quality query failed; inspect Render logs (secrets omitted).'}
+
+
+# V114: non-mutating funnel diagnostic. This endpoint is exploratory and
+# does not insert observations, trigger a V112 poll, or change entry rules.
+@app.get('/candidate-funnel-v114')
+async def candidate_funnel_v114():
+    from bisect import bisect_right
+    from statistics import median
+    now_ms=int(datetime.now(timezone.utc).timestamp()*1000)
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(240.0)) as client:
+            sem=asyncio.Semaphore(2)
+            async def worker(sym):
+                async with sem:
+                    try:
+                        cs=await get_5m_candles_days(client,sym,3)
+                        return sym,[c for c in cs if int(c['close_time'])<=now_ms],None
+                    except Exception as exc:
+                        return sym,[],type(exc).__name__
+            fetched=await asyncio.gather(*(worker(sym) for sym in _V106_SYMBOLS))
+        data={sym:cs for sym,cs,err in fetched if err is None}
+        failed=[{'symbol':sym,'error_type':err} for sym,cs,err in fetched if err]
+        btc=data.get('BTCUSDT',[])
+        btc_close=[float(c['close']) for c in btc]
+        btc_times=[int(c['close_time']) for c in btc]
+        fast=_v109_ema(btc_close,144)
+        slow=_v109_ema(btc_close,576)
+        keys=('evaluated_candles','width_valid','compression_pass','breakout_pass','volume_valid','confirmation_pass','entry_candle_available','fresh_entry','btc_regime_available','btc_downtrend','long_direction','volume_ge_1_5','final_candidates')
+        counts={k:0 for k in keys}
+        by_symbol={}
+        # Match V112's trailing candidate window exactly. Counts are sequential
+        # funnel stages, not independent mutually exclusive rejection reasons.
+        for sym,cs in data.items():
+            local={k:0 for k in keys}
+            n=len(cs)
+            if n<580:
+                by_symbol[sym]={'status':'INSUFFICIENT_CANDLES','candles':n,'funnel':local}
+                continue
+            o=[float(c['open']) for c in cs]
+            h=[float(c['high']) for c in cs]
+            l=[float(c['low']) for c in cs]
+            cl=[float(c['close']) for c in cs]
+            v=[float(c['volume']) for c in cs]
+            widths=[None]*n
+            for j in range(11,n):
+                low=min(l[j-11:j+1])
+                widths[j]=(max(h[j-11:j+1])-low)/low*100 if low>0 else None
+            for i in range(max(110,n-12),n-1):
+                local['evaluated_candles']+=1
+                base=[w for w in widths[i-73:i-1] if w is not None]
+                if len(base)!=72 or widths[i-1] is None:continue
+                local['width_valid']+=1
+                bm=median(base)
+                if bm<=0 or widths[i-1]>.65*bm:continue
+                local['compression_pass']+=1
+                ceiling=max(h[i-24:i]);floor=min(l[i-24:i])
+                direction='SHORT' if cl[i]>ceiling else ('LONG' if cl[i]<floor else None)
+                if not direction:continue
+                local['breakout_pass']+=1
+                avg=sum(v[i-20:i])/20
+                if avg<=0:continue
+                local['volume_valid']+=1
+                ratio=v[i]/avg
+                confirm=next((k for k in range(i+1,min(i+7,n)) if floor<=cl[k]<=ceiling),None)
+                if confirm is None:continue
+                local['confirmation_pass']+=1
+                entry_idx=confirm+1
+                if entry_idx>=n:continue
+                local['entry_candle_available']+=1
+                entry_ms=int(cs[entry_idx]['open_time'])
+                if entry_ms<_V106_START_MS or not (0<=now_ms-entry_ms<900000):continue
+                local['fresh_entry']+=1
+                ix=bisect_right(btc_times,entry_ms-1)-1
+                if ix<0 or fast[ix] is None or slow[ix] is None:continue
+                local['btc_regime_available']+=1
+                regime='UPTREND' if btc_close[ix]>fast[ix]>slow[ix] else ('DOWNTREND' if btc_close[ix]<fast[ix]<slow[ix] else 'MIXED')
+                if regime!='DOWNTREND':continue
+                local['btc_downtrend']+=1
+                if direction!='LONG':continue
+                local['long_direction']+=1
+                if ratio<1.5:continue
+                local['volume_ge_1_5']+=1
+                local['final_candidates']+=1
+            for key in keys:counts[key]+=local[key]
+            by_symbol[sym]={'status':'OK','candles':n,'funnel':local}
+        return {**MODE_INFO,'status':'PARTIAL' if failed else 'OK','signal':False,
+                'study':'V114_CANDIDATE_FUNNEL_DIAGNOSTIC','generated_utc':utc_now(),
+                'lookback':'V112 most recent 11 candidate candle indices per symbol, as available at call time',
+                'funnel_order':list(keys),'funnel':counts,'by_symbol':by_symbol,
+                'fetch_failures':failed,'writes_to_database':False,
+                'limitations':['Snapshot diagnostic only: not a persisted audit of previous scheduler calls.',
+                               'Stages are sequential; differences indicate first stage failed, not independent causes.',
+                               'Counts may overlap across successive manual calls; do not add snapshots.',
+                               'Freshness is evaluated at diagnostic call time, not past scheduler time.',
+                               'No trading, orders, signals, or changes to V112 entry criteria.']}
+    except Exception as exc:
+        return {**MODE_INFO,'status':'ERROR','signal':False,
+                'study':'V114_CANDIDATE_FUNNEL_DIAGNOSTIC',
+                'generated_utc':utc_now(),'error_type':type(exc).__name__}
