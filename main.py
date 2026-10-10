@@ -20642,3 +20642,97 @@ async def atr_execution_audit90_v105(
         return {**MODE_INFO,'status':'ERROR','signal':False,
                 'study':'V105_ATR_EXECUTION_AUDIT',
                 'error':str(exc),'generated_utc':utc_now()}
+
+
+# V106 FROZEN FORWARD PAPER VALIDATION (stateless, read-only)
+# Only entries from 2026-10-10 15:30 UTC onward count.
+# Uses a fixed ten-symbol basket; no optimization or order placement.
+_V106_START_MS = 1791646200000  # 2026-10-10 15:30:00 UTC
+_V106_SYMBOLS = ('BTCUSDT','ETHUSDT','SOLUSDT','XRPUSDT','BNBUSDT',
+                 'DOGEUSDT','ADAUSDT','LINKUSDT','AVAXUSDT','LTCUSDT')
+
+@app.get('/forward-paper-v106')
+async def forward_paper_v106(days: int = Query(default=30,ge=7,le=90)):
+    try:
+        now_ms=int(datetime.now(timezone.utc).timestamp()*1000)
+        async with httpx.AsyncClient(timeout=httpx.Timeout(240.0)) as client:
+            sem=asyncio.Semaphore(2)
+            async def worker(symbol):
+                async with sem:
+                    try:
+                        candles=await get_5m_candles_days(client,symbol,days)
+                        # Existing V99 event detector only yields fully matured trades.
+                        events=_v99_events(candles,symbol)
+                        idx_by_time={int(c['open_time']):i for i,c in enumerate(candles)}
+                        atrs=_v104_atr14(candles)
+                        rows=[]
+                        for e in events:
+                            t=int(e['entry_open_time'])
+                            if t < _V106_START_MS or t+120*60*1000 > now_ms:continue
+                            idx=idx_by_time.get(t)
+                            if idx is None or idx<15 or idx+24>=len(candles):continue
+                            sim=_v105_strict(candles,idx,e['reversal_direction'],atrs[idx-1],ROUND_TRIP_COST_PCT)
+                            if sim is None:continue
+                            rows.append({'symbol':symbol,'entry_open_time':t,
+                                         'direction':e['reversal_direction'],
+                                         'volume_ratio':e['volume_ratio'],
+                                         'baseline_net_pct':e['outcomes'][120]['net'],
+                                         'atr_net_pct':sim['net_pct'],
+                                         'tp1_hit':sim['tp1_hit'],'tp2_hit':sim['tp2_hit'],
+                                         'ambiguous_bar_count':sim['ambiguous_bar_count']})
+                        return {'symbol':symbol,'rows':rows,'error':None}
+                    except Exception as exc:
+                        return {'symbol':symbol,'rows':[],'error':str(exc)}
+            fetched=await asyncio.gather(*(worker(s) for s in _V106_SYMBOLS))
+        failed=[{'symbol':x['symbol'],'error':x['error']} for x in fetched if x['error']]
+        # Important: per-symbol chronological cooldown, identical to V105.
+        all_rows=sorted((r for x in fetched for r in x['rows']),
+                        key=lambda r:(r['symbol'],r['entry_open_time']))
+        cooled=[];last={}
+        for r in all_rows:
+            sym=r['symbol'];t=r['entry_open_time']
+            if sym in last and t-last[sym]<120*60*1000:continue
+            cooled.append(r);last[sym]=t
+        results={}
+        for threshold_name,threshold in [('VOLUME_GE_1_0',1.0),('VOLUME_GE_1_5',1.5)]:
+            results[threshold_name]={}
+            for direction in ('LONG','SHORT'):
+                subset=[r for r in cooled if r['direction']==direction and r['volume_ratio']>=threshold]
+                base=_v103_stats([r['baseline_net_pct'] for r in subset])
+                atr=_v103_stats([r['atr_net_pct'] for r in subset])
+                results[threshold_name][direction]={
+                    'baseline_120m':base,'atr_partial_tp':atr,
+                    'mean_delta_pp':round(atr['mean_net_pct']-base['mean_net_pct'],4) if subset else None,
+                    'tp1_hit_count':sum(r['tp1_hit'] for r in subset),
+                    'tp2_hit_count':sum(r['tp2_hit'] for r in subset),
+                    'ambiguous_bar_count':sum(r['ambiguous_bar_count'] for r in subset),
+                }
+        return {**MODE_INFO,'status':'OK' if not failed else 'PARTIAL',
+                'signal':False,'study':'V106_FROZEN_FORWARD_PAPER',
+                'forward_start_utc':'2026-10-10T15:30:00+00:00',
+                'forward_start_ms':_V106_START_MS,
+                'generated_utc':utc_now(),'days_rolling_lookback':days,
+                'symbols_fixed':list(_V106_SYMBOLS),
+                'successful_coin_count':len(fetched)-len(failed),
+                'failed':failed,'raw_matured_event_count':len(all_rows),
+                'cooled_matured_event_count':len(cooled),
+                'settings_frozen':{'atr_period':14,'stop_atr':2.0,'tp1_atr':1.5,
+                                   'tp1_fraction':0.5,'tp2_atr':3.0,'tp2_fraction':0.25,
+                                   'trailing_atr':2.0,'max_holding_minutes':120,
+                                   'round_trip_cost_pct':ROUND_TRIP_COST_PCT,
+                                   'cooldown_minutes':120},
+                'results':results,
+                'limitations':[
+                    'Only matured entries at or after frozen forward start are included.',
+                    'This is a stateless rolling lookback, NOT a durable signal ledger.',
+                    'Signals older than rolling days fall out of view; export periodic snapshots.',
+                    'First 110+ candles are detector warmup; earliest forward entries may be missed if days window begins near start.',
+                    'Frozen basket differs from dynamically selected V105 universe; cross-version raw comparisons are not paired.',
+                    'V99 historical detector needs future bars to establish mature 120-minute outcomes; no live signals or orders.',
+                    'Historical OHLC execution ambiguity, fees, slippage and short funding remain limitations.',
+                    'Forward start date alone does not guarantee a fully prospective test if code/rules were previously tuned on similar data.'
+                ]}
+    except Exception as exc:
+        return {**MODE_INFO,'status':'ERROR','signal':False,
+                'study':'V106_FROZEN_FORWARD_PAPER','error':str(exc),
+                'generated_utc':utc_now()}
