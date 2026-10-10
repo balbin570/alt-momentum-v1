@@ -18391,6 +18391,8 @@ async def v88_status():
 # ============================================================
 V89_THRESH={"alt30":0.412776,"btc30":0.234763,"disp30":0.574416,"breakout_change_pct":0.801574}
 V89_SCAN_SECONDS=60
+V89_STOP_PCT=3.0
+V89_NEW_VERSION="V89_1_V66_CONFIRM10_STOP3_TIME120"
 V89_STATE={"open":[],"closed":[],"seen":[],"last_scan":None,"errors":[],"started_utc":None}
 V89_TASK=None
 
@@ -18444,18 +18446,38 @@ async def v89_scan_once():
         btc=await v74_candles(client,"BTCUSDT",90)
         if len(btc)<55:raise RuntimeError("BTC candles insufficient")
 
-        # Frozen TIME120 exit using live BID.
-        now=alt_now_ms();still=[]
+        # V89.1: old open trades keep TIME120; new entries use STOP3 or TIME120.
+        # Live BID checked once per scan. A gap can cause a loss beyond -3%.
+        now=alt_now_ms();still=[];exit_messages=[]
         for p in V89_STATE.get("open",[]):
-          if now<int(p["exit_due_ms"]):still.append(p);continue
-          q=await live_quote(client,p["symbol"]);xp=float(q["bid"]) if q else None
+          due=now>=int(p["exit_due_ms"])
+          stop_enabled=p.get("execution_version")==V89_NEW_VERSION
+          if not due and not stop_enabled:
+            still.append(p);continue
+          q=await live_quote(client,p["symbol"])
+          xp=float(q["bid"]) if q and q.get("bid") is not None else None
           if xp is None:
-            cc=data.get(p["symbol"],[]);xp=float(cc[-1]["close"]) if cc else float(p["entry_price"])
-          gross=v74_pct(float(p["entry_price"]),xp);net=gross-0.15
-          p.update(exit_price=xp,exit_utc=utc_now(),exit_reason="TIME120",gross_pct=round(gross,4),cost_pct=0.15,net_pct=round(net,4),status="CLOSED_SHADOW")
+            if not due:
+              still.append(p);continue  # Never trigger stop from stale candle.
+            cc=data.get(p["symbol"],[])
+            xp=float(cc[-1]["close"]) if cc else float(p["entry_price"])
+          gross=v74_pct(float(p["entry_price"]),xp)
+          stopped=stop_enabled and gross<=-V89_STOP_PCT
+          if not stopped and not due:
+            still.append(p);continue
+          reason="STOP3" if stopped else "TIME120"
+          net=gross-0.15
+          p.update(exit_price=xp,exit_utc=utc_now(),exit_reason=reason,
+                   gross_pct=round(gross,4),cost_pct=0.15,net_pct=round(net,4),
+                   status="CLOSED_SHADOW")
           V89_STATE.setdefault("closed",[]).append(p)
-          await alt_safe_send(f"ALT V89 SHADOW CIKIS\nCoin: {p['symbol']}\nKalite: {p['v88_score']}/4 - {p['v88_label']}\nNet: {p['net_pct']}%\nCikis: TIME120\nPAPER/GOZLEMSEL - GERCEK EMIR YOK","V89_EXIT",p["symbol"])
-        V89_STATE["open"]=still;V89_STATE["closed"]=V89_STATE.get("closed",[])[-1000:]
+          exit_messages.append((p,reason))
+        V89_STATE["open"]=still
+        V89_STATE["closed"]=V89_STATE.get("closed",[])[-1000:]
+        # Persist exits before sending messages to reduce state loss on restart.
+        if exit_messages:v89_save()
+        for p,reason in exit_messages:
+          await alt_safe_send(f"ALT V89 SHADOW CIKIS\nCoin: {p['symbol']}\nKalite: {p['v88_score']}/4 - {p['v88_label']}\nNet: {p['net_pct']}%\nCikis: {reason}\nPAPER/GOZLEMSEL - GERCEK EMIR YOK","V89_EXIT",p["symbol"])
 
         # Causal market context: all candles here are completed before live entry.
         b30=v74_pct(btc[-7]["close"],btc[-1]["close"])
@@ -18480,9 +18502,10 @@ async def v89_scan_once():
             if q and q["spread_pct"]<=SPREAD_MAX_PCT:
               factors={"alt30":alt30,"btc30":b30,"disp30":disp30,"breakout_change_pct":float(e["breakout_change_pct"])}
               passed={k:(factors[k]>=V89_THRESH[k]) for k in V89_THRESH};score=sum(1 for x in passed.values() if x);label="YUKSEK" if score>=3 else ("ORTA" if score==2 else "DUSUK")
-              ep=float(q["ask"]);entry_ms=alt_now_ms();p={**e,"entry_price":ep,"entry_utc":utc_now(),"entry_ms":entry_ms,"exit_due_ms":entry_ms+120*60*1000,"status":"OPEN_SHADOW","execution_version":"V89_V66_CONFIRM10_CAUSAL_QUALITY_TIME120","spread_pct":round(float(q["spread_pct"]),4),"alt30_pct":round(alt30,6),"btc30_pct":round(b30,6),"disp30_pct":round(disp30,6),"v88_score":score,"v88_label":label,"v88_factor_pass":passed,"entry_gate":False}
+              ep=float(q["ask"]);entry_ms=alt_now_ms();p={**e,"entry_price":ep,"entry_utc":utc_now(),"entry_ms":entry_ms,"exit_due_ms":entry_ms+120*60*1000,"status":"OPEN_SHADOW","execution_version":V89_NEW_VERSION,"stop_loss_pct":V89_STOP_PCT,"stop_price":round(ep*(1-V89_STOP_PCT/100),12),"spread_pct":round(float(q["spread_pct"]),4),"alt30_pct":round(alt30,6),"btc30_pct":round(b30,6),"disp30_pct":round(disp30,6),"v88_score":score,"v88_label":label,"v88_factor_pass":passed,"entry_gate":False}
               V89_STATE.setdefault("open",[]).append(p);accepted=p
-              await alt_safe_send(f"ALT V89 SHADOW GIRIS\nCoin: {e['symbol']}\nV88 Kalite: {score}/4 - {label} (gozlemsel)\nBreakout: {e['breakout_change_pct']:.3f}% | Vol: {e['volume_ratio']:.2f}x\nALT30: {alt30:.3f}% | BTC30: {b30:.3f}% | Disp30: {disp30:.3f}\nGiris ask: {ep}\nTIME120 | PAPER - GERCEK EMIR YOK","V89_ENTRY",e["symbol"])
+              v89_save()
+              await alt_safe_send(f"ALT V89 SHADOW GIRIS\nCoin: {e['symbol']}\nV88 Kalite: {score}/4 - {label} (gozlemsel)\nBreakout: {e['breakout_change_pct']:.3f}% | Vol: {e['volume_ratio']:.2f}x\nALT30: {alt30:.3f}% | BTC30: {b30:.3f}% | Disp30: {disp30:.3f}\nGiris ask: {ep}\nSTOP -3% / TIME120 | PAPER - GERCEK EMIR YOK","V89_ENTRY",e["symbol"])
             seen.add(key);V89_STATE["seen"]=list(seen)[-2000:]
         V89_STATE["last_scan"]={"utc":scan_utc,"symbols":len(data),"errors":len(errs),"confirm10_candidates":len(candidates),"accepted":accepted["symbol"] if accepted else None,"alt30_pct":round(alt30,4),"btc30_pct":round(b30,4),"disp30_pct":round(disp30,4)}
         V89_STATE["errors"]=errs[-20:];v89_save();return V89_STATE["last_scan"]
@@ -18512,7 +18535,7 @@ async def v89_scan_now():return {"status":"OK","paper_only":True,"scan":await v8
 @app.get("/v89-status")
 async def v89_status():
     cl=V89_STATE.get("closed",[]);low=[x for x in cl if int(x.get("v88_score",-1))<=2];high=[x for x in cl if int(x.get("v88_score",-1))>=3]
-    return {**MODE_INFO,"status":"OK","panel":"V89_FORWARD_V66_CAUSAL_QUALITY_SHADOW","trading":False,"orders":False,"entry_gate":False,"active_strategy_changed":False,"v32_unchanged":True,"v61_unchanged":True,"v74_unchanged":True,"frozen_entry":"V66_CONFIRM_10M_TOP1","frozen_exit":"TIME120","quality_thresholds":V89_THRESH,"quality_use":"OBSERVATIONAL_ONLY_NOT_ENTRY_GATE","last_scan":V89_STATE.get("last_scan"),"open_count":len(V89_STATE.get("open",[])),"closed_count":len(cl),"performance":{"all":v89_perf(cl),"score_0_2":v89_perf(low),"score_3_4":v89_perf(high)},"open":V89_STATE.get("open",[])[-20:],"recent_closed":cl[-30:],"errors":V89_STATE.get("errors",[])[-10:],"started_utc":V89_STATE.get("started_utc"),"generated_utc":utc_now()}
+    return {**MODE_INFO,"status":"OK","panel":"V89_FORWARD_V66_CAUSAL_QUALITY_SHADOW","trading":False,"orders":False,"entry_gate":False,"active_strategy_changed":False,"v32_unchanged":True,"v61_unchanged":True,"v74_unchanged":True,"frozen_entry":"V66_CONFIRM_10M_TOP1","frozen_exit":"LEGACY_TIME120_NEW_STOP3_OR_TIME120","current_version":V89_NEW_VERSION,"stop_loss_pct":V89_STOP_PCT,"stop_check":"LIVE_BID_EACH_SCAN","legacy_positions_keep_time120":True,"quality_thresholds":V89_THRESH,"quality_use":"OBSERVATIONAL_ONLY_NOT_ENTRY_GATE","last_scan":V89_STATE.get("last_scan"),"open_count":len(V89_STATE.get("open",[])),"closed_count":len(cl),"performance":{"all":v89_perf(cl),"score_0_2":v89_perf(low),"score_3_4":v89_perf(high)},"performance_by_version":{"legacy":v89_perf([x for x in cl if x.get("execution_version")!=V89_NEW_VERSION]),"v89_1":v89_perf([x for x in cl if x.get("execution_version")==V89_NEW_VERSION])},"open":V89_STATE.get("open",[])[-20:],"recent_closed":cl[-30:],"errors":V89_STATE.get("errors",[])[-10:],"started_utc":V89_STATE.get("started_utc"),"generated_utc":utc_now()}
 
 # V90 - READ-ONLY COUNTERFACTUAL EXIT RESEARCH FOR V89 CLOSED SHADOWS
 # Does not mutate V89 state or any paper strategy.
