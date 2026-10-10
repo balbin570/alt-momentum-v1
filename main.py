@@ -19421,3 +19421,158 @@ async def mean_reversion90_v97(
         return {**MODE_INFO, 'status': 'ERROR', 'signal': False,
                 'study': 'V97_MEAN_REVERSION_SHORT_DIAGNOSTIC',
                 'error': str(exc), 'generated_utc': utc_now()}
+
+
+# ============================================================
+# V98 VOLATILITY SQUEEZE BREAKOUT — DIAGNOSTIC, RESEARCH ONLY
+# Independent frozen hypothesis; no V96/paper/order modifications.
+# ============================================================
+
+def _v98_events(candles, symbol):
+    from collections import deque
+    n = len(candles)
+    if n < 150:
+        return []
+    o = [float(c['open']) for c in candles]
+    h = [float(c['high']) for c in candles]
+    l = [float(c['low']) for c in candles]
+    cl = [float(c['close']) for c in candles]
+    vol = [float(c['volume']) for c in candles]
+    # Each rolling 12-bar range uses only fully completed historical bars.
+    widths = [None] * n
+    for j in range(11, n):
+        low = min(l[j-11:j+1]); high = max(h[j-11:j+1])
+        widths[j] = (high-low)/low*100 if low > 0 else None
+    events=[]
+    # i is the fully closed breakout bar. Entry is NEXT bar open i+1.
+    for i in range(110, n-26):
+        # Squeeze ends BEFORE breakout bar; no future candles used.
+        prior_width = widths[i-1]
+        baseline = [w for w in widths[i-73:i-1] if w is not None]
+        if prior_width is None or len(baseline) != 72:
+            continue
+        baseline_median = median(baseline)
+        if baseline_median <= 0 or prior_width > 0.65 * baseline_median:
+            continue
+        ceiling = max(h[i-24:i]); floor = min(l[i-24:i])
+        if cl[i] > ceiling:
+            direction='LONG'
+        elif cl[i] < floor:
+            direction='SHORT'
+        else:
+            continue
+        average_volume = sum(vol[i-20:i])/20
+        if average_volume <= 0:
+            continue
+        volume_ratio = vol[i]/average_volume
+        entry = o[i+1]
+        if entry <= 0:
+            continue
+        outcomes={}
+        for hold in (30,60,120):
+            bars=hold//5
+            exit_index=i+1+bars
+            exit_price=o[exit_index]
+            gross=(exit_price/entry-1)*100 if direction=='LONG' else (entry-exit_price)/entry*100
+            inside=range(i+1,exit_index)
+            if direction=='LONG':
+                mae=max(0.0,(1-min(l[k] for k in inside)/entry)*100)
+            else:
+                mae=max(0.0,(max(h[k] for k in inside)/entry-1)*100)
+            outcomes[hold]={'net':gross-ROUND_TRIP_COST_PCT,'mae':mae}
+        events.append({'symbol':symbol,'signal_time_ms':int(candles[i]['close_time']),
+                       'entry_open_time':int(candles[i+1]['open_time']),
+                       'direction':direction,'volume_ratio':volume_ratio,
+                       'squeeze_ratio':prior_width/baseline_median,'outcomes':outcomes})
+    return events
+
+
+def _v98_stats(rows, hold):
+    if not rows:
+        return {'n':0,'mean_net_pct':None,'median_net_pct':None,'win_rate_pct':None,
+                'profit_factor':None,'mean_mae_pct':None,'p95_mae_pct':None}
+    values=[r['outcomes'][hold]['net'] for r in rows]
+    adverse=sorted(r['outcomes'][hold]['mae'] for r in rows)
+    wins=sum(x for x in values if x>0)
+    losses=-sum(x for x in values if x<0)
+    return {'n':len(values),'mean_net_pct':round(mean(values),4),
+            'median_net_pct':round(median(values),4),
+            'win_rate_pct':round(100*sum(x>0 for x in values)/len(values),2),
+            'profit_factor':round(wins/losses,4) if losses>0 else None,
+            'mean_mae_pct':round(mean(adverse),4),
+            'p95_mae_pct':round(adverse[math.ceil(.95*len(adverse))-1],4)}
+
+
+@app.get('/squeeze-breakout90')
+async def squeeze_breakout90_v98(
+    count: int = Query(default=10, ge=5, le=20),
+    days: int = Query(default=90, ge=30, le=90),
+):
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(240.0)) as client:
+            universe=await build_universe(client)
+            selected=universe[:count]
+            sem=asyncio.Semaphore(2)
+            async def worker(item):
+                async with sem:
+                    try:
+                        candles=await get_5m_candles_days(client,item['symbol'],days)
+                        return {'symbol':item['symbol'],'ok':True,
+                                'events':_v98_events(candles,item['symbol'])}
+                    except Exception as exc:
+                        return {'symbol':item['symbol'],'ok':False,'error':str(exc)}
+            fetched=await asyncio.gather(*(worker(x) for x in selected))
+        successful=[r for r in fetched if r['ok']]
+        failed=[{'symbol':r['symbol'],'error':r['error']} for r in fetched if not r['ok']]
+        all_events=sorted((e for r in successful for e in r['events']),
+                          key=lambda x:(x['symbol'],x['signal_time_ms']))
+        # Non-overlapping 120-minute observation windows within each symbol.
+        cooled=[];last={}
+        for e in all_events:
+            sym=e['symbol'];t=e['signal_time_ms']
+            if sym in last and t-last[sym]<120*60*1000:
+                continue
+            cooled.append(e);last[sym]=t
+        # Fixed global chronological split, independent of chosen variants.
+        times=sorted(e['entry_open_time'] for e in cooled)
+        cutoff=times[int(len(times)*2/3)] if times else None
+        variants={
+            'BREAKOUT_VOLUME_GE_1_0':lambda e:e['volume_ratio']>=1.0,
+            'BREAKOUT_VOLUME_GE_1_5':lambda e:e['volume_ratio']>=1.5,
+        }
+        results={}
+        for name,pred in variants.items():
+            results[name]={}
+            for direction in ('LONG','SHORT'):
+                subset=[e for e in cooled if pred(e) and e['direction']==direction]
+                discovery=[e for e in subset if cutoff is not None and e['entry_open_time']<cutoff]
+                reference=[e for e in subset if cutoff is not None and e['entry_open_time']>=cutoff]
+                results[name][direction]={str(hold):{
+                    'all':_v98_stats(subset,hold),
+                    'discovery_first_2_3':_v98_stats(discovery,hold),
+                    'reference_last_1_3':_v98_stats(reference,hold),
+                } for hold in (30,60,120)}
+        return {**MODE_INFO,'status':'OK','signal':False,
+                'study':'V98_VOLATILITY_SQUEEZE_BREAKOUT_DIAGNOSTIC',
+                'days':days,'selected_coin_count':len(selected),
+                'successful_coin_count':len(successful),'failed_coin_count':len(failed),
+                'squeeze_definition':'Prior 12 completed 5m bars range <= 65% of median rolling 12-bar range over preceding 72 completed bars',
+                'breakout_definition':'Completed signal candle CLOSE outside prior 24-bar high/low',
+                'volume_filters':[1.0,1.5],
+                'entry':'NEXT_5M_OPEN_AFTER_COMPLETED_BREAKOUT_CANDLE',
+                'hold_minutes':[30,60,120],
+                'round_trip_cost_pct':ROUND_TRIP_COST_PCT,
+                'cooldown_minutes':120,
+                'calendar_split_utc_ms':cutoff,
+                'cooled_event_count':len(cooled),
+                'results':results,'failed':failed,'generated_utc':utc_now(),
+                'limitations':['Research only: no real or paper orders are placed.',
+                    'Thresholds are exploratory, not validated on independent future data.',
+                    'Current-universe survivorship bias; overlapping cross-coin signals possible.',
+                    'Fixed trading cost does not model variable slippage/spread.',
+                    'Hypothetical short ignores borrow/funding/liquidation.',
+                    'MAE is descriptive; no executable stop loss or portfolio simulation.']}
+    except Exception as exc:
+        return {**MODE_INFO,'status':'ERROR','signal':False,
+                'study':'V98_VOLATILITY_SQUEEZE_BREAKOUT_DIAGNOSTIC',
+                'error':str(exc),'generated_utc':utc_now()}
