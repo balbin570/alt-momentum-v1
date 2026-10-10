@@ -21397,3 +21397,68 @@ async def prospective_audit_v112():
         return {**MODE_INFO,'status':'ERROR','signal':False,'study':'V112_POSTGRES_PROSPECTIVE_AUDIT',
                 'generated_utc':utc_now(),'error_type':type(exc).__name__,
                 'error':'PostgreSQL connection or audit failed; check Render logs (secrets omitted).'}
+
+# V113: read-only PostgreSQL research quality dashboard. Does not trigger market polling.
+@app.get('/research-quality-v113')
+async def research_quality_v113():
+    from collections import defaultdict
+    from statistics import mean, median
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    url = os.getenv('DATABASE_URL', '').strip()
+    if not url:
+        return {**MODE_INFO, 'status':'ERROR', 'study':'V113_RESEARCH_QUALITY', 'signal':False, 'error':'DATABASE_URL missing'}
+    try:
+        with psycopg.connect(url, connect_timeout=15) as con:
+            with con.cursor() as cur:
+                # All reads are restricted to the V112 schema; no CREATE/UPDATE/DELETE.
+                cur.execute('SELECT polled_ms, observed_added, settled_added, failures FROM alt_momentum_v112.polls ORDER BY polled_ms')
+                polls = cur.fetchall()
+                cur.execute('SELECT s.id,s.symbol,s.entry_ms,s.observed_ms,s.direction,s.entry_price,s.volume_ratio,s.btc_regime,o.gross_pct,o.settled_ms FROM alt_momentum_v112.observations s LEFT JOIN alt_momentum_v112.outcomes o ON o.observation_id=s.id ORDER BY s.entry_ms')
+                rows = cur.fetchall()
+        times = [int(p[0]) for p in polls]
+        gaps = [(times[i]-times[i-1])/1000 for i in range(1,len(times))]
+        long_gaps = [{'from_ms':times[i-1], 'to_ms':times[i], 'gap_minutes':round((times[i]-times[i-1])/60000,2)} for i in range(1,len(times)) if times[i]-times[i-1]>450000]
+        # Number of absent 5-minute intervals is an estimate; manual requests and jitter affect it.
+        estimated_missing = sum(max(0, round(g/300)-1) for g in gaps)
+        settled = [r for r in rows if r[8] is not None]
+        pending = [r for r in rows if r[8] is None]
+        delays = [(int(r[3])-int(r[2]))/1000 for r in rows]
+        by_symbol = defaultdict(list)
+        for r in settled: by_symbol[r[1]].append(float(r[8]))
+        costs = (0.15,0.20,0.25,0.35)
+        gross = [float(r[8]) for r in settled]
+        cost_results = {str(c):_v103_stats([g-c for g in gross]) for c in costs}
+        concentration = None
+        if gross:
+            net = sorted([g-0.15 for g in gross], reverse=True)
+            k=min(5,len(net))
+            concentration = {'sample_n':len(net),'top_5_or_fewer_sum_net_pct_points':round(sum(net[:k]),5),
+                             'all_sum_net_pct_points':round(sum(net),5),
+                             'excluding_top_5_or_fewer':_v103_stats(net[k:]) if len(net)>k else None}
+        return {**MODE_INFO,'status':'OK','signal':False,'study':'V113_RESEARCH_QUALITY',
+                'generated_utc':utc_now(),'storage':'POSTGRES_SCHEMA_alt_momentum_v112_READ_ONLY',
+                'polls':{'count':len(polls),'first_ms':times[0] if times else None,'last_ms':times[-1] if times else None,
+                         'age_of_last_poll_minutes':round((now_ms-times[-1])/60000,2) if times else None,
+                         'average_interval_seconds':round(mean(gaps),2) if gaps else None,
+                         'median_interval_seconds':round(median(gaps),2) if gaps else None,
+                         'estimated_missing_5m_slots':estimated_missing,
+                         'gaps_over_7_5_minutes':long_gaps[-20:],
+                         'polls_with_fetch_failures':sum(1 for p in polls if p[3]>0),
+                         'sum_symbol_fetch_failures':sum(int(p[3]) for p in polls)},
+                'observations':{'count':len(rows),'settled_count':len(settled),'pending_count':len(pending),
+                                'median_observation_delay_seconds':round(median(delays),2) if delays else None,
+                                'max_observation_delay_seconds':round(max(delays),2) if delays else None,
+                                'pending_over_150_minutes':sum(1 for r in pending if now_ms-int(r[2])>150*60000)},
+                'net_120m_by_cost_pct':cost_results,
+                'by_symbol_at_cost_0_15_pct':{s:_v103_stats([g-0.15 for g in values]) for s,values in sorted(by_symbol.items())},
+                'top_winner_concentration_at_cost_0_15_pct':concentration,
+                'limitations':['Read-only dashboard: calling this endpoint does not create a poll.',
+                               'Missing slots are inferred from poll timestamps, not verified cron-job.org executions.',
+                               'Manual polling and scheduler jitter distort gap estimates.',
+                               'Small prospective samples cannot establish profitability.',
+                               'Entry and exit use candle opens; no executable fills or observed slippage.',
+                               'Research only; no orders, signals, or live trading.']}
+    except Exception as exc:
+        return {**MODE_INFO,'status':'ERROR','signal':False,'study':'V113_RESEARCH_QUALITY',
+                'generated_utc':utc_now(),'error_type':type(exc).__name__,
+                'error':'Research quality query failed; inspect Render logs (secrets omitted).'}
