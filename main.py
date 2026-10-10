@@ -22433,3 +22433,122 @@ async def squeeze_day_portfolio_v121(days: int = Query(default=90, ge=30, le=90)
             'Leave-one-day-out is a sensitivity test, not a statistically independent holdout.',
             'No real fills, orders, paper-state changes, V112 writes, or strategy modifications.'
         ]}
+
+
+# V122: prospective, isolated squeeze-breakout research; no orders or paper state changes.
+# Call /squeeze-prospective-v122 every 5 minutes from a scheduler.
+@app.get('/squeeze-prospective-v122')
+async def squeeze_prospective_v122():
+    from bisect import bisect_right
+    from collections import defaultdict
+    from statistics import median
+    now_ms=int(datetime.now(timezone.utc).timestamp()*1000)
+    url=os.getenv('DATABASE_URL','').strip()
+    if not url:
+        return {**MODE_INFO,'study':'V122_PROSPECTIVE_SQUEEZE','status':'ERROR','signal':False,'error':'DATABASE_URL missing'}
+    try:
+        # Fetch before opening database transaction; a failed market call cannot hold a DB lock.
+        async with httpx.AsyncClient(timeout=httpx.Timeout(240.0)) as client:
+            sem=asyncio.Semaphore(3)
+            async def worker(sym):
+                async with sem:
+                    try:
+                        cs=await get_5m_candles_days(client,sym,3)
+                        return sym,[c for c in cs if int(c['close_time'])<=now_ms],None
+                    except Exception as exc:
+                        return sym,[],type(exc).__name__
+            fetched=await asyncio.gather(*(worker(sym) for sym in _V106_SYMBOLS))
+        data={sym:cs for sym,cs,err in fetched if err is None}
+        failures=[{'symbol':sym,'error_type':err} for sym,cs,err in fetched if err]
+        btc=data.get('BTCUSDT',[])
+        btc_times=[int(c['open_time']) for c in btc]
+        bc=[float(c['close']) for c in btc]
+        bh=[float(c['high']) for c in btc]
+        bl=[float(c['low']) for c in btc]
+        btc_vol={}
+        if len(btc)>=577:
+            tr=[bh[0]-bl[0]]+[max(bh[j]-bl[j],abs(bh[j]-bc[j-1]),abs(bl[j]-bc[j-1])) for j in range(1,len(bc))]
+            for j in range(576,len(bc)):
+                if bc[j]>0:
+                    btc_vol[btc_times[j]]=100*sum(tr[j-13:j+1])/14/bc[j]
+        # Build only recent signals, but reconstruct the full 120m cooldown from available history.
+        candidates=[]
+        candle_lookup={}
+        for sym,cs in data.items():
+            n=len(cs)
+            if n<700:continue
+            cl=[float(c['close']) for c in cs]
+            hi=[float(c['high']) for c in cs]
+            lo=[float(c['low']) for c in cs]
+            vol=[float(c['volume']) for c in cs]
+            times=[int(c['open_time']) for c in cs]
+            ema50=_v109_ema(cl,50)
+            candle_lookup[sym]={int(c['open_time']):float(c['open']) for c in cs}
+            last_entry=-10**18
+            for i in range(200,n-1):
+                if ema50[i] is None or cl[i-1]<=0 or times[i+1]-times[i]!=300000:continue
+                prior_hi=max(hi[i-20:i]);prior_lo=min(lo[i-20:i])
+                vbase=sum(vol[i-20:i])/20
+                vr=vol[i]/vbase if vbase>0 else 0
+                breakout=((prior_hi-prior_lo)/cl[i-1]<0.025 and cl[i]>prior_hi
+                          and vr>=1.5 and cl[i]>ema50[i])
+                entry_ms=times[i+1]
+                if not breakout or entry_ms-last_entry<120*60000:continue
+                last_entry=entry_ms
+                atr_pct=btc_vol.get(times[i])
+                if atr_pct is None or not 0.25<=atr_pct<0.60:continue
+                # A signal may only be registered when its intended entry open is recent.
+                # This prevents retrospectively backfilling winning historical signals.
+                if 0<=now_ms-entry_ms<15*60000:
+                    entry=float(cs[i+1]['open'])
+                    if entry>0:
+                        candidates.append((sym,entry_ms,times[i],entry,vr,atr_pct))
+        with psycopg.connect(url,connect_timeout=15) as con:
+            with con.cursor() as cur:
+                cur.execute('CREATE SCHEMA IF NOT EXISTS alt_momentum_v122')
+                cur.execute('CREATE TABLE IF NOT EXISTS alt_momentum_v122.observations (id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, observed_ms BIGINT NOT NULL, symbol TEXT NOT NULL, signal_ms BIGINT NOT NULL, entry_ms BIGINT NOT NULL, entry_price DOUBLE PRECISION NOT NULL, volume_ratio DOUBLE PRECISION NOT NULL, btc_atr_pct DOUBLE PRECISION NOT NULL, UNIQUE(symbol,entry_ms))')
+                cur.execute('CREATE TABLE IF NOT EXISTS alt_momentum_v122.outcomes (observation_id BIGINT PRIMARY KEY REFERENCES alt_momentum_v122.observations(id), exit_ms BIGINT NOT NULL, exit_price DOUBLE PRECISION NOT NULL, gross_pct DOUBLE PRECISION NOT NULL, settled_ms BIGINT NOT NULL)')
+                cur.execute('CREATE TABLE IF NOT EXISTS alt_momentum_v122.polls (polled_ms BIGINT PRIMARY KEY, observed_added INTEGER NOT NULL, settled_added INTEGER NOT NULL, failure_count INTEGER NOT NULL)')
+                con.commit()
+                added=0;settled=0
+                for sym,entry_ms,signal_ms,entry,vr,atr_pct in candidates:
+                    cur.execute('INSERT INTO alt_momentum_v122.observations(observed_ms,symbol,signal_ms,entry_ms,entry_price,volume_ratio,btc_atr_pct) VALUES (%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(symbol,entry_ms) DO NOTHING RETURNING id',(now_ms,sym,signal_ms,entry_ms,entry,vr,atr_pct))
+                    if cur.fetchone():added+=1
+                cur.execute('SELECT o.id,o.symbol,o.entry_ms,o.entry_price FROM alt_momentum_v122.observations o LEFT JOIN alt_momentum_v122.outcomes r ON r.observation_id=o.id WHERE r.observation_id IS NULL')
+                for oid,sym,entry_ms,entry in cur.fetchall():
+                    exit_ms=entry_ms+120*60000
+                    if exit_ms>now_ms:continue
+                    exit_price=candle_lookup.get(sym,{}).get(exit_ms)
+                    if exit_price is None or entry<=0:continue
+                    gross=(exit_price/entry-1)*100
+                    cur.execute('INSERT INTO alt_momentum_v122.outcomes(observation_id,exit_ms,exit_price,gross_pct,settled_ms) VALUES (%s,%s,%s,%s,%s) ON CONFLICT(observation_id) DO NOTHING RETURNING observation_id',(oid,exit_ms,exit_price,gross,now_ms))
+                    if cur.fetchone():settled+=1
+                cur.execute('INSERT INTO alt_momentum_v122.polls(polled_ms,observed_added,settled_added,failure_count) VALUES (%s,%s,%s,%s) ON CONFLICT(polled_ms) DO NOTHING',(now_ms,added,settled,len(failures)))
+                con.commit()
+                cur.execute('SELECT s.symbol,s.entry_ms,s.observed_ms,r.gross_pct FROM alt_momentum_v122.observations s LEFT JOIN alt_momentum_v122.outcomes r ON r.observation_id=s.id ORDER BY s.entry_ms DESC')
+                rows=cur.fetchall()
+                settled_rows=[r for r in rows if r[3] is not None]
+                scenarios={}
+                for cost in (0.15,0.30):
+                    nets=[float(r[3])-cost for r in settled_rows]
+                    scenarios[str(cost)]={**_v103_stats(nets),'median_net_pct':round(median(nets),5) if nets else None}
+                by_day=defaultdict(list)
+                for sym,entry_ms,observed_ms,gross in settled_rows:
+                    day=datetime.fromtimestamp(entry_ms/1000,timezone.utc).strftime('%Y-%m-%d')
+                    by_day[day].append(float(gross)-0.30)
+                return {**MODE_INFO,'study':'V122_PROSPECTIVE_SQUEEZE','status':'PARTIAL' if failures else 'OK','signal':False,
+                        'generated_utc':utc_now(),'strategy_frozen':'V119 SQUEEZE_BREAKOUT / BTC ATR 0.25%-0.60% / 120m hold / 120m per-symbol cooldown',
+                        'observation_count':len(rows),'new_observations_this_call':added,'settled_count':len(settled_rows),'new_settlements_this_call':settled,
+                        'pending_count':len(rows)-len(settled_rows),'cost_scenarios':scenarios,
+                        'days_at_030':{day:{'n':len(v),'mean_net_pct':round(sum(v)/len(v),5)} for day,v in sorted(by_day.items())},
+                        'recent':[{'symbol':r[0],'entry_utc':datetime.fromtimestamp(r[1]/1000,timezone.utc).isoformat(),'gross_pct':round(float(r[3]),5) if r[3] is not None else None} for r in rows[:20]],
+                        'fetch_failures':failures,'storage':'POSTGRES_SCHEMA_alt_momentum_v122','writes_to_other_schemas':False,
+                        'limitations':['Requires an external scheduler to call every 5 minutes; deployment alone does not start polling.',
+                                       'No historical backfill; only near-real-time observed entries are recorded.',
+                                       'Next-bar open is a theoretical paper price, not a verified executable fill.',
+                                       '120-minute exit uses historical next-open after time elapses; gaps can delay settlement.',
+                                       'No orders, trading, V112 writes or existing strategy changes.']}
+    except Exception as exc:
+        return {**MODE_INFO,'study':'V122_PROSPECTIVE_SQUEEZE','status':'ERROR','signal':False,
+                'generated_utc':utc_now(),'error_type':type(exc).__name__,
+                'error':'V122 research poll failed; check Render logs (credentials omitted).'}
