@@ -21167,3 +21167,113 @@ async def btc_regime_robustness_v110(days: int = Query(default=90, ge=30, le=90)
         return {**MODE_INFO,'status':'ERROR','signal':False,
                 'study':'V110_BTC_DOWNTREND_LONG_HIGH_VOLUME_ROBUSTNESS',
                 'error':str(exc),'generated_utc':utc_now()}
+
+
+# V111: prospective observation audit, read-only, with local SQLite journal.
+# IMPORTANT: Render ephemeral filesystem is NOT durable across redeploys/restarts.
+# An external persistent database and an independent scheduler are required for
+# truly durable unattended prospective collection. No retrospective backfill.
+@app.get('/prospective-audit-v111')
+async def prospective_audit_v111():
+    import os, sqlite3
+    from bisect import bisect_right
+    now_ms=int(datetime.now(timezone.utc).timestamp()*1000)
+    path=os.getenv('V111_SQLITE_PATH','/tmp/alt_momentum_v111.sqlite3')
+    try:
+        con=sqlite3.connect(path,timeout=15)
+        con.execute('CREATE TABLE IF NOT EXISTS observations (id INTEGER PRIMARY KEY AUTOINCREMENT, observed_ms INTEGER NOT NULL, symbol TEXT NOT NULL, entry_ms INTEGER NOT NULL, direction TEXT NOT NULL, entry_price REAL NOT NULL, volume_ratio REAL NOT NULL, btc_regime TEXT NOT NULL, UNIQUE(symbol,entry_ms,direction))')
+        con.execute('CREATE TABLE IF NOT EXISTS outcomes (observation_id INTEGER PRIMARY KEY, exit_price REAL NOT NULL, net_pct REAL NOT NULL, settled_ms INTEGER NOT NULL)')
+        con.commit()
+        async with httpx.AsyncClient(timeout=httpx.Timeout(240.0)) as client:
+            sem=asyncio.Semaphore(2)
+            async def worker(sym):
+                async with sem:
+                    try:
+                        cs=await get_5m_candles_days(client,sym,3)
+                        cs=[c for c in cs if int(c['close_time'])<=now_ms]
+                        return sym,cs,None
+                    except Exception as e:return sym,[],str(e)
+            fetched=await asyncio.gather(*(worker(sym) for sym in _V106_SYMBOLS))
+        data={sym:cs for sym,cs,err in fetched if err is None}
+        failed=[{'symbol':sym,'error':err} for sym,cs,err in fetched if err]
+        btc=data.get('BTCUSDT',[])
+        btc_close=[float(c['close']) for c in btc]
+        btc_times=[int(c['close_time']) for c in btc]
+        fast=_v109_ema(btc_close,144);slow=_v109_ema(btc_close,576)
+        added=0;settled=0;skipped_stale=0
+        for sym,cs in data.items():
+            n=len(cs)
+            if n<580:continue
+            o=[float(c['open']) for c in cs];h=[float(c['high']) for c in cs]
+            l=[float(c['low']) for c in cs];cl=[float(c['close']) for c in cs]
+            v=[float(c['volume']) for c in cs]
+            widths=[None]*n
+            for j in range(11,n):
+                low=min(l[j-11:j+1]);widths[j]=(max(h[j-11:j+1])-low)/low*100 if low>0 else None
+            # Only recently completed entry candles (up to 15 minutes old) may be recorded.
+            # This prevents old historical signals from being called prospective.
+            for i in range(max(110,n-12),n-1):
+                base=[w for w in widths[i-73:i-1] if w is not None]
+                if len(base)!=72 or widths[i-1] is None:continue
+                bm=median(base)
+                if bm<=0 or widths[i-1]>.65*bm:continue
+                ceiling=max(h[i-24:i]);floor=min(l[i-24:i])
+                direction='SHORT' if cl[i]>ceiling else ('LONG' if cl[i]<floor else None)
+                if not direction:continue
+                avg=sum(v[i-20:i])/20
+                if avg<=0:continue
+                ratio=v[i]/avg
+                confirm=next((k for k in range(i+1,min(i+7,n)) if floor<=cl[k]<=ceiling),None)
+                if confirm is None:continue
+                entry_idx=confirm+1
+                if entry_idx>=n:continue
+                entry_ms=int(cs[entry_idx]['open_time'])
+                if entry_ms<_V106_START_MS:continue
+                if not (0<=now_ms-entry_ms<900000):
+                    skipped_stale+=1;continue
+                ix=bisect_right(btc_times,entry_ms-1)-1
+                if ix<0 or fast[ix] is None or slow[ix] is None:continue
+                regime='UPTREND' if btc_close[ix]>fast[ix]>slow[ix] else ('DOWNTREND' if btc_close[ix]<fast[ix]<slow[ix] else 'MIXED')
+                if regime!='DOWNTREND' or direction!='LONG' or ratio<1.5:continue
+                # Do not claim an entry at the historical open is executable;
+                # this is a delayed near-real-time paper observation only.
+                before=con.total_changes
+                con.execute('INSERT OR IGNORE INTO observations(observed_ms,symbol,entry_ms,direction,entry_price,volume_ratio,btc_regime) VALUES (?,?,?,?,?,?,?)',(now_ms,sym,entry_ms,direction,o[entry_idx],ratio,regime))
+                if con.total_changes>before:added+=1
+        con.commit()
+        rows=con.execute('SELECT id,symbol,entry_ms,direction,entry_price FROM observations WHERE id NOT IN (SELECT observation_id FROM outcomes)').fetchall()
+        for oid,sym,entry_ms,direction,price in rows:
+            cs=data.get(sym,[])
+            lookup={int(c['open_time']):float(c['open']) for c in cs}
+            exit_ms=entry_ms+120*60000
+            if exit_ms not in lookup:continue
+            exit_price=lookup[exit_ms]
+            gross=(exit_price/price-1)*100 if direction=='LONG' else (price-exit_price)/price*100
+            con.execute('INSERT OR IGNORE INTO outcomes VALUES (?,?,?,?)',(oid,exit_price,gross-ROUND_TRIP_COST_PCT,now_ms))
+            settled+=1
+        con.commit()
+        complete=con.execute('SELECT o.net_pct FROM outcomes o JOIN observations s ON s.id=o.observation_id ORDER BY s.entry_ms').fetchall()
+        count=con.execute('SELECT COUNT(*) FROM observations').fetchone()[0]
+        recent=con.execute('SELECT s.symbol,s.entry_ms,s.observed_ms,s.volume_ratio,s.btc_regime,o.net_pct FROM observations s LEFT JOIN outcomes o ON o.observation_id=s.id ORDER BY s.entry_ms DESC LIMIT 15').fetchall()
+        con.close()
+        return {**MODE_INFO,'status':'PARTIAL' if failed else 'OK','signal':False,
+                'study':'V111_LOCAL_PROSPECTIVE_OBSERVATION_AUDIT','generated_utc':utc_now(),
+                'observation_count':count,'new_observations_this_call':added,
+                'settled_count':len(complete),'new_settlements_this_call':settled,
+                'results_120m':_v103_stats([r[0] for r in complete]),
+                'recent':[{'symbol':r[0],'entry_ms':r[1],'observed_ms':r[2],
+                           'volume_ratio':round(r[3],4),'btc_regime':r[4],
+                           'net_pct':round(r[5],5) if r[5] is not None else None} for r in recent],
+                'failed':failed,'storage':'LOCAL_SQLITE_EPHEMERAL',
+                'limitations':['Not durable on Render free ephemeral filesystem: restart/redeploy can erase observations.',
+                               'Requires calls at least once per 5-minute candle; no scheduler is installed.',
+                               'No bulk backfill; a recently completed entry may be observed up to 15 minutes late.',
+                               'Entry price is observed candle open, not a verified executable fill.',
+                               'Candle close availability, API delays and polling gaps can miss observations.',
+                               '120m outcomes require a subsequent call while exit candle remains in fetched window.',
+                               'Historical selection bias persists; costs exclude spread/slippage/funding.',
+                               'Research only; no orders, trading or execution.']}
+    except Exception as exc:
+        return {**MODE_INFO,'status':'ERROR','signal':False,
+                'study':'V111_LOCAL_PROSPECTIVE_OBSERVATION_AUDIT',
+                'error':str(exc),'generated_utc':utc_now()}
