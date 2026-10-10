@@ -21784,3 +21784,61 @@ async def candidate_timing_v116(days: int = Query(default=90, ge=7, le=90)):
         return {**MODE_INFO,'status':'ERROR','signal':False,
                 'study':'V116_HISTORICAL_CANDIDATE_TIMING',
                 'generated_utc':utc_now(),'error_type':type(exc).__name__}
+
+
+# V117: read-only prospective polling coverage audit.
+# Does not retroactively label any historical candle as a prospective observation.
+@app.get('/poll-coverage-v117')
+async def poll_coverage_v117(hours: int = Query(default=24, ge=1, le=168)):
+    from statistics import median
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    url = os.getenv('DATABASE_URL', '').strip()
+    if not url:
+        return {**MODE_INFO, 'status':'ERROR', 'signal':False,
+                'study':'V117_POLL_COVERAGE', 'error':'DATABASE_URL missing'}
+    try:
+        with psycopg.connect(url, connect_timeout=15) as con:
+            with con.cursor() as cur:
+                cur.execute('SELECT polled_ms,observed_added,settled_added,failures FROM alt_momentum_v112.polls WHERE polled_ms >= %s ORDER BY polled_ms', (now_ms-hours*3600000,))
+                rows=cur.fetchall()
+                cur.execute('SELECT COUNT(*), MIN(polled_ms), MAX(polled_ms) FROM alt_momentum_v112.polls')
+                all_count,first_ms,last_ms=cur.fetchone()
+                cur.execute('SELECT COUNT(*), COUNT(*) FILTER (WHERE o.observation_id IS NOT NULL) FROM alt_momentum_v112.observations s LEFT JOIN alt_momentum_v112.outcomes o ON o.observation_id=s.id')
+                obs_count,settled_count=cur.fetchone()
+                cur.execute('SELECT s.symbol,s.entry_ms,s.observed_ms FROM alt_momentum_v112.observations s WHERE s.observed_ms >= %s ORDER BY s.observed_ms DESC LIMIT 100', (now_ms-hours*3600000,))
+                obs=cur.fetchall()
+        stamps=[int(r[0]) for r in rows]
+        intervals=[round((b-a)/1000,2) for a,b in zip(stamps,stamps[1:])]
+        # A scheduled 5-minute tick may start late. Only report gap estimates,
+        # not exact scheduler misses, because manual requests are mixed in.
+        gaps=[{'start_ms':a,'end_ms':b,'gap_minutes':round((b-a)/60000,2),
+               'minimum_possible_unobserved_5m_slots':max(0,int((b-a)//300000)-1)}
+              for a,b in zip(stamps,stamps[1:]) if b-a>450000]
+        return {**MODE_INFO,'status':'OK','signal':False,
+            'study':'V117_POLL_COVERAGE','generated_utc':utc_now(),
+            'storage':'POSTGRES_SCHEMA_alt_momentum_v112_READ_ONLY',
+            'window_hours':hours,'polls_in_window':len(rows),
+            'polls_total':all_count,'first_poll_ms':first_ms,'last_poll_ms':last_ms,
+            'age_last_poll_minutes':round((now_ms-last_ms)/60000,2) if last_ms else None,
+            'interval_median_seconds':round(median(intervals),2) if intervals else None,
+            'interval_max_seconds':max(intervals) if intervals else None,
+            'gaps_over_7_5m':gaps[-30:],
+            'polls_with_fetch_failures':sum(int(r[3])>0 for r in rows),
+            'sum_symbol_fetch_failures':sum(int(r[3]) for r in rows),
+            'observations_total':obs_count,'settled_total':settled_count,
+            'recent_observation_delays_seconds':[{'symbol':sym,'entry_ms':int(entry),
+                'observed_ms':int(observed),'delay_seconds':round((observed-entry)/1000,2)}
+                for sym,entry,observed in obs[:30]],
+            'writes_to_database':False,'prospective_observations_added':0,
+            'limitations':[
+                'Polls record completed API audit calls, including manual calls, not cron scheduling intentions.',
+                'Missing scheduled executions cannot be proven from the database; use cron-job.org history.',
+                'A poll without a candidate does not prove every candidate was evaluated or captured.',
+                'No historical candidate is reclassified as prospectively observed.',
+                'No trading, orders, signals, or modification of V112 collection.'
+            ]}
+    except Exception as exc:
+        return {**MODE_INFO,'status':'ERROR','signal':False,
+                'study':'V117_POLL_COVERAGE','generated_utc':utc_now(),
+                'error_type':type(exc).__name__,
+                'error':'Read-only PostgreSQL audit failed; check Render logs.'}
