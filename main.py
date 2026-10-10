@@ -20959,3 +20959,90 @@ async def forward_ledger_v108(days: int = Query(default=7, ge=2, le=30)):
         return {**MODE_INFO,'status':'ERROR','signal':False,
                 'study':'V108_ALL_VOLUME_FORWARD_VISIBILITY','error':str(exc),
                 'generated_utc':utc_now()}
+
+
+# V109: BTC regime attribution, research only. Existing routes untouched.
+# EMA(144) and EMA(576) on *completed* BTC 5m closes (~12h and 48h).
+def _v109_ema(values, period):
+    result=[None]*len(values)
+    if len(values)<period:return result
+    v=sum(values[:period])/period
+    result[period-1]=v
+    alpha=2/(period+1)
+    for i in range(period,len(values)):
+        v=alpha*values[i]+(1-alpha)*v
+        result[i]=v
+    return result
+
+@app.get('/btc-regime-v109')
+async def btc_regime_v109(days: int = Query(default=90,ge=30,le=90)):
+    try:
+        from bisect import bisect_right
+        async with httpx.AsyncClient(timeout=httpx.Timeout(240.0)) as client:
+            btc=await get_5m_candles_days(client,'BTCUSDT',days)
+            btc_close=[float(c['close']) for c in btc]
+            btc_times=[int(c['close_time']) for c in btc]
+            fast=_v109_ema(btc_close,144)
+            slow=_v109_ema(btc_close,576)
+            sem=asyncio.Semaphore(2)
+            async def worker(symbol):
+                async with sem:
+                    try:
+                        candles=btc if symbol=='BTCUSDT' else await get_5m_candles_days(client,symbol,days)
+                        return {'symbol':symbol,'rows':_v105_rows(candles,symbol),'error':None}
+                    except Exception as exc:
+                        return {'symbol':symbol,'rows':[],'error':str(exc)}
+            fetched=await asyncio.gather(*(worker(s) for s in _V106_SYMBOLS))
+        failures=[{'symbol':x['symbol'],'error':x['error']} for x in fetched if x['error']]
+        raw=sorted((r for x in fetched for r in x['rows']),key=lambda r:(r['symbol'],r['entry_open_time']))
+        cooled=[];last={}
+        for r in raw:
+            sym=r['symbol'];t=r['entry_open_time']
+            if sym in last and t-last[sym]<120*60000:continue
+            last[sym]=t
+            # Use last BTC candle fully closed strictly before the entry open.
+            idx=bisect_right(btc_times,t-1)-1
+            if idx<0 or fast[idx] is None or slow[idx] is None:continue
+            if btc_close[idx]>fast[idx]>slow[idx]:regime='UPTREND'
+            elif btc_close[idx]<fast[idx]<slow[idx]:regime='DOWNTREND'
+            else:regime='MIXED'
+            group='LT_1_0' if r['volume_ratio']<1 else ('GE_1_0_TO_1_5' if r['volume_ratio']<1.5 else 'GE_1_5')
+            cooled.append({**r,'btc_regime':regime,'volume_bucket':group})
+        timestamps=sorted(r['entry_open_time'] for r in cooled)
+        cutoff=timestamps[int(len(timestamps)*2/3)] if timestamps else None
+        def summarize(rows):
+            return {'baseline_120m':_v103_stats([r['baseline'] for r in rows]),
+                    'atr_strict':_v103_stats([r['strict'] for r in rows]),
+                    'tp1_hit_count':sum(bool(r['tp1_hit']) for r in rows),
+                    'tp2_hit_count':sum(bool(r['tp2_hit']) for r in rows)}
+        result={}
+        for regime in ('UPTREND','DOWNTREND','MIXED'):
+            result[regime]={}
+            for direction in ('LONG','SHORT'):
+                result[regime][direction]={}
+                for bucket in ('LT_1_0','GE_1_0_TO_1_5','GE_1_5'):
+                    subset=[r for r in cooled if r['btc_regime']==regime and r['direction']==direction and r['volume_bucket']==bucket]
+                    result[regime][direction][bucket]={
+                        'all':summarize(subset),
+                        'discovery_first_2_3':summarize([r for r in subset if cutoff is not None and r['entry_open_time']<cutoff]),
+                        'reference_last_1_3':summarize([r for r in subset if cutoff is not None and r['entry_open_time']>=cutoff])}
+        return {**MODE_INFO,'status':'PARTIAL' if failures else 'OK','signal':False,
+                'study':'V109_BTC_TREND_REGIME_RESEARCH','generated_utc':utc_now(),
+                'days':days,'symbols_fixed':list(_V106_SYMBOLS),'successful_coin_count':len(fetched)-len(failures),
+                'failed':failures,'raw_event_count':len(raw),'cooled_classified_count':len(cooled),
+                'calendar_split_utc_ms':cutoff,'btc_ema_fast_5m_bars':144,'btc_ema_slow_5m_bars':576,
+                'btc_regime_definition':{'UPTREND':'BTC close > EMA144 > EMA576',
+                                         'DOWNTREND':'BTC close < EMA144 < EMA576',
+                                         'MIXED':'All other conditions'},
+                'volume_buckets_exclusive':True,'round_trip_cost_pct':ROUND_TRIP_COST_PCT,
+                'results':result,
+                'limitations':['Retrospective reused 90-day sample, NOT independent validation.',
+                               'Fixed 10-symbol basket differs from dynamic V105 universe; results not paired.',
+                               'BTC regime uses the last fully closed BTC candle before entry; no future candle used.',
+                               'Regime is a descriptive segmentation, not a validated trading filter.',
+                               'Small subgroup counts are unstable; multiple comparisons can overfit.',
+                               'OHLC execution assumptions and fixed cost omit slippage, spreads and funding.',
+                               'All existing routes and paper-only execution settings unchanged.']}
+    except Exception as exc:
+        return {**MODE_INFO,'status':'ERROR','signal':False,
+                'study':'V109_BTC_TREND_REGIME_RESEARCH','error':str(exc),'generated_utc':utc_now()}
