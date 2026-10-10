@@ -19854,3 +19854,135 @@ async def trade_path90_v100(
         return {**MODE_INFO,'status':'ERROR','signal':False,
                 'study':'V100_TRADE_PATH_EXIT_DIAGNOSTIC',
                 'error':str(exc),'generated_utc':utc_now()}
+
+
+# ============================================================
+# V101 15-MIN EARLY EXIT — RESEARCH ONLY, NO ORDER PLACEMENT
+# V99 frozen entries, observe 15m (open idx+3), act at next
+# 5m candle open (idx+4). Positive holds until idx+24 open.
+# ============================================================
+def _v101_rows(candles, symbol):
+    events = _v99_events(candles, symbol)
+    indices = {int(c['open_time']): i for i,c in enumerate(candles)}
+    rows = []
+    for event in events:
+        idx = indices.get(event['entry_open_time'])
+        if idx is None or idx+24 >= len(candles):
+            continue
+        entry = float(candles[idx]['open'])
+        if entry <= 0:
+            continue
+        direction = 1 if event['reversal_direction'] == 'LONG' else -1
+        def gross(j):
+            return direction * (float(candles[j]['open']) / entry - 1) * 100
+        decision_15m = gross(idx+3)
+        early_exit = decision_15m <= 0
+        # Deliberate one-bar execution delay, not exit at observed decision price.
+        executed_exit_idx = idx+4 if early_exit else idx+24
+        rows.append({
+            'symbol': symbol,
+            'entry_open_time': event['entry_open_time'],
+            'direction': event['reversal_direction'],
+            'volume_ratio': event['volume_ratio'],
+            'first_15m_gross_pct': decision_15m,
+            'early_exit': early_exit,
+            'baseline_net_pct': gross(idx+24)-ROUND_TRIP_COST_PCT,
+            'policy_net_pct': gross(executed_exit_idx)-ROUND_TRIP_COST_PCT,
+            'exit_delay_minutes': 20 if early_exit else 120,
+        })
+    return rows
+
+
+def _v101_summary(rows):
+    if not rows:
+        return {'n':0, 'early_exit_count':0, 'early_exit_rate_pct':None,
+                'baseline_mean_net_pct':None, 'policy_mean_net_pct':None,
+                'improvement_pp':None, 'baseline_profit_factor':None,
+                'policy_profit_factor':None, 'baseline_win_rate_pct':None,
+                'policy_win_rate_pct':None, 'early_exit_mean_net_pct':None,
+                'held_mean_net_pct':None}
+    base=[r['baseline_net_pct'] for r in rows]
+    policy=[r['policy_net_pct'] for r in rows]
+    early=[r['policy_net_pct'] for r in rows if r['early_exit']]
+    held=[r['policy_net_pct'] for r in rows if not r['early_exit']]
+    def pf(vals):
+        loss=-sum(v for v in vals if v<0)
+        return round(sum(v for v in vals if v>0)/loss,4) if loss else None
+    return {
+        'n':len(rows), 'early_exit_count':len(early),
+        'early_exit_rate_pct':round(100*len(early)/len(rows),2),
+        'baseline_mean_net_pct':round(mean(base),4),
+        'policy_mean_net_pct':round(mean(policy),4),
+        'improvement_pp':round(mean(policy)-mean(base),4),
+        'baseline_profit_factor':pf(base), 'policy_profit_factor':pf(policy),
+        'baseline_win_rate_pct':round(100*sum(v>0 for v in base)/len(base),2),
+        'policy_win_rate_pct':round(100*sum(v>0 for v in policy)/len(policy),2),
+        'early_exit_mean_net_pct':round(mean(early),4) if early else None,
+        'held_mean_net_pct':round(mean(held),4) if held else None,
+    }
+
+
+@app.get('/early-exit90')
+async def early_exit90_v101(
+    count: int = Query(default=10, ge=5, le=20),
+    days: int = Query(default=90, ge=30, le=90),
+):
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(240.0)) as client:
+            universe=await build_universe(client)
+            selected=universe[:count]
+            sem=asyncio.Semaphore(2)
+            async def worker(item):
+                async with sem:
+                    try:
+                        candles=await get_5m_candles_days(client,item['symbol'],days)
+                        return {'ok':True,'symbol':item['symbol'],
+                                'rows':_v101_rows(candles,item['symbol'])}
+                    except Exception as exc:
+                        return {'ok':False,'symbol':item['symbol'],'error':str(exc)}
+            fetched=await asyncio.gather(*(worker(item) for item in selected))
+        good=[x for x in fetched if x['ok']]
+        failed=[{'symbol':x['symbol'],'error':x['error']} for x in fetched if not x['ok']]
+        all_rows=sorted((r for x in good for r in x['rows']),
+                        key=lambda r:(r['symbol'],r['entry_open_time']))
+        cooled=[]; last={}
+        for r in all_rows:
+            sym=r['symbol']; t=r['entry_open_time']
+            if sym in last and t-last[sym]<120*60*1000:
+                continue
+            cooled.append(r); last[sym]=t
+        times=sorted(r['entry_open_time'] for r in cooled)
+        cutoff=times[int(len(times)*2/3)] if times else None
+        results={}
+        for name,threshold in [('VOLUME_GE_1_0',1.),('VOLUME_GE_1_5',1.5)]:
+            results[name]={}
+            for direction in ('LONG','SHORT'):
+                group=[r for r in cooled if r['volume_ratio']>=threshold and r['direction']==direction]
+                results[name][direction]={
+                    'all':_v101_summary(group),
+                    'discovery_first_2_3':_v101_summary([r for r in group if cutoff is not None and r['entry_open_time']<cutoff]),
+                    'reference_last_1_3':_v101_summary([r for r in group if cutoff is not None and r['entry_open_time']>=cutoff]),
+                }
+        return {**MODE_INFO,'status':'OK','signal':False,
+                'study':'V101_15M_EARLY_EXIT_DIAGNOSTIC',
+                'base_events':'V99_CONFIRMED_FALSE_BREAKOUT',
+                'days':days,'selected_coin_count':len(selected),
+                'successful_coin_count':len(good),'failed_coin_count':len(failed),
+                'raw_event_count':len(all_rows),'cooled_event_count':len(cooled),
+                'round_trip_cost_pct':ROUND_TRIP_COST_PCT,
+                'decision':'15m directional return at entry+3 open; <=0 means exit',
+                'execution':'early exit at entry+4 open (20m); otherwise entry+24 open (120m)',
+                'calendar_split_utc_ms':cutoff,'results':results,'failed':failed,
+                'generated_utc':utc_now(),
+                'limitations':[
+                    'Exploratory in-sample policy motivated by V100, not independent validation.',
+                    'First 15m is observed before decision; execution deliberately delayed one 5m candle.',
+                    'Fixed 0.15% cost; real spread/slippage and short borrow costs omitted.',
+                    'Current-universe survivorship bias and overlapping signals remain.',
+                    'No executable portfolio simulation, orders, or paper positions.',
+                    'All V96-V100 existing code remains unchanged.',
+                ]}
+    except Exception as exc:
+        return {**MODE_INFO,'status':'ERROR','signal':False,
+                'study':'V101_15M_EARLY_EXIT_DIAGNOSTIC',
+                'error':str(exc),'generated_utc':utc_now()}
