@@ -20831,3 +20831,131 @@ async def forward_signal_v107(days: int = Query(default=7, ge=2, le=30)):
     except Exception as exc:
         return {**MODE_INFO,'status':'ERROR','signal':False,'study':'V107_FORWARD_SIGNAL_VISIBILITY',
                 'error':str(exc),'generated_utc':utc_now()}
+
+
+# V108: all-volume forward paper event visibility; read-only, stateless.
+# Frozen V106 benchmark is not modified. Historical reconstruction is NOT live execution.
+@app.get('/forward-ledger-v108')
+async def forward_ledger_v108(days: int = Query(default=7, ge=2, le=30)):
+    try:
+        now_ms=int(datetime.now(timezone.utc).timestamp()*1000)
+        async with httpx.AsyncClient(timeout=httpx.Timeout(240.0)) as client:
+            sem=asyncio.Semaphore(2)
+            async def worker(symbol):
+                async with sem:
+                    try:
+                        cs=await get_5m_candles_days(client,symbol,days)
+                        cs=[c for c in cs if int(c['close_time'])<=now_ms]
+                        n=len(cs)
+                        op=[float(c['open']) for c in cs]
+                        hi=[float(c['high']) for c in cs]
+                        lo=[float(c['low']) for c in cs]
+                        cl=[float(c['close']) for c in cs]
+                        vol=[float(c['volume']) for c in cs]
+                        widths=[None]*n
+                        for j in range(11,n):
+                            low12=min(lo[j-11:j+1])
+                            widths[j]=(max(hi[j-11:j+1])-low12)/low12*100 if low12>0 else None
+                        atrs=_v104_atr14(cs)
+                        records=[]
+                        for i in range(110,n):
+                            baseline=[w for w in widths[i-73:i-1] if w is not None]
+                            if len(baseline)!=72 or widths[i-1] is None:continue
+                            base_med=median(baseline)
+                            if base_med<=0 or widths[i-1]>.65*base_med:continue
+                            ceiling=max(hi[i-24:i]);floor=min(lo[i-24:i])
+                            direction='SHORT' if cl[i]>ceiling else ('LONG' if cl[i]<floor else None)
+                            if direction is None:continue
+                            avg=sum(vol[i-20:i])/20
+                            if avg<=0:continue
+                            ratio=vol[i]/avg
+                            k_confirm=next((k for k in range(i+1,min(i+7,n))
+                                            if floor<=cl[k]<=ceiling),None)
+                            if k_confirm is None:continue
+                            idx=k_confirm+1
+                            if idx>=n or idx<15:continue
+                            entry_ms=int(cs[idx]['open_time'])
+                            if entry_ms<_V106_START_MS:continue
+                            entry=op[idx]
+                            if entry<=0:continue
+                            matured=(idx+24<n and entry_ms+120*60000<=now_ms)
+                            row={'symbol':symbol,'direction':direction,
+                                 'entry_time_ms':entry_ms,'entry_price':round(entry,9),
+                                 'volume_ratio':round(ratio,4),
+                                 'volume_group':'GE_1_5' if ratio>=1.5 else ('GE_1_0' if ratio>=1 else 'LT_1_0'),
+                                 'eligible_v106_ge_1_0':ratio>=1,
+                                 'eligible_v106_ge_1_5':ratio>=1.5,
+                                 'elapsed_minutes':round((now_ms-entry_ms)/60000,1),
+                                 'stage':'CLOSED_120M' if matured else 'OPEN_PAPER_CANDIDATE',
+                                 'paper_only':True}
+                            if matured:
+                                exit_price=op[idx+24]
+                                gross=((exit_price/entry-1)*100 if direction=='LONG'
+                                       else (entry-exit_price)/entry*100)
+                                row['baseline_120m_net_pct']=round(gross-ROUND_TRIP_COST_PCT,5)
+                                sim=_v105_strict(cs,idx,direction,atrs[idx-1],ROUND_TRIP_COST_PCT)
+                                if sim is not None:
+                                    row['atr_partial_net_pct']=round(sim['net_pct'],5)
+                                    row['tp1_hit']=sim['tp1_hit']
+                                    row['tp2_hit']=sim['tp2_hit']
+                                    row['fills']=sim['fills']
+                                    row['ambiguous_bar_count']=sim['ambiguous_bar_count']
+                                else:
+                                    row['atr_partial_net_pct']=None
+                                    row['calculation_note']='ATR unavailable'
+                            else:
+                                row['last_completed_close']=round(cl[-1],9)
+                                row['unrealized_gross_pct']=round(((cl[-1]/entry-1)*100 if direction=='LONG'
+                                             else (entry-cl[-1])/entry*100),5)
+                                atr=atrs[idx-1]
+                                if atr is not None and atr>0:
+                                    sign=1 if direction=='LONG' else -1
+                                    row['initial_stop']=round(entry-sign*2*atr,9)
+                                    row['tp1_price']=round(entry+sign*1.5*atr,9)
+                                    row['tp2_price']=round(entry+sign*3*atr,9)
+                                row['status_note']='Inferred from completed candles; not a stored live position. Exit path pending.'
+                            records.append(row)
+                        records.sort(key=lambda r:r['entry_time_ms'])
+                        cooled=[];last=None
+                        for r in records:
+                            if last is not None and r['entry_time_ms']-last<120*60000:continue
+                            cooled.append(r);last=r['entry_time_ms']
+                        return {'symbol':symbol,'rows':cooled,'raw_count':len(records),'error':None}
+                    except Exception as exc:
+                        return {'symbol':symbol,'rows':[],'raw_count':0,'error':str(exc)}
+            fetched=await asyncio.gather(*(worker(s) for s in _V106_SYMBOLS))
+        failed=[{'symbol':x['symbol'],'error':x['error']} for x in fetched if x['error']]
+        rows=sorted((r for x in fetched for r in x['rows']),key=lambda r:r['entry_time_ms'],reverse=True)
+        closed=[r for r in rows if r['stage']=='CLOSED_120M']
+        open_rows=[r for r in rows if r['stage']=='OPEN_PAPER_CANDIDATE']
+        def summary(group):
+            done=[r for r in group if r['stage']=='CLOSED_120M']
+            base=[r['baseline_120m_net_pct'] for r in done]
+            atr=[r['atr_partial_net_pct'] for r in done if r.get('atr_partial_net_pct') is not None]
+            return {'all_entries':len(group),'closed_120m':len(done),
+                    'open_candidates':len(group)-len(done),
+                    'baseline':_v103_stats(base),'atr_partial':_v103_stats(atr)}
+        groups={key:summary([r for r in rows if r['volume_group']==key])
+                for key in ('LT_1_0','GE_1_0','GE_1_5')}
+        return {**MODE_INFO,'status':'PARTIAL' if failed else 'OK','signal':False,
+                'study':'V108_ALL_VOLUME_FORWARD_VISIBILITY',
+                'generated_utc':utc_now(),'forward_start_ms':_V106_START_MS,
+                'days_rolling_lookback':days,'symbols_fixed':list(_V106_SYMBOLS),
+                'successful_coin_count':len(fetched)-len(failed),'failed':failed,
+                'raw_entry_count':sum(x['raw_count'] for x in fetched),
+                'cooled_entry_count':len(rows),'open_candidate_count':len(open_rows),
+                'closed_120m_count':len(closed),
+                'groups_exclusive':groups,
+                'recent_open_candidates':open_rows[:20],
+                'recent_closed_trades':closed[:30],
+                'notes':['Read-only historical reconstruction, not live orders or durable positions.',
+                         'Groups LT_1_0, GE_1_0 and GE_1_5 are mutually exclusive.',
+                         'V106 volume thresholds and all original endpoints remain unchanged.',
+                         'Only completed 5-minute bars are used; an open candidate may not be executable.',
+                         'Trailing, stop and targets are simulated only for matured 120-minute trades.',
+                         'Results are rolling and can change as new candles arrive; export snapshots.',
+                         'Past-sample signals are not independently forward-logged.']}
+    except Exception as exc:
+        return {**MODE_INFO,'status':'ERROR','signal':False,
+                'study':'V108_ALL_VOLUME_FORWARD_VISIBILITY','error':str(exc),
+                'generated_utc':utc_now()}
