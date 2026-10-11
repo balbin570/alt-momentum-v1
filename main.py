@@ -8730,7 +8730,14 @@ async def v32_scan_once():
         try:
             await v321_independent_entries(client, top1_rows, good)
         except Exception as exc:
+            import traceback as _v321_traceback
             V321_SHADOW["last_error"] = "entry: " + str(exc)
+            V321_SHADOW["last_error_utc"] = utc_now()
+            V321_SHADOW["last_error_traceback"] = _v321_traceback.format_exc()[-5000:]
+            try:
+                v321_shadow_save()
+            except Exception:
+                pass  # Do not interrupt the original V32 scan.
 
         new_entries = []
         for e in top1_rows:
@@ -22909,6 +22916,7 @@ async def v321_independent_entries(client, top1_rows, good):
     old_error = V321_SHADOW.get("last_error")
     if isinstance(old_error, str) and old_error.startswith("entry:"):
         V321_SHADOW["last_error"] = None
+        V321_SHADOW["last_error_traceback"] = None
         changed = True
     if changed:
         v321_shadow_save()
@@ -23013,6 +23021,8 @@ async def v321_independent_status():
         "last_scan_utc":V321_SHADOW["last_scan_utc"],
         "last_exit_utc":V321_SHADOW["last_exit_utc"],
         "last_error":V321_SHADOW["last_error"],
+        "last_error_utc":V321_SHADOW.get("last_error_utc"),
+        "last_error_traceback":V321_SHADOW.get("last_error_traceback"),
         "limitations":["Uses V32 TOP1 candidate generation; independent capacity/cooldown and fills.",
                        "Requires live quote and <60s checkpoint latency; no synthetic fills.",
                        "Prospective paper only; filters selected on historical data."]}
