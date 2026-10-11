@@ -8770,6 +8770,8 @@ async def v32_scan_once():
             pos.update(v94_candidate_tag(good.get(e["symbol"]), int(e["entry_open_time"]), pos.get("spread_pct"), pos.get("entry_live_ms")))
             # V95: observational momentum/volume filter; never blocks the paper entry.
             pos.update(v95_momentum_volume_tag(pos))
+            # V32.1: prospective matched-cohort research tag (no change to V32 entries).
+            pos.update(v321_candidate_tag(pos))
             # V87: informational V86 score only; never blocks the paper entry.
             pos.update(v87_quality_at_entry(good, e))
             pos["risk_engine"] = {
@@ -22683,3 +22685,87 @@ async def v89_all_closed(x_api_key: str = Header(default="")):
         "v89_1_trades": v891,
         "generated_utc": utc_now(),
     }
+
+
+# ============================================================
+# V32.1 PROSPECTIVE FILTERED MATCHED COHORT - PAPER RESEARCH
+# Original V32 entries and exits remain unchanged. This is NOT
+# an independent shadow execution / separate position book.
+# ============================================================
+V321_VERSION = "V32_1_PROSPECTIVE_MATCHED_FILTER"
+V321_THRESHOLDS = {
+    "ret60_min_inclusive_pct": 3.9,
+    "volume_min_inclusive": 0.9,
+    "volume_max_exclusive": 3.0,
+    "relative_momentum_z_max_exclusive": 2.0,
+    "entry_delay_max_exclusive_seconds": 60.0,
+}
+
+def v321_candidate_tag(pos):
+    result = {"v321_version": V321_VERSION, "v321_pass": False,
+              "v321_reason": "MISSING_ENTRY_FEATURE", "v321_research_only": True}
+    fields = ("ctx_ret_60m_pct", "ctx_vol_ratio_15m_vs_4h",
+              "relative_momentum_z", "entry_delay_seconds")
+    try:
+        if any(pos.get(k) is None for k in fields):
+            return result
+        ret60, volume, z, delay = (float(pos[k]) for k in fields)
+        if not all(math.isfinite(v) for v in (ret60, volume, z, delay)):
+            result["v321_reason"] = "INVALID_ENTRY_FEATURE"
+            return result
+        failures = []
+        if ret60 < 3.9: failures.append("RET60_LT_3_9")
+        if not (0.9 <= volume < 3.0): failures.append("VOLUME_OUTSIDE_0_9_TO_3")
+        if z >= 2.0: failures.append("Z_GTE_2")
+        if delay < 0 or delay >= 60: failures.append("DELAY_OUTSIDE_0_TO_60")
+        result["v321_pass"] = not failures
+        result["v321_reason"] = "PASS" if not failures else "|".join(failures)
+        return result
+    except (TypeError, ValueError, OverflowError):
+        result["v321_reason"] = "INVALID_ENTRY_FEATURE"
+        return result
+
+def v321_summary(rows):
+    values = [float(t["net_pct"]) for t in rows if t.get("net_pct") is not None]
+    if not values:
+        return {"n": 0, "mean_net_pct": None, "win_rate_pct": None,
+                "profit_factor": None, "big_winners_over_5pct": 0}
+    wins = [x for x in values if x > 0]
+    losses = [x for x in values if x < 0]
+    pf = sum(wins)/abs(sum(losses)) if losses else None
+    return {"n": len(values), "mean_net_pct": round(sum(values)/len(values), 4),
+            "win_rate_pct": round(100*len(wins)/len(values), 2),
+            "profit_factor": round(pf, 4) if pf is not None else None,
+            "big_winners_over_5pct": sum(x > 5 for x in values)}
+
+@app.get("/v321-status")
+async def v321_status():
+    opened = [p for p in V32_STATE.get("open", {}).values()
+              if p.get("v321_version") == V321_VERSION]
+    closed = [p for p in V32_STATE.get("closed", [])
+              if p.get("v321_version") == V321_VERSION]
+    passed = [p for p in closed if p.get("v321_pass") is True]
+    rejected = [p for p in closed if p.get("v321_pass") is not True]
+    reasons = {}
+    for p in opened + closed:
+        for reason in p.get("v321_reason", "UNKNOWN").split("|"):
+            reasons[reason] = reasons.get(reason, 0) + 1
+    return {**MODE_INFO, "status": "OK", "version": V321_VERSION,
+            "mode": "PAPER_ONLY_MATCHED_OBSERVATION", "real_orders": False,
+            "v32_unchanged": True, "entry_gate": False,
+            "independent_shadow_execution": False, "new_entries_only": True,
+            "thresholds": V321_THRESHOLDS,
+            "tagged_open": len(opened), "tagged_closed": len(closed),
+            "passed_open": sum(p.get("v321_pass") is True for p in opened),
+            "baseline": v321_summary(closed),
+            "filtered": v321_summary(passed),
+            "excluded": v321_summary(rejected),
+            "reason_counts": reasons,
+            "recent_closed": [{"symbol": p.get("symbol"),
+                               "net_pct": p.get("net_pct"),
+                               "pass": p.get("v321_pass"),
+                               "reason": p.get("v321_reason")}
+                              for p in closed[-20:]],
+            "limitations": ["Matched V32 fills only, not independent V32.1 entries.",
+                            "Baseline V32 cooldown/capacity may hide rejected-candidate alternatives.",
+                            "Thresholds chosen on past data; forward validation required."]}
