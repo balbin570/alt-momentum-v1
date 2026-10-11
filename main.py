@@ -18393,6 +18393,11 @@ V89_THRESH={"alt30":0.412776,"btc30":0.234763,"disp30":0.574416,"breakout_change
 V89_SCAN_SECONDS=60
 V89_STOP_PCT=3.0
 V89_NEW_VERSION="V89_1_V66_CONFIRM10_STOP3_TIME120"
+V892_VERSION="V89_2_FILTERED_CONFIRM10_STOP3_TIME120"
+V892_VOLUME_MAX=3.0
+V892_BREAKOUT_MAX=2.0
+V892_DISP_LOW=1.5
+V892_DISP_HIGH=3.0
 V89_STATE={"open":[],"closed":[],"seen":[],"last_scan":None,"errors":[],"started_utc":None}
 V89_TASK=None
 
@@ -18479,6 +18484,30 @@ async def v89_scan_once():
         for p,reason in exit_messages:
           await alt_safe_send(f"ALT V89 SHADOW CIKIS\nCoin: {p['symbol']}\nKalite: {p['v88_score']}/4 - {p['v88_label']}\nNet: {p['net_pct']}%\nCikis: {reason}\nPAPER/GOZLEMSEL - GERCEK EMIR YOK","V89_EXIT",p["symbol"])
 
+        # V89.2: independent filtered paper exits; original V89.1 remains unchanged.
+        v892_still=[]
+        for p2 in V89_STATE.get("v892_open",[]):
+          due2=now>=int(p2["exit_due_ms"])
+          q2=await live_quote(client,p2["symbol"])
+          xp2=float(q2["bid"]) if q2 and q2.get("bid") is not None else None
+          if xp2 is None:
+            if not due2:
+              v892_still.append(p2);continue
+            cc2=data.get(p2["symbol"],[])
+            xp2=float(cc2[-1]["close"]) if cc2 else float(p2["entry_price"])
+          gross2=v74_pct(float(p2["entry_price"]),xp2)
+          stopped2=gross2<=-V89_STOP_PCT
+          if not stopped2 and not due2:
+            v892_still.append(p2);continue
+          reason2="STOP3" if stopped2 else "TIME120"
+          p2.update(exit_price=xp2,exit_utc=utc_now(),exit_reason=reason2,
+                    gross_pct=round(gross2,4),cost_pct=0.15,
+                    net_pct=round(gross2-0.15,4),status="CLOSED_SHADOW")
+          V89_STATE.setdefault("v892_closed",[]).append(p2)
+          v89_save()
+          await alt_safe_send(f"ALT V89.2 FILTRELI SHADOW CIKIS\nCoin: {p2['symbol']}\nNet: {p2['net_pct']}%\nCikis: {reason2}\nPAPER - GERCEK EMIR YOK","V892_EXIT",p2["symbol"])
+        V89_STATE["v892_open"]=v892_still
+        V89_STATE["v892_closed"]=V89_STATE.get("v892_closed",[])[-1000:]
         # Causal market context: all candles here are completed before live entry.
         b30=v74_pct(btc[-7]["close"],btc[-1]["close"])
         a30=[v74_pct(c[-7]["close"],c[-1]["close"]) for c in data.values() if len(c)>=7]
@@ -18507,6 +18536,38 @@ async def v89_scan_once():
               v89_save()
               await alt_safe_send(f"ALT V89 SHADOW GIRIS\nCoin: {e['symbol']}\nV88 Kalite: {score}/4 - {label} (gozlemsel)\nBreakout: {e['breakout_change_pct']:.3f}% | Vol: {e['volume_ratio']:.2f}x\nALT30: {alt30:.3f}% | BTC30: {b30:.3f}% | Disp30: {disp30:.3f}\nGiris ask: {ep}\nSTOP -3% / TIME120 | PAPER - GERCEK EMIR YOK","V89_ENTRY",e["symbol"])
             seen.add(key);V89_STATE["seen"]=list(seen)[-2000:]
+        # V89.2 observes the SAME Top1 signal as V89.1, with three gates.
+        # Do not promote a lower-ranked coin when Top1 fails a filter.
+        v892_accepted=None
+        if candidates:
+          e2=candidates[0]
+          key2=f'{e2["symbol"]}:{e2["breakout_time"]}'
+          seen2=set(V89_STATE.get("v892_seen",[]))
+          if key2 not in seen2:
+            seen2.add(key2)
+            V89_STATE["v892_seen"]=list(seen2)[-2000:]
+            passes2=(float(e2["volume_ratio"])<V892_VOLUME_MAX
+              and float(e2["breakout_change_pct"])<V892_BREAKOUT_MAX
+              and not (V892_DISP_LOW<=disp30<=V892_DISP_HIGH))
+            already2=any(p2["symbol"]==e2["symbol"] for p2 in V89_STATE.get("v892_open",[]))
+            if passes2 and not already2:
+              q2=await live_quote(client,e2["symbol"])
+              if q2 and q2["spread_pct"]<=SPREAD_MAX_PCT:
+                ep2=float(q2["ask"]);ms2=alt_now_ms()
+                p2={**e2,"entry_price":ep2,"entry_utc":utc_now(),"entry_ms":ms2,
+                  "exit_due_ms":ms2+120*60*1000,"status":"OPEN_SHADOW",
+                  "execution_version":V892_VERSION,"stop_loss_pct":V89_STOP_PCT,
+                  "stop_price":round(ep2*(1-V89_STOP_PCT/100),12),
+                  "spread_pct":round(float(q2["spread_pct"]),4),
+                  "alt30_pct":round(alt30,6),"btc30_pct":round(b30,6),
+                  "disp30_pct":round(disp30,6),"entry_gate":True,
+                  "v892_filters":{"volume_lt":V892_VOLUME_MAX,
+                    "breakout_lt_pct":V892_BREAKOUT_MAX,
+                    "disp30_excluded_pct":[V892_DISP_LOW,V892_DISP_HIGH]}}
+                V89_STATE.setdefault("v892_open",[]).append(p2)
+                v892_accepted=p2
+                v89_save()
+                await alt_safe_send(f"ALT V89.2 FILTRELI SHADOW GIRIS\nCoin: {e2['symbol']}\nBreakout: {e2['breakout_change_pct']:.3f}% | Vol: {e2['volume_ratio']:.2f}x\nDisp30: {disp30:.3f}\nSTOP -3% / TIME120 | PAPER - GERCEK EMIR YOK","V892_ENTRY",e2["symbol"])
         V89_STATE["last_scan"]={"utc":scan_utc,"symbols":len(data),"errors":len(errs),"confirm10_candidates":len(candidates),"accepted":accepted["symbol"] if accepted else None,"alt30_pct":round(alt30,4),"btc30_pct":round(b30,4),"disp30_pct":round(disp30,4)}
         V89_STATE["errors"]=errs[-20:];v89_save();return V89_STATE["last_scan"]
     except Exception as e:
@@ -18536,6 +18597,24 @@ async def v89_scan_now():return {"status":"OK","paper_only":True,"scan":await v8
 async def v89_status():
     cl=V89_STATE.get("closed",[]);low=[x for x in cl if int(x.get("v88_score",-1))<=2];high=[x for x in cl if int(x.get("v88_score",-1))>=3]
     return {**MODE_INFO,"status":"OK","panel":"V89_FORWARD_V66_CAUSAL_QUALITY_SHADOW","trading":False,"orders":False,"entry_gate":False,"active_strategy_changed":False,"v32_unchanged":True,"v61_unchanged":True,"v74_unchanged":True,"frozen_entry":"V66_CONFIRM_10M_TOP1","frozen_exit":"LEGACY_TIME120_NEW_STOP3_OR_TIME120","current_version":V89_NEW_VERSION,"stop_loss_pct":V89_STOP_PCT,"stop_check":"LIVE_BID_EACH_SCAN","legacy_positions_keep_time120":True,"quality_thresholds":V89_THRESH,"quality_use":"OBSERVATIONAL_ONLY_NOT_ENTRY_GATE","last_scan":V89_STATE.get("last_scan"),"open_count":len(V89_STATE.get("open",[])),"closed_count":len(cl),"performance":{"all":v89_perf(cl),"score_0_2":v89_perf(low),"score_3_4":v89_perf(high)},"performance_by_version":{"legacy":v89_perf([x for x in cl if x.get("execution_version")!=V89_NEW_VERSION]),"v89_1":v89_perf([x for x in cl if x.get("execution_version")==V89_NEW_VERSION])},"open":V89_STATE.get("open",[])[-20:],"recent_closed":cl[-30:],"errors":V89_STATE.get("errors",[])[-10:],"started_utc":V89_STATE.get("started_utc"),"generated_utc":utc_now()}
+
+@app.get("/v892-status")
+async def v892_status():
+    cl=V89_STATE.get("closed",[])
+    base=[p for p in cl if p.get("execution_version")==V89_NEW_VERSION]
+    filtered=V89_STATE.get("v892_closed",[])
+    return {**MODE_INFO,"status":"OK","mode":"PAPER_ONLY_PARALLEL",
+      "version":V892_VERSION,"original_v891_unchanged":True,
+      "comparison_note":"Separate forward paper entries; past V89.1 trades are not retroactively relabeled",
+      "filters":{"volume_ratio_lt":V892_VOLUME_MAX,
+        "breakout_change_pct_lt":V892_BREAKOUT_MAX,
+        "disp30_exclude_inclusive":[V892_DISP_LOW,V892_DISP_HIGH]},
+      "exit":"STOP3_OR_TIME120","v891_closed":len(base),
+      "v891_performance":v89_perf(base),
+      "v892_open_count":len(V89_STATE.get("v892_open",[])),
+      "v892_closed_count":len(filtered),"v892_performance":v89_perf(filtered),
+      "v892_open":V89_STATE.get("v892_open",[])[-10:],
+      "v892_recent_closed":filtered[-30:],"generated_utc":utc_now()}
 
 # V90 - READ-ONLY COUNTERFACTUAL EXIT RESEARCH FOR V89 CLOSED SHADOWS
 # Does not mutate V89 state or any paper strategy.
