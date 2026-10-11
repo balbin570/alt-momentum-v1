@@ -8726,6 +8726,12 @@ async def v32_scan_once():
                     row["spread_pct"] = pos.get("spread_pct")
                 entry_funnel["rejection_samples"].append(row)
 
+        # Independent V32.1 shadow book. Failures never block V32.
+        try:
+            await v321_independent_entries(client, top1_rows, good)
+        except Exception as exc:
+            V321_SHADOW["last_error"] = "entry: " + str(exc)
+
         new_entries = []
         for e in top1_rows:
             if now_ms_for_freshness - e["entry_open_time"] > freshness_ms:
@@ -22769,3 +22775,238 @@ async def v321_status():
             "limitations": ["Matched V32 fills only, not independent V32.1 entries.",
                             "Baseline V32 cooldown/capacity may hide rejected-candidate alternatives.",
                             "Thresholds chosen on past data; forward validation required."]}
+
+
+# ============================================================
+# V32.1 INDEPENDENT PAPER BOOK -- V32 and V89.x untouched
+# Entries use the SAME frozen TOP1 candidate stream, but a separate
+# cooldown/seen/open/closed book. All four filters checked before fill.
+# ============================================================
+V321_SHADOW_VERSION = "V32_1_INDEPENDENT_PAPER_V1"
+V321_SHADOW = {"open": {}, "closed": [], "seen": set(),
+               "started_utc": utc_now(), "last_error": None,
+               "last_scan_utc": None, "last_exit_utc": None,
+               "rejected": {}, "recent_rejections": []}
+V321_SHADOW_TASK = None
+
+def v321_shadow_db_init():
+    if not V21_DB_URL:
+        return
+    with v21_db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""CREATE TABLE IF NOT EXISTS alt_v321_independent_paper_state
+                        (id INTEGER PRIMARY KEY, payload JSONB NOT NULL,
+                         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())""")
+        conn.commit()
+
+def v321_shadow_save():
+    if not V21_DB_URL:
+        return
+    payload = json.dumps({**V321_SHADOW, "seen": sorted(V321_SHADOW["seen"])})
+    with v21_db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""INSERT INTO alt_v321_independent_paper_state (id,payload,updated_at)
+                VALUES (1,%s::jsonb,NOW()) ON CONFLICT (id) DO UPDATE
+                SET payload=EXCLUDED.payload,updated_at=NOW()""", (payload,))
+        conn.commit()
+
+def v321_shadow_load():
+    if not V21_DB_URL:
+        return
+    with v21_db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT payload FROM alt_v321_independent_paper_state WHERE id=1")
+            row = cur.fetchone()
+    if row:
+        d = row[0] if isinstance(row[0],dict) else json.loads(row[0])
+        V321_SHADOW.update(d)
+        V321_SHADOW["seen"] = set(d.get("seen", []))
+
+def v321_shadow_reject(reason, e):
+    d=V321_SHADOW["rejected"]
+    d[reason]=d.get(reason,0)+1
+    V321_SHADOW["recent_rejections"].append({"symbol":e.get("symbol"),
+       "entry_open_time":e.get("entry_open_time"),"reason":reason})
+    del V321_SHADOW["recent_rejections"][:-25]
+
+async def v321_independent_entries(client, top1_rows, good):
+    # Called on each V32 scan, BEFORE V32 capacity/cooldown filtering.
+    # Only newly actionable checkpoint candidates may enter.
+    if not V21_DB_URL or V321_SHADOW.get("last_error", "").startswith("db startup:"):
+        V321_SHADOW["last_error"] = V321_SHADOW.get("last_error") or "Database required for independent paper state"
+        return
+    now=alt_now_ms()
+    V321_SHADOW["last_scan_utc"]=utc_now()
+    changed=False
+    for e in top1_rows:
+        key=f'{e["symbol"]}:{e["entry_open_time"]}'
+        if key in V321_SHADOW["seen"]:
+            continue
+        # Ignore stale checkpoints; never backfill paper positions.
+        if now < int(e["entry_open_time"]) or now-int(e["entry_open_time"]) > 600000:
+            continue
+        V321_SHADOW["seen"].add(key)
+        changed=True
+        sym=e["symbol"]
+        if sym in V321_SHADOW["open"]:
+            v321_shadow_reject("SYMBOL_OPEN",e); continue
+        prior=[int(p.get("entry_open_time",0)) for p in V321_SHADOW["closed"]
+               if p.get("symbol")==sym]
+        if prior and int(e["entry_open_time"])-max(prior)<3600000:
+            v321_shadow_reject("COOLDOWN",e); continue
+        price=e.get("checkpoint_open")
+        if not price or float(price)<=0:
+            v321_shadow_reject("NO_CHECKPOINT_PRICE",e); continue
+        # Causal context: uses only completed candles preceding checkpoint.
+        context=v61_entry_context(good.get(sym),good.get("BTCUSDT"),
+                                   int(e["entry_open_time"]),float(price))
+        pre={"ctx_ret_60m_pct":context.get("ctx_ret_60m_pct"),
+             "ctx_vol_ratio_15m_vs_4h":context.get("ctx_vol_ratio_15m_vs_4h"),
+             "relative_momentum_z":e.get("relative_momentum_z"),
+             "entry_delay_seconds":0}
+        tag=v321_candidate_tag(pre)
+        if not tag["v321_pass"]:
+            v321_shadow_reject(tag["v321_reason"],e); continue
+        # Separate executable quote; no historical/estimated fill fallback.
+        try:
+            q=await live_quote(client,sym)
+        except Exception:
+            q=None
+        if not q or not q.get("ask") or not q.get("bid"):
+            v321_shadow_reject("NO_LIVE_QUOTE",e); continue
+        now_fill=alt_now_ms()
+        delay=(now_fill-int(e["entry_open_time"]))/1000.0
+        if not (0<=delay<60):
+            v321_shadow_reject("DELAY_OUTSIDE_0_TO_60",e); continue
+        spread=float(q["spread_pct"])
+        if not math.isfinite(spread) or spread>SPREAD_MAX_PCT:
+            v321_shadow_reject("SPREAD",e); continue
+        ask=float(q["ask"]); bid=float(q["bid"])
+        if not all(math.isfinite(x) and x>0 for x in (ask,bid)) or ask<bid:
+            v321_shadow_reject("INVALID_QUOTE",e); continue
+        pos={"key":key,"symbol":sym,"strategy":V321_SHADOW_VERSION,
+             "status":"OPEN_PAPER","signal_time_ms":e["signal_time_ms"],
+             "entry_open_time":e["entry_open_time"],"entry_live_ms":now_fill,
+             "entry_price":ask,"candle_open_price":float(price),
+             "live_ask":ask,"live_bid":bid,"spread_pct":round(spread,4),
+             "entry_delay_seconds":round(delay,2),
+             "entry_slippage_vs_candle_pct":round(pct_change(float(price),ask),4),
+             "exit_due_time":now_fill+V32_HOLD_MS,
+             "relative_momentum_z":round(float(e["relative_momentum_z"]),4),
+             "cross_section_percentile":e.get("cross_section_percentile"),
+             "continuation_60m_pct":e.get("wait_end_change_pct"),
+             "alt_market_mean_30m_pct":e.get("alt_market_mean_30m_pct"),
+             "peak_bid":bid,"peak_gain_pct":round(pct_change(ask,bid),4),
+             "trailing_active":False,"execution_version":V321_SHADOW_VERSION,
+             "risk_engine":{"hard_stop_pct":V55_HARD_STOP_PCT,
+                 "trail_activate_pct":V55_TRAIL_ACTIVATE_PCT,
+                 "trail_distance_pct":V55_TRAIL_DISTANCE_PCT,"max_hold_minutes":120},
+             **context,**tag}
+        pos["entry_delay_seconds"]=round(delay,2)
+        V321_SHADOW["open"][sym]=pos
+    if changed:
+        v321_shadow_save()
+
+async def v321_independent_exit_tick(client):
+    if not V321_SHADOW["open"]:
+        return
+    changed=False
+    now=alt_now_ms()
+    for sym,pos in list(V321_SHADOW["open"].items()):
+        try:
+            q=await live_quote(client,sym)
+            if not q or not q.get("bid"):
+                continue
+            bid=float(q["bid"])
+            if not math.isfinite(bid) or bid<=0:
+                continue
+            entry=float(pos["entry_price"])
+            old_peak=float(pos.get("peak_bid") or entry)
+            old_trailing=bool(pos.get("trailing_active"))
+            peak=max(old_peak,bid)
+            pos["peak_bid"]=peak
+            pos["peak_gain_pct"]=round(pct_change(entry,peak),4)
+            if pos["peak_gain_pct"]>=V55_TRAIL_ACTIVATE_PCT:
+                pos["trailing_active"]=True
+            hard=entry*(1-V55_HARD_STOP_PCT/100)
+            pos["hard_stop_price"]=hard
+            reason=None
+            if bid<=hard:
+                reason="HARD_STOP"
+            elif pos["trailing_active"]:
+                trailing=peak*(1-V55_TRAIL_DISTANCE_PCT/100)
+                pos["trailing_stop_price"]=trailing
+                if bid<=trailing:
+                    reason="TRAILING_STOP"
+            if reason is None and now>=int(pos["exit_due_time"]):
+                reason="TIME_STOP_120M"
+            if reason is None:
+                if peak>old_peak or bool(pos["trailing_active"])!=old_trailing:
+                    changed=True  # persist changed peak/trailing state
+                continue
+            gross=pct_change(entry,bid)
+            closed={**pos,"status":"CLOSED_PAPER","exit_open_time":now,
+                    "exit_price":bid,"gross_pct":round(gross,4),
+                    "cost_pct":V32_COST_PCT,"net_pct":round(gross-V32_COST_PCT,4),
+                    "exit_reason":reason,"exit_execution_version":V321_SHADOW_VERSION}
+            closed.update(v61_exit_diagnostics(closed,"V321_FAST_3S"))
+            V321_SHADOW["closed"].append(closed)
+            del V321_SHADOW["open"][sym]
+            V321_SHADOW["last_exit_utc"]=utc_now()
+            changed=True
+        except Exception as exc:
+            V321_SHADOW["last_error"]=f"exit {sym}: {exc}"
+    if changed:
+        v321_shadow_save()
+
+async def v321_independent_exit_loop():
+    await asyncio.sleep(15)
+    while True:
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(12.0)) as client:
+                await v321_independent_exit_tick(client)
+        except Exception as exc:
+            V321_SHADOW["last_error"]="exit loop: "+str(exc)
+        await asyncio.sleep(3)
+
+@app.on_event("startup")
+async def v321_independent_startup():
+    global V321_SHADOW_TASK
+    try:
+        v321_shadow_db_init()
+        v321_shadow_load()
+    except Exception as exc:
+        V321_SHADOW["last_error"]="db startup: "+str(exc)
+    if V321_SHADOW_TASK is None:
+        V321_SHADOW_TASK=asyncio.create_task(v321_independent_exit_loop())
+
+@app.on_event("shutdown")
+async def v321_independent_shutdown():
+    try:
+        v321_shadow_save()
+    except Exception:
+        pass
+
+@app.get("/v321-independent-status")
+async def v321_independent_status():
+    closed=V321_SHADOW["closed"]
+    return {**MODE_INFO,"status":"OK" if not V321_SHADOW["last_error"] else "WARNING",
+        "version":V321_SHADOW_VERSION,"mode":"INDEPENDENT_PAPER_ONLY",
+        "real_orders":False,"independent_shadow_execution":True,
+        "v32_unchanged":True,"v89_unchanged":True,
+        "source":"FROZEN_V32_TOP1_BEFORE_V32_CAPACITY_AND_COOLDOWN",
+        "thresholds":V321_THRESHOLDS,"open_count":len(V321_SHADOW["open"]),
+        "closed_count":len(closed),"performance":v321_summary(closed),
+        "open_positions":[{"symbol":p["symbol"],"entry_price":p["entry_price"],
+             "entry_delay_seconds":p["entry_delay_seconds"],
+             "entry_live_ms":p["entry_live_ms"]} for p in V321_SHADOW["open"].values()],
+        "recent_closed":[{"symbol":p["symbol"],"net_pct":p["net_pct"],
+             "exit_reason":p.get("exit_reason")} for p in closed[-20:]],
+        "rejected":V321_SHADOW["rejected"],
+        "recent_rejections":V321_SHADOW["recent_rejections"],
+        "last_scan_utc":V321_SHADOW["last_scan_utc"],
+        "last_exit_utc":V321_SHADOW["last_exit_utc"],
+        "last_error":V321_SHADOW["last_error"],
+        "limitations":["Uses V32 TOP1 candidate generation; independent capacity/cooldown and fills.",
+                       "Requires live quote and <60s checkpoint latency; no synthetic fills.",
+                       "Prospective paper only; filters selected on historical data."]}
