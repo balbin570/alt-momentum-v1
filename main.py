@@ -22832,7 +22832,7 @@ def v321_shadow_reject(reason, e):
 async def v321_independent_entries(client, top1_rows, good):
     # Called on each V32 scan, BEFORE V32 capacity/cooldown filtering.
     # Only newly actionable checkpoint candidates may enter.
-    if not V21_DB_URL or V321_SHADOW.get("last_error", "").startswith("db startup:"):
+    if not V21_DB_URL or (V321_SHADOW.get("last_error") or "").startswith("db startup:"):
         V321_SHADOW["last_error"] = V321_SHADOW.get("last_error") or "Database required for independent paper state"
         return
     now=alt_now_ms()
