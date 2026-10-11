@@ -22904,6 +22904,12 @@ async def v321_independent_entries(client, top1_rows, good):
              **context,**tag}
         pos["entry_delay_seconds"]=round(delay,2)
         V321_SHADOW["open"][sym]=pos
+    # A completed scan supersedes a previously persisted entry exception.
+    # Do not hide DB startup/exit-loop failures or current scan exceptions.
+    old_error = V321_SHADOW.get("last_error")
+    if isinstance(old_error, str) and old_error.startswith("entry:"):
+        V321_SHADOW["last_error"] = None
+        changed = True
     if changed:
         v321_shadow_save()
 
