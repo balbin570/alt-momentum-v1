@@ -49,7 +49,7 @@ from datetime import datetime, timezone
 from statistics import mean, median
 
 import httpx
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Header
 import time
 
 app = FastAPI(title="ALT-MOMENTUM-V1")
@@ -22575,3 +22575,32 @@ async def squeeze_prospective_v122():
         return {**MODE_INFO,'study':'V122_PROSPECTIVE_SQUEEZE','status':'ERROR','signal':False,
                 'generated_utc':utc_now(),'error_type':type(exc).__name__,
                 'error':'V122 research poll failed; check Render logs (credentials omitted).'}
+
+
+# V89.1 - Kapanmis islemler (salt okunur, korumali)
+@app.get("/v89-all-closed")
+async def v89_all_closed(x_api_key: str = Header(default="")):
+    import hmac
+    from fastapi import HTTPException
+
+    expected_key = os.environ.get("V32_EXPORT_API_KEY")
+
+    if not expected_key or not hmac.compare_digest(
+        x_api_key, expected_key
+    ):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    closed = V89_STATE.get("closed", [])
+    v891 = [
+        dict(t) for t in closed
+        if t.get("execution_version") == V89_NEW_VERSION
+    ]
+
+    return {
+        "status": "OK",
+        "mode": "READ_ONLY_PAPER_RESEARCH",
+        "total_closed": len(closed),
+        "v89_1_count": len(v891),
+        "v89_1_trades": v891,
+        "generated_utc": utc_now(),
+    }
