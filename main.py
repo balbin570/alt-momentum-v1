@@ -6218,6 +6218,8 @@ def prune_seen_keys(keys):
 
 
 async def alt_safe_send(msg, kind, symbol):
+    if kind not in {"V322_ENTRY", "V322_EXIT", "V893_ENTRY", "V893_EXIT"}:
+        return {"type": kind, "symbol": symbol, "sent": False, "reason": "telegram_new_strategies_only"}
     try:
         res = await v22_telegram_send(msg)
         return {"type": kind, "symbol": symbol, **res}
@@ -6807,6 +6809,12 @@ V22_TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 
 async def v22_telegram_send(message: str):
+    # Global delivery whitelist: other direct callers cannot send old strategy alerts.
+    if not (message.startswith("ALT V32.2 PAPER GIRIS") or
+            message.startswith("ALT V32.2 PAPER CIKIS") or
+            message.startswith("ALT V89.3 PAPER GIRIS") or
+            message.startswith("ALT V89.3 PAPER CIKIS")):
+        return {"sent": False, "reason": "telegram_new_strategies_only"}
     if not V22_TG_TOKEN or not V22_TG_CHAT_ID:
         return {"sent": False, "reason": "telegram_not_configured"}
 
@@ -9050,7 +9058,7 @@ async def v32_notify(result):
 
     for p in result.get("new_entries", []):
         msg = alt_entry_text(
-            "ALT V32 PAPER GIRIS (Top1, BTC filtresi yok)",
+            "ALT V32.2 PAPER GIRIS (Top1, V32.1 filtreli)",
             p,
             [
                 f"Z: {p['relative_momentum_z']} | yuzdelik: {p['cross_section_percentile']} (kohort: {p.get('cohort_size')})",
@@ -9061,10 +9069,11 @@ async def v32_notify(result):
             ],
             open_count,
         )
-        notes.append(await alt_safe_send(msg, "ENTRY", p["symbol"]))
+        notes.append(await alt_safe_send(msg, "V322_ENTRY", p["symbol"]))
 
     for p in result.get("newly_closed", []):
-        notes.append(await alt_safe_send(alt_exit_text("ALT V32 PAPER CIKIS", p), "EXIT", p["symbol"]))
+        if p.get("strategy_version") == "V32_2":
+            notes.append(await alt_safe_send(alt_exit_text("ALT V32.2 PAPER CIKIS", p), "V322_EXIT", p["symbol"]))
     return notes
 
 
@@ -12452,9 +12461,10 @@ async def v61_fast_stop_once(client):
         except Exception as exc:
             V61_FAST["last_error"] = f"save: {exc}"
         for c in closed_now:
-            await alt_safe_send(
-                alt_exit_text("ALT V32 PAPER CIKIS (hizli stop izleyici)", c), "EXIT", c["symbol"]
-            )
+            if c.get("strategy_version") == "V32_2":
+                await alt_safe_send(
+                    alt_exit_text("ALT V32.2 PAPER CIKIS (hizli stop izleyici)", c), "V322_EXIT", c["symbol"]
+                )
     return closed_now
 
 
