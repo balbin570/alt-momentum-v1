@@ -23678,3 +23678,161 @@ async def momentum_exits_v127(days: int = Query(default=30, ge=30, le=90)):
                 '27-way optimization may overfit; historical holdout is not prospective.',
                 'Fixed costs omit variable slippage and liquidity.',
                 'No database writes, orders, Telegram or scheduler changes.']}
+
+
+# V128: Read-only descriptive comparison of winners and losers at signal time.
+@app.get('/momentum-winners-losers-v128')
+async def momentum_winners_losers_v128(days: int = Query(default=30, ge=30, le=90)):
+    from statistics import mean, median
+    from collections import Counter
+    now_ms = int(datetime.now(timezone.utc).timestamp()*1000)
+    split_ms = now_ms - days*86400000//3
+    symbols = tuple(_V106_SYMBOLS)
+    async with httpx.AsyncClient(timeout=httpx.Timeout(240.0)) as client:
+        sem = asyncio.Semaphore(3)
+        async def worker(sym):
+            async with sem:
+                try:
+                    cs = await get_5m_candles_days(client, sym, days)
+                    return sym, [c for c in cs if int(c['close_time']) <= now_ms], None
+                except Exception as exc:
+                    return sym, [], type(exc).__name__
+        fetched = await asyncio.gather(*(worker(sym) for sym in symbols))
+    failures = [{'symbol':sym, 'error_type':err} for sym,_,err in fetched if err]
+    btc_candles = next((cs for sym,cs,err in fetched if sym=='BTCUSDT' and not err), [])
+    btc_close = {int(c['open_time']):float(c['close']) for c in btc_candles}
+    rows=[]
+    counts=Counter()
+    for sym,cs,err in fetched:
+        if err or sym=='BTCUSDT':
+            continue
+        n=len(cs)
+        if n<100:
+            counts['insufficient_history_symbols']+=1
+            continue
+        cl=[float(c['close']) for c in cs]
+        op=[float(c['open']) for c in cs]
+        hi=[float(c['high']) for c in cs]
+        lo=[float(c['low']) for c in cs]
+        vol=[float(c['volume']) for c in cs]
+        ts=[int(c['open_time']) for c in cs]
+        last_entry=-10**18
+        for i in range(55,n-26):
+            if any(ts[k+1]-ts[k]!=300000 for k in range(i-50,i+25)):
+                counts['gapped_windows']+=1
+                continue
+            if min(cl[i-50:i+1])<=0:
+                continue
+            rise=(cl[i]/cl[i-3]-1)*100
+            if not 1<=rise<2:
+                continue
+            counts['rise_events_before_cooldown']+=1
+            idx=i+1
+            entry_ms=ts[idx]
+            if entry_ms-last_entry<120*60000:
+                counts['cooldown_skipped']+=1
+                continue
+            entry=op[idx]
+            if entry<=0:
+                continue
+            last_entry=entry_ms
+            # All features below are computed from candles closed BEFORE entry.
+            btc_now=btc_close.get(ts[i]); btc_prev=btc_close.get(ts[i-6])
+            btc_30m=(btc_now/btc_prev-1)*100 if btc_now and btc_prev and btc_prev>0 else None
+            alt_30m=(cl[i]/cl[i-6]-1)*100
+            ema20=cl[i-19]
+            alpha20=2/21
+            for p in cl[i-18:i+1]:
+                ema20=alpha20*p+(1-alpha20)*ema20
+            ema50=cl[i-49]
+            alpha50=2/51
+            for p in cl[i-48:i+1]:
+                ema50=alpha50*p+(1-alpha50)*ema50
+            deltas=[cl[j]-cl[j-1] for j in range(i-13,i+1)]
+            gains=sum(max(d,0) for d in deltas)/14
+            losses=sum(max(-d,0) for d in deltas)/14
+            rsi=100 if losses==0 else 100-100/(1+gains/losses)
+            avgvol=sum(vol[i-20:i])/20
+            volume_ratio=vol[i]/avgvol if avgvol>0 else None
+            # V127's fixed selected rule: TP 0.5%, SL 0.8%, 60m maximum.
+            take=entry*1.005; stop=entry*0.992
+            net=None; reason=None
+            for k in range(12):
+                o,h,l=op[idx+k],hi[idx+k],lo[idx+k]
+                if o<=stop:
+                    net=(o/entry-1)*100-0.30; reason='STOP_GAP'; break
+                if o>=take:
+                    net=0.5-0.30; reason='TAKE_GAP'; break
+                if l<=stop:
+                    net=-0.8-0.30; reason='STOP'; break
+                if h>=take:
+                    net=0.5-0.30; reason='TAKE'; break
+            if net is None:
+                net=(op[idx+12]/entry-1)*100-0.30
+                reason='TIME'
+            rows.append({'split':'HOLDOUT_LAST_THIRD' if entry_ms>=split_ms else 'DEVELOPMENT_FIRST_TWO_THIRDS',
+                         'net':net, 'reason':reason, 'btc30':btc_30m,
+                         'relative30':alt_30m-btc_30m if btc_30m is not None else None,
+                         'volume':volume_ratio, 'rsi':rsi, 'ema_bull':cl[i]>ema20>ema50,
+                         'rise':rise, 'alt30':alt_30m})
+    def stats(group):
+        if not group:
+            return {'n':0,'mean_net_pct':None,'win_rate_pct':None,'profit_factor':None}
+        vals=[r['net'] for r in group]
+        gain=sum(v for v in vals if v>0)
+        loss=-sum(v for v in vals if v<0)
+        return {'n':len(vals),'mean_net_pct':round(mean(vals),5),
+                'median_net_pct':round(median(vals),5),
+                'win_rate_pct':round(100*sum(v>0 for v in vals)/len(vals),2),
+                'profit_factor':round(gain/loss,4) if loss else None}
+    def feature_summary(group):
+        winners=[r for r in group if r['net']>0]
+        losers=[r for r in group if r['net']<=0]
+        def av(items,key):
+            vals=[r[key] for r in items if r[key] is not None]
+            return round(mean(vals),5) if vals else None
+        return {'winners_n':len(winners),'losers_or_breakeven_n':len(losers),
+                'means_by_outcome':{key:{'winners':av(winners,key),'losers':av(losers,key)}
+                                    for key in ('btc30','relative30','volume','rsi','rise','alt30')},
+                'ema_bull_fraction':{'winners':round(sum(r['ema_bull'] for r in winners)/len(winners),4) if winners else None,
+                                     'losers':round(sum(r['ema_bull'] for r in losers)/len(losers),4) if losers else None},
+                'exit_counts':dict(Counter(r['reason'] for r in group))}
+    bins={'btc_30m':('btc30', [(-1e12,0,'BTC_NEGATIVE'),(0,1e12,'BTC_NONNEGATIVE')]),
+          'relative_strength_30m':('relative30',[(-1e12,0,'BELOW_BTC'),(0,1e12,'ABOVE_BTC')]),
+          'volume_ratio':('volume',[(-1e12,1,'BELOW_1'),(1,1.5,'1_TO_1_5'),(1.5,2,'1_5_TO_2'),(2,1e12,'AT_LEAST_2')]),
+          'rsi14_5m':('rsi',[(-1e12,60,'BELOW_60'),(60,70,'60_TO_70'),(70,1e12,'AT_LEAST_70')])}
+    groups={'DEVELOPMENT_FIRST_TWO_THIRDS':[r for r in rows if r['split']=='DEVELOPMENT_FIRST_TWO_THIRDS'],
+            'HOLDOUT_LAST_THIRD':[r for r in rows if r['split']=='HOLDOUT_LAST_THIRD']}
+    output={}
+    for name,group in groups.items():
+        bucketed={}
+        for label,(field,edges) in bins.items():
+            bucketed[label]={bucket:stats([r for r in group if r[field] is not None and a<=r[field]<b])
+                             for a,b,bucket in edges}
+            bucketed[label]['MISSING']=stats([r for r in group if r[field] is None])
+        bucketed['ema_trend']={'CLOSE_ABOVE_EMA20_ABOVE_EMA50':stats([r for r in group if r['ema_bull']]),
+                             'OTHER':stats([r for r in group if not r['ema_bull']])}
+        output[name]={'overall':stats(group),'features_by_winner_loser':feature_summary(group),
+                      'descriptive_buckets':bucketed}
+    return {'model':'ALT-MOMENTUM-V1','mode':'RESEARCH_PAPER_ONLY',
+            'trading':False,'orders':False,'signal':False,'status':'PARTIAL' if failures else 'OK',
+            'study':'V128_MOMENTUM_WINNERS_VS_LOSERS_DESCRIPTIVE',
+            'generated_utc':datetime.now(timezone.utc).isoformat(),
+            'days':days,'symbols_requested':len(symbols),
+            'symbols_fetched':sum(e is None for _,_,e in fetched),
+            'altcoins_fetched':sum(sym!='BTCUSDT' and e is None for sym,_,e in fetched),
+            'entry_rule':'V126/V127: 15m rise >=1% and <2%; next 5m open; 120m symbol cooldown',
+            'outcome_rule':'V127 frozen selected: TP +0.5%, SL -0.8%, 60m max hold, 0.30% cost, stop-first',
+            'split':'First 2/3 calendar development; last 1/3 holdout',
+            'candidate_count':len(rows),'diagnostic_counts':dict(counts),
+            'by_split':output,'fetch_failures':failures,
+            'writes_to_database':False,'changes_to_existing_strategies':False,
+            'limitations':['Descriptive only: no feature selection, model fitting or strategy promotion.',
+                           'Outcome groups are defined after entry; features use only signal-time information.',
+                           'Subgroup comparisons are exploratory and vulnerable to multiple testing and small samples.',
+                           'EMA and RSI are approximated from finite historical windows.',
+                           'Stop-first within candle; gap and limit execution assumptions are theoretical.',
+                           'BTC context missing remains missing, not silently treated as neutral.',
+                           'Historical holdout is not prospective validation.',
+                           'Fixed fees omit variable slippage and liquidity.',
+                           'No orders, Telegram, database or scheduler changes.']}
