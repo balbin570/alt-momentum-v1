@@ -18947,14 +18947,24 @@ async def v323b_status(limit: int = Query(default=50, ge=1, le=200)):
 # The existing status endpoint performs the same candle-based valuation.
 # No exchange order path is called. Deduplication is in RAM like the research book.
 V323B_TG_SENT = {}  # event key -> {entry: bool, exit: bool}
-V323B_TG_LAST = {"last_check_utc": None, "last_error": None, "last_send": None}
+V323B_TG_LAST = {"last_check_utc": None, "last_error": None, "last_send": None,
+                 "last_cycle_state": "NOT_STARTED", "candidate_count": 0,
+                 "cycle_count": 0}
 V323B_TG_TASK = None
 
 async def v323b_telegram_cycle():
-    if not any(row.get("v323b_pass") for row in V323_FOLLOWUP_EVENTS):
-        return
-    report = await v323b_status(limit=200)
+    # Heartbeat is recorded even when there are no eligible candidates.
+    # Otherwise a healthy idle worker incorrectly appears never to have run.
     V323B_TG_LAST["last_check_utc"] = utc_now()
+    V323B_TG_LAST["cycle_count"] += 1
+    eligible_count = sum(bool(row.get("v323b_pass")) for row in V323_FOLLOWUP_EVENTS)
+    V323B_TG_LAST["candidate_count"] = eligible_count
+    if not eligible_count:
+        V323B_TG_LAST["last_cycle_state"] = "IDLE_NO_ELIGIBLE_CANDIDATES"
+        return
+    V323B_TG_LAST["last_cycle_state"] = "VALUATING_CANDIDATES"
+    report = await v323b_status(limit=200)
+    V323B_TG_LAST["last_cycle_state"] = "VALUATION_COMPLETE"
     for trade in report.get("trades", []):
         key = trade.get("key")
         if not key or trade.get("status") not in ("OPEN_SHADOW", "CLOSED_SHADOW"):
@@ -18999,6 +19009,7 @@ async def v323b_telegram_loop():
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            V323B_TG_LAST["last_cycle_state"] = "ERROR"
             V323B_TG_LAST["last_error"] = f"{type(exc).__name__}: {str(exc)[:180]}"
             print("V323B_TELEGRAM_ERROR", V323B_TG_LAST["last_error"], flush=True)
         await asyncio.sleep(45)
