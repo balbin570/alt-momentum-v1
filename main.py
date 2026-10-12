@@ -8614,6 +8614,7 @@ def v53_latest_checkpoint_row(candles, symbol):
 
 
 async def v32_scan_once():
+    V322_DIAG["scan_checks"] += 1
     import time as _t
     scan_started = _t.perf_counter()
     async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
@@ -8780,11 +8781,15 @@ async def v32_scan_once():
             _v322_pre = {**_v322_context, "relative_momentum_z": e.get("relative_momentum_z"),
                          "entry_delay_seconds": max(0.0, (alt_now_ms()-int(e["entry_open_time"]))/1000.0)}
             _v322_gate = v321_candidate_tag(_v322_pre)
+            V322_DIAG["filter_checked"] += 1
             if not _v322_gate["v321_pass"]:
+                V322_DIAG["filter_rejected"] += 1
+                _research_diag_mark(V322_DIAG, str(_v322_gate.get("v321_reason", "UNKNOWN")), e.get("symbol"))
                 V32_STATE["seen_signal_keys"].add(key)
                 V47_SEEN_KEYS["V32"].add(key)
                 alt_log_skip(V32_STATE, {**pos, **_v322_gate}, "V32_2_FILTER:" + _v322_gate["v321_reason"])
                 continue
+            V322_DIAG["filter_passed"] += 1
             entry_funnel["quote_or_entry_attempted"] += 1
             ok_entry, skip_reason = await apply_live_entry(client, pos, price, V32_HOLD_MS)
             pos["execution_version"] = V55_EXECUTION_VERSION
@@ -8814,6 +8819,8 @@ async def v32_scan_once():
             pos["peak_gain_pct"] = round(pct_change(pos["entry_price"], pos["peak_bid"]), 4)
             pos["trailing_active"] = False
             if not ok_entry:
+                V322_DIAG["live_fill_rejected"] += 1
+                _research_diag_mark(V322_DIAG, str(skip_reason or "LIVE_ENTRY_REJECTED"), e.get("symbol"))
                 reason_text = str(skip_reason or "")
                 if "entry delay" in reason_text:
                     _v46_reject("rejected_delay_gt_120s", e, reason_text, pos)
@@ -8830,6 +8837,7 @@ async def v32_scan_once():
             V47_SEEN_KEYS["V32"].add(key)
             V32_STATE["open"][e["symbol"]] = pos
             new_entries.append(pos)
+            V322_DIAG["accepted"] += 1
             entry_funnel["accepted_entries"] += 1
 
         newly_closed = []
@@ -18633,11 +18641,18 @@ async def v89_scan_once():
                 v89_save()
                 await alt_safe_send(f"ALT V89.2 FILTRELI SHADOW GIRIS\nCoin: {e2['symbol']}\nBreakout: {e2['breakout_change_pct']:.3f}% | Vol: {e2['volume_ratio']:.2f}x\nDisp30: {disp30:.3f}\nSTOP -3% / TIME120 | PAPER - GERCEK EMIR YOK","V892_ENTRY",e2["symbol"])
         # V89.3: frozen CONFIRM10 Top1 + V89.2 gates, independent paper book.
+        V893_DIAG["scan_checks"] += 1
+        if not candidates:
+          V893_DIAG["no_candidate"] += 1
         v893_accepted=None
         if candidates:
+          V893_DIAG["top1_seen"] += 1
           e3=candidates[0]
           key3=f'{e3["symbol"]}:{e3["breakout_time"]}'
           seen3=set(V89_STATE.get("v893_seen",[]))
+          if key3 in seen3:
+            V893_DIAG["already_seen"] += 1
+            _research_diag_mark(V893_DIAG, "ALREADY_SEEN", e3["symbol"])
           if key3 not in seen3:
             seen3.add(key3)
             V89_STATE["v893_seen"]=list(seen3)[-2000:]
@@ -18645,8 +18660,20 @@ async def v89_scan_once():
               and float(e3["breakout_change_pct"])<V892_BREAKOUT_MAX
               and not (V892_DISP_LOW<=disp30<=V892_DISP_HIGH))
             already3=any(p3["symbol"]==e3["symbol"] for p3 in V89_STATE.get("v893_open",[]))
+            if not passes3:
+              V893_DIAG["filter_rejected"] += 1
+              for reason3, fail3 in (("VOLUME", float(e3["volume_ratio"])>=V892_VOLUME_MAX),
+                                    ("BREAKOUT", float(e3["breakout_change_pct"])>=V892_BREAKOUT_MAX),
+                                    ("DISPERSION", V892_DISP_LOW<=disp30<=V892_DISP_HIGH)):
+                if fail3: _research_diag_mark(V893_DIAG, reason3, e3["symbol"])
+            elif already3:
+              V893_DIAG["already_open"] += 1
+              _research_diag_mark(V893_DIAG, "ALREADY_OPEN", e3["symbol"])
             if passes3 and not already3:
               q3=await live_quote(client,e3["symbol"])
+              if not (q3 and q3.get("ask") and q3.get("bid") and q3["spread_pct"]<=SPREAD_MAX_PCT):
+                V893_DIAG["quote_rejected"] += 1
+                _research_diag_mark(V893_DIAG, "QUOTE_OR_SPREAD", e3["symbol"])
               if q3 and q3.get("ask") and q3.get("bid") and q3["spread_pct"]<=SPREAD_MAX_PCT:
                 ep3=float(q3["ask"]);ms3=alt_now_ms()
                 p3={**e3,"entry_price":ep3,"entry_utc":utc_now(),"entry_ms":ms3,
@@ -18662,6 +18689,7 @@ async def v89_scan_once():
                     "breakout_lt_pct":V892_BREAKOUT_MAX,
                     "disp30_excluded_pct":[V892_DISP_LOW,V892_DISP_HIGH]}}
                 V89_STATE.setdefault("v893_open",[]).append(p3)
+                V893_DIAG["accepted"] += 1
                 v893_accepted=p3
                 v89_save()
                 await alt_safe_send(f"ALT V89.3 PAPER GIRIS\nCoin: {e3['symbol']}\nBreakout: {e3['breakout_change_pct']:.3f}% | Vol: {e3['volume_ratio']:.2f}x\nDisp30: {disp30:.3f}\nSTOP -3% / TIME120 | GERCEK EMIR YOK","V893_ENTRY",e3["symbol"])
@@ -18712,6 +18740,30 @@ async def v892_status():
       "v892_closed_count":len(filtered),"v892_performance":v89_perf(filtered),
       "v892_open":V89_STATE.get("v892_open",[])[-10:],
       "v892_recent_closed":filtered[-30:],"generated_utc":utc_now()}
+
+# Read-only diagnostic counters; RAM only, reset on process restart.
+# No strategy, state, order, or historical trade mutations.
+V322_DIAG = {"scan_checks": 0, "filter_checked": 0, "filter_rejected": 0,
+             "filter_passed": 0, "live_fill_rejected": 0, "accepted": 0,
+             "reasons": {}, "recent": []}
+V893_DIAG = {"scan_checks": 0, "no_candidate": 0, "top1_seen": 0,
+             "already_seen": 0, "filter_rejected": 0, "already_open": 0,
+             "quote_rejected": 0, "accepted": 0, "reasons": {}, "recent": []}
+
+def _research_diag_mark(book, reason, symbol=None):
+    book["reasons"][reason] = book["reasons"].get(reason, 0) + 1
+    book["recent"].append({"utc": utc_now(), "symbol": symbol, "reason": reason})
+    del book["recent"][:-30]
+
+@app.get("/v322-diagnostics")
+async def v322_diagnostics():
+    return {**MODE_INFO, "status": "OK", "paper_only": True,
+            "diagnostics": V322_DIAG, "note": "RAM counters since last restart; read-only"}
+
+@app.get("/v893-diagnostics")
+async def v893_diagnostics():
+    return {**MODE_INFO, "status": "OK", "paper_only": True,
+            "diagnostics": V893_DIAG, "note": "RAM counters since last restart; read-only"}
 
 @app.get("/v322-status")
 async def v322_status():
