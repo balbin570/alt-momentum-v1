@@ -23444,3 +23444,122 @@ async def momentum_pullback_v125(days: int = Query(default=30, ge=30, le=90)):
                 'status':'ERROR','signal':False,'generated_utc':utc_now(),
                 'error_type':type(exc).__name__,'fetch_failures':failures,
                 'writes_to_database':False,'changes_to_existing_strategies':False}
+
+# V126: Read-only descriptive excursion study, independent of all live/paper strategies.
+@app.get('/momentum-excursion-v126')
+async def momentum_excursion_v126(days: int = Query(default=30, ge=30, le=90)):
+    from statistics import mean, median
+    from collections import Counter
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    split_ms = now_ms - (days * 86400000 // 3)
+    symbols = tuple(_V106_SYMBOLS)
+    async with httpx.AsyncClient(timeout=httpx.Timeout(240.0)) as client:
+        sem = asyncio.Semaphore(3)
+        async def worker(sym):
+            async with sem:
+                try:
+                    candles = await get_5m_candles_days(client, sym, days)
+                    return sym, [c for c in candles if int(c['close_time']) <= now_ms], None
+                except Exception as exc:
+                    return sym, [], type(exc).__name__
+        fetched = await asyncio.gather(*(worker(s) for s in symbols))
+    failures = [{'symbol':s, 'error_type':e} for s,_,e in fetched if e]
+    rows=[]
+    counters=Counter()
+    for sym, cs, error in fetched:
+        if error or sym=='BTCUSDT':
+            continue
+        n=len(cs)
+        if n<100:
+            counters['insufficient_history_symbols']+=1
+            continue
+        close=[float(c['close']) for c in cs]
+        opening=[float(c['open']) for c in cs]
+        highs=[float(c['high']) for c in cs]
+        lows=[float(c['low']) for c in cs]
+        ts=[int(c['open_time']) for c in cs]
+        last_entry=-10**18
+        for i in range(3,n-26):
+            if close[i-3]<=0 or close[i]<=0:
+                continue
+            if any(ts[k+1]-ts[k]!=300000 for k in range(i-3,i+25)):
+                counters['gapped_windows']+=1
+                continue
+            rise=(close[i]/close[i-3]-1)*100
+            if not (1<=rise<2):
+                continue
+            counters['rise_events_before_cooldown']+=1
+            entry_idx=i+1
+            entry_ms=ts[entry_idx]
+            if entry_ms-last_entry<120*60000:
+                counters['cooldown_skipped']+=1
+                continue
+            entry_price=opening[entry_idx]
+            if entry_price<=0:
+                counters['invalid_entry']+=1
+                continue
+            last_entry=entry_ms
+            record={'symbol':sym, 'split':'HOLDOUT_LAST_THIRD' if entry_ms>=split_ms else 'DEVELOPMENT_FIRST_TWO_THIRDS', 'entry_ms':entry_ms}
+            for minutes in (15,30,60,120):
+                steps=minutes//5
+                # Entry at candle entry_idx open; monitor its intrabar high/low and subsequent bars.
+                window_highs=highs[entry_idx:entry_idx+steps]
+                window_lows=lows[entry_idx:entry_idx+steps]
+                max_high=max(window_highs)
+                min_low=min(window_lows)
+                # Exit at the next candle open after the monitored period.
+                exit_idx=entry_idx+steps
+                if ts[exit_idx]-entry_ms!=minutes*60000 or opening[exit_idx]<=0:
+                    record[str(minutes)]=None
+                    continue
+                first_peak=window_highs.index(max_high)*5
+                first_trough=window_lows.index(min_low)*5
+                record[str(minutes)]={
+                    'mfe_pct':(max_high/entry_price-1)*100,
+                    'mae_pct':(min_low/entry_price-1)*100,
+                    'terminal_gross_pct':(opening[exit_idx]/entry_price-1)*100,
+                    'peak_candle_start_min':first_peak,
+                    'trough_candle_start_min':first_trough,
+                }
+            rows.append(record)
+    def summarize(group, minutes, cost):
+        subset=[r[str(minutes)] for r in group if r[str(minutes)] is not None]
+        if not subset:
+            return {'n':0,'mean_terminal_net_pct':None,'median_terminal_net_pct':None,
+                    'mean_mfe_pct':None,'median_mfe_pct':None,'mean_mae_pct':None,
+                    'pct_mfe_at_least_0_5':None,'pct_mfe_at_least_1_0':None,
+                    'pct_terminal_net_positive':None,'median_peak_candle_start_min':None}
+        terminal=[v['terminal_gross_pct']-cost for v in subset]
+        mfe=[v['mfe_pct'] for v in subset]
+        mae=[v['mae_pct'] for v in subset]
+        return {'n':len(subset),
+                'mean_terminal_net_pct':round(mean(terminal),5),
+                'median_terminal_net_pct':round(median(terminal),5),
+                'mean_mfe_pct':round(mean(mfe),5),
+                'median_mfe_pct':round(median(mfe),5),
+                'mean_mae_pct':round(mean(mae),5),
+                'pct_mfe_at_least_0_5':round(100*sum(v>=0.5 for v in mfe)/len(subset),2),
+                'pct_mfe_at_least_1_0':round(100*sum(v>=1 for v in mfe)/len(subset),2),
+                'pct_terminal_net_positive':round(100*sum(v>0 for v in terminal)/len(subset),2),
+                'median_peak_candle_start_min':median(v['peak_candle_start_min'] for v in subset)}
+    splits=('DEVELOPMENT_FIRST_TWO_THIRDS','HOLDOUT_LAST_THIRD')
+    results={split:{str(cost):{str(m):summarize([r for r in rows if r['split']==split],m,cost)
+                   for m in (15,30,60,120)} for cost in (0.15,0.30)} for split in splits}
+    return {'model':'ALT-MOMENTUM-V1','mode':'RESEARCH_PAPER_ONLY','trading':False,'orders':False,
+            'study':'V126_MOMENTUM_EXCURSION_DESCRIPTIVE','status':'OK','signal':False,
+            'generated_utc':datetime.now(timezone.utc).isoformat(), 'days':days,
+            'symbols_requested':len(symbols),'symbols_fetched':sum(e is None for _,_,e in fetched),
+            'altcoins_fetched':sum(s!='BTCUSDT' and e is None for s,_,e in fetched),
+            'entry_rule':'15m close rise >=1% and <2%; next 5m open; 120m per-symbol cooldown',
+            'split':'First 2/3 calendar time development; final 1/3 holdout',
+            'candidate_count':len(rows),'diagnostic_counts':dict(counters),
+            'by_split_cost_horizon':results,'fetch_failures':failures,
+            'writes_to_database':False,'changes_to_existing_strategies':False,
+            'limitations':['Descriptive excursion study, not a tradable strategy or profitability claim.',
+              'MFE and MAE are theoretical intrabar extremes, not executable profits or losses.',
+              'The chronological order of high and low within a 5m candle is unknown.',
+              'Peak/trough times indicate candle start, with up to 5m timing uncertainty.',
+              'Terminal return uses next-open theoretical fills and fixed round-trip costs.',
+              'No stop, take-profit, limit order or fill simulation is performed.',
+              'Overlapping symbols and survivorship selection can bias findings.',
+              'No changes to V89/V112/V122/V123/V124/V125, schedulers, Telegram or orders.']}
