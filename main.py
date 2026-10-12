@@ -24779,3 +24779,117 @@ async def prospective_v134():
     except Exception as exc:
         return {**MODE_INFO,'status':'UNAVAILABLE','error_type':type(exc).__name__,
                 'message':'V134 table not initialized yet or database unavailable'}
+
+
+# V135: Read-only, predeclared weekly stability and prospective poll health checks.
+# Does not change the V134 logger, existing trading paths, or database schemas.
+@app.get('/research-stability-v135')
+async def research_stability_v135(days: int = Query(default=90, ge=30, le=90)):
+    from collections import defaultdict
+    now_ms=int(datetime.now(timezone.utc).timestamp()*1000)
+    symbols=tuple(_V106_SYMBOLS)
+    async with httpx.AsyncClient(timeout=httpx.Timeout(240.0)) as client:
+        sem=asyncio.Semaphore(3)
+        async def fetch(sym):
+            async with sem:
+                try:return sym,await get_5m_candles_days(client,sym,days),None
+                except Exception as exc:return sym,[],type(exc).__name__
+        fetched=await asyncio.gather(*(fetch(sym) for sym in symbols))
+    data={sym:cs for sym,cs,err in fetched if err is None}
+    failures=[{'symbol':sym,'error_type':err} for sym,cs,err in fetched if err]
+    btc={int(c['open_time']):float(c['close']) for c in data.get('BTCUSDT',[])}
+    variants=('PB_06_10_BASE','PB_06_10_BTC_UP_03','PB_06_10_BTC_NONNEG')
+    rows={v:[] for v in variants}
+    start_ms=now_ms-days*86400000
+    for sym,cs in data.items():
+        if sym=='BTCUSDT' or len(cs)<100:continue
+        cl=[float(c['close']) for c in cs]
+        op=[float(c['open']) for c in cs]
+        ts=[int(c['open_time']) for c in cs]
+        last={v:-10**18 for v in variants}
+        for i in range(60,len(cs)-14):
+            if ts[i+13]-ts[i-60]!=73*300000:continue
+            if min(cl[i-7],cl[i-1],cl[i],op[i+1])<=0:continue
+            if 100*(cl[i-1]/cl[i-7]-1)<1:continue
+            depth=100*(cl[i-1]/cl[i]-1)
+            if not .6<=depth<1:continue
+            bnow=btc.get(ts[i]);bprev=btc.get(ts[i]-3600000)
+            if not bnow or not bprev:continue
+            b60=100*(bnow/bprev-1)
+            flags={'PB_06_10_BASE':True,'PB_06_10_BTC_UP_03':b60>=.3,
+                   'PB_06_10_BTC_NONNEG':b60>=0}
+            for v,passed in flags.items():
+                if not passed or ts[i+1]-last[v]<7200000:continue
+                last[v]=ts[i+1]
+                rows[v].append({'time':ts[i+1],'symbol':sym,
+                                'gross':100*(op[i+13]/op[i+1]-1)})
+    result={}
+    for v,trades in rows.items():
+        buckets=defaultdict(list)
+        for t in trades:
+            week=max(0,(t['time']-start_ms)//(7*86400000))
+            buckets[int(week)].append(t)
+        weekly=[]
+        for k in sorted(buckets):
+            tr=buckets[k]
+            weekly.append({'week_index':k+1,'n':len(tr),
+                           **v134_summary([x['gross'] for x in tr]),
+                           'unique_symbols':len({x['symbol'] for x in tr})})
+        active=[w for w in weekly if w['n']>0]
+        result[v]={'overall':v134_summary([x['gross'] for x in trades]),
+                   'weekly':weekly,'weeks_with_signals':len(active),
+                   'positive_weeks':sum(w['mean_net_pct']>0 for w in active),
+                   'negative_weeks':sum(w['mean_net_pct']<0 for w in active),
+                   'unique_symbols':len({x['symbol'] for x in trades})}
+    return {**MODE_INFO,'status':'PARTIAL' if failures else 'OK',
+            'study':'V135_PREDECLARED_WEEKLY_STABILITY','days':days,
+            'symbols_fetched':len(data),'cost_round_trip_pct':.3,
+            'hold_minutes':60,'weekly_buckets_anchor':'request_start_utc',
+            'variants':result,'fetch_failures':failures,'writes_to_database':False,
+            'changes_to_existing_strategies':False,
+            'limitations':['Previously inspected historical data: not independent out-of-sample.',
+                           'Weekly results are descriptive and can have small samples.',
+                           '120-minute per-symbol per-variant cooldown; cross-symbol signals may overlap.',
+                           'Fixed 0.30% hypothetical round-trip cost; no variable slippage.',
+                           'No live orders or prospective database writes.']}
+
+@app.get('/prospective-audit-v135')
+async def prospective_audit_v135():
+    import json as _json
+    dburl=os.getenv('DATABASE_URL','').strip()
+    if not dburl:return {**MODE_INFO,'status':'UNAVAILABLE','reason':'DATABASE_URL not configured'}
+    try:
+        with psycopg.connect(dburl,connect_timeout=7) as conn:
+            with conn.cursor() as cur:
+                cur.execute('BEGIN READ ONLY')
+                cur.execute('SELECT polled_ms,signals_seen,candidates_saved,failures,stage_counts FROM alt_momentum_v134.polls ORDER BY polled_ms DESC LIMIT 300')
+                polls=cur.fetchall()
+                cur.execute('SELECT variant,COUNT(*) FROM alt_momentum_v134.observations GROUP BY variant ORDER BY variant')
+                observations=dict(cur.fetchall())
+                cur.execute('SELECT o.variant,COUNT(*),AVG(x.gross_pct-.30) FROM alt_momentum_v134.outcomes x JOIN alt_momentum_v134.observations o ON o.id=x.observation_id GROUP BY o.variant ORDER BY o.variant')
+                settled=[{'variant':v,'n':n,'mean_net_pct':round(float(avg),5)} for v,n,avg in cur.fetchall()]
+                cur.execute('SELECT COUNT(*) FROM alt_momentum_v134.observations o LEFT JOIN alt_momentum_v134.outcomes x ON x.observation_id=o.id WHERE x.observation_id IS NULL')
+                unsettled=cur.fetchone()[0]
+        totals={k:0 for k in ('symbols','rise_ge_1','depth_06_10','btc_available','btc_nonnegative','rsi_50_70','volume_ge_1_5')}
+        for _,_,_,_,stages in polls:
+            if isinstance(stages,str):stages=_json.loads(stages)
+            for k in totals:totals[k]+=int((stages or {}).get(k,0))
+        gaps=[polls[i][0]-polls[i+1][0] for i in range(len(polls)-1)]
+        return {**MODE_INFO,'status':'OK','study':'V135_V134_PROSPECTIVE_READ_ONLY_AUDIT',
+                'polls_inspected':len(polls),'last_poll_ms':polls[0][0] if polls else None,
+                'first_inspected_poll_ms':polls[-1][0] if polls else None,
+                'poll_failures_in_window':sum(p[3] for p in polls),
+                'poll_gaps_over_10m':sum(g>600000 for g in gaps),
+                'max_poll_gap_minutes':round(max(gaps)/60000,2) if gaps else None,
+                'candidates_saved_in_window':sum(p[2] for p in polls),
+                'filter_stage_counts_in_window':totals,
+                'observations_by_variant_all_time':observations,
+                'settled_by_variant_all_time':settled,'unsettled_all_time':unsettled,
+                'writes_to_database':False,
+                'notes':['Read-only snapshot of at most 300 latest V134 polls.',
+                         'Stage counts are per poll and are not unique signals.',
+                         'A missing poll may reflect Render sleep or scheduler failure.',
+                         'No trading or database writes are triggered by this endpoint.']}
+    except Exception as exc:
+        return {**MODE_INFO,'status':'UNAVAILABLE','error_type':type(exc).__name__,
+                'message':'V134 tables may not be initialized or database is unavailable'}
