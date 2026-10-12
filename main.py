@@ -24281,3 +24281,133 @@ async def research_batch_v131(days: int = Query(default=90, ge=30, le=90)):
                            'Current fixed symbol universe and overlapping trades can bias results.',
                            'Fixed cost scenarios omit variable slippage; TP fills are theoretical.',
                            'No database writes, orders, Telegram or scheduler changes.']}
+
+
+# V132 - 12 predeclared alternative entry scenarios + V122 read-only diagnostic.
+@app.get('/research-batch-v132')
+async def research_batch_v132(days: int = Query(default=90, ge=30, le=90)):
+    from collections import Counter
+    from statistics import mean
+    now = int(datetime.now(timezone.utc).timestamp()*1000)
+    symbols=tuple(_V106_SYMBOLS)
+    async with httpx.AsyncClient(timeout=httpx.Timeout(240.0)) as client:
+        sem=asyncio.Semaphore(3)
+        async def fetch(sym):
+            async with sem:
+                try:
+                    return sym, await get_5m_candles_days(client,sym,days), None
+                except Exception as e:
+                    return sym,[],type(e).__name__
+        fetched=await asyncio.gather(*(fetch(s) for s in symbols))
+    data={s:c for s,c,e in fetched if not e}
+    failures=[{'symbol':s,'error_type':e} for s,c,e in fetched if e]
+    btc={int(c['open_time']):float(c['close']) for c in data.get('BTCUSDT',[])}
+    # All families and thresholds fixed before examining this batch.
+    families={
+      'PULLBACK_AFTER_RISE': [('PB_0_2_TO_0_6',.2,.6),('PB_0_6_TO_1_0',.6,1.),('PB_1_0_TO_1_5',1.,1.5)],
+      'CONSOLIDATION_BREAKOUT': [('BREAK_12_0_2',12,.2),('BREAK_12_0_5',12,.5),('BREAK_24_0_2',24,.2)],
+      'BTC_RELATIVE_STRENGTH': [('REL_30_0_5',30,.5),('REL_30_1_0',30,1.),('REL_60_1_0',60,1.)],
+      'EARLY_VOLUME_MOMENTUM': [('EARLY_0_2_VOL_1_5',.2,1.5),('EARLY_0_4_VOL_2',.4,2.),('EARLY_0_6_VOL_3',.6,3.)]
+    }
+    outcomes={v[0]:[] for variants in families.values() for v in variants}
+    diagnostics=Counter()
+    for sym,cs in data.items():
+        if sym=='BTCUSDT' or len(cs)<120:continue
+        cl=[float(c['close']) for c in cs]; op=[float(c['open']) for c in cs]
+        hi=[float(c['high']) for c in cs]; lo=[float(c['low']) for c in cs]
+        vol=[float(c['volume']) for c in cs]; ts=[int(c['open_time']) for c in cs]
+        last={key:-10**18 for key in outcomes}
+        for i in range(55,len(cs)-26):
+            if any(ts[j+1]-ts[j]!=300000 for j in range(i-55,i+25)):
+                diagnostics['gapped_windows']+=1;continue
+            if min(cl[i],cl[i-3],cl[i-6],cl[i-12],op[i+1])<=0:continue
+            m5=100*(cl[i]/cl[i-1]-1)
+            m15=100*(cl[i]/cl[i-3]-1)
+            m30=100*(cl[i]/cl[i-6]-1)
+            m60=100*(cl[i]/cl[i-12]-1)
+            volbase=sum(vol[i-20:i])/20
+            vr=vol[i]/volbase if volbase>0 else 0
+            b30=(100*(btc[ts[i]]/btc[ts[i]-1800000]-1)
+                 if ts[i] in btc and ts[i]-1800000 in btc and btc[ts[i]-1800000]>0 else None)
+            b60=(100*(btc[ts[i]]/btc[ts[i]-3600000]-1)
+                 if ts[i] in btc and ts[i]-3600000 in btc and btc[ts[i]-3600000]>0 else None)
+            # Signal at completed candle i, fill at next candle open.
+            # Pullback: recent 30m rise >=1%, then 5m negative retracement.
+            pb_rise=100*(cl[i-1]/cl[i-7]-1) if cl[i-7]>0 else 0
+            retrace=100*(cl[i-1]/cl[i]-1)
+            prior12=max(hi[i-12:i]); prior24=max(hi[i-24:i])
+            conditions={
+              'PB_0_2_TO_0_6':pb_rise>=1 and .2<=retrace<.6,
+              'PB_0_6_TO_1_0':pb_rise>=1 and .6<=retrace<1,
+              'PB_1_0_TO_1_5':pb_rise>=1 and 1<=retrace<1.5,
+              'BREAK_12_0_2':max(hi[i-12:i])-min(lo[i-12:i])<=.02*min(lo[i-12:i]) and cl[i]>prior12*1.002,
+              'BREAK_12_0_5':max(hi[i-12:i])-min(lo[i-12:i])<=.02*min(lo[i-12:i]) and cl[i]>prior12*1.005,
+              'BREAK_24_0_2':max(hi[i-24:i])-min(lo[i-24:i])<=.03*min(lo[i-24:i]) and cl[i]>prior24*1.002,
+              'REL_30_0_5':b30 is not None and m30-b30>=.5 and 0<m15<2,
+              'REL_30_1_0':b30 is not None and m30-b30>=1 and 0<m15<2,
+              'REL_60_1_0':b60 is not None and m60-b60>=1 and 0<m15<2,
+              'EARLY_0_2_VOL_1_5':.2<=m5<.8 and vr>=1.5 and m15<1,
+              'EARLY_0_4_VOL_2':.4<=m5<1 and vr>=2 and m15<1.5,
+              'EARLY_0_6_VOL_3':.6<=m5<1.2 and vr>=3 and m15<2
+            }
+            for name,passed in conditions.items():
+                if not passed:continue
+                diagnostics['raw_'+name]+=1
+                if ts[i+1]-last[name]<7200000:continue
+                last[name]=ts[i+1]
+                entry=op[i+1]
+                # Exit: 60m fixed-time next-open, no intra-candle TP/SL assumptions.
+                gross=100*(op[i+13]/entry-1)
+                outcomes[name].append({'time':ts[i+1],'symbol':sym,'gross':gross})
+    split=now-days*86400000//3
+    def summary(trades,cost):
+        vals=[x['gross']-cost for x in trades]
+        if not vals:return {'n':0,'mean_net_pct':None,'win_rate_pct':None,'profit_factor':None}
+        wins=sum(x for x in vals if x>0); losses=-sum(x for x in vals if x<0)
+        return {'n':len(vals),'mean_net_pct':round(mean(vals),5),
+                'win_rate_pct':round(100*sum(x>0 for x in vals)/len(vals),2),
+                'profit_factor':round(wins/losses,4) if losses else None}
+    results={}
+    for family,variants in families.items():
+        results[family]={}
+        for name,*_ in variants:
+            tr=outcomes[name]
+            dev=[t for t in tr if t['time']<split]
+            hold=[t for t in tr if t['time']>=split]
+            results[family][name]={
+              'total_signals':len(tr),'development':summary(dev,.3),
+              'historical_holdout':summary(hold,.3),
+              'historical_holdout_cost_0_15':summary(hold,.15),
+              'historical_holdout_cost_0':summary(hold,0),
+              'unique_symbols':len(set(t['symbol'] for t in tr))}
+    audit={'status':'UNAVAILABLE','reason':'DATABASE_URL missing'}
+    url=os.getenv('DATABASE_URL','').strip()
+    if url:
+        try:
+            with psycopg.connect(url,connect_timeout=6) as conn:
+                with conn.cursor() as cur:
+                    cur.execute('BEGIN READ ONLY')
+                    cur.execute("SELECT table_name,column_name,data_type FROM information_schema.columns WHERE table_schema='alt_momentum_v122' ORDER BY table_name,ordinal_position")
+                    schema={}
+                    for table,column,typ in cur.fetchall():schema.setdefault(table,[]).append({'name':column,'type':typ})
+                    counts={}
+                    for table in ('polls','observations','outcomes'):
+                        if table in schema:
+                            cur.execute('SELECT COUNT(*) FROM alt_momentum_v122.'+table)
+                            counts[table]=cur.fetchone()[0]
+                    audit={'status':'OK','table_counts':counts,'table_columns':schema,
+                           'interpretation':'Zero observations may mean no qualifying signals or a recording-path issue; source/scheduler review is needed to distinguish.'}
+        except Exception as exc:
+            audit={'status':'UNAVAILABLE','error_type':type(exc).__name__}
+    return {**MODE_INFO,'status':'PARTIAL' if failures else 'OK','signal':False,
+            'study':'V132_12_ENTRY_SCENARIOS_AND_V122_DIAGNOSTIC',
+            'generated_utc':utc_now(),'days':days,'symbols_requested':len(symbols),
+            'symbols_fetched':len(data),'test_count':12,'entry_families':results,
+            'v122_read_only_audit':audit,'diagnostics':dict(diagnostics),
+            'fetch_failures':failures,'writes_to_database':False,
+            'changes_to_existing_strategies':False,
+            'assumptions':['60m fixed exit at next 5m open','120m per-symbol per-scenario cooldown',
+                           'Costs 0%, 0.15%, 0.30% round trip',
+                           'The last third of this historical window is repeatedly inspected, not independent prospective validation',
+                           'Current fixed symbols cause survivorship bias; signals can overlap across symbols',
+                           'All results are exploratory and are not validated trading signals']}
