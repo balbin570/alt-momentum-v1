@@ -23983,3 +23983,134 @@ async def momentum_regimes_v129(days: int = Query(default=30, ge=30, le=90)):
                            'Fixed 0.30% costs omit variable slippage and liquidity.',
                            'Stop-first same-candle assumption and theoretical target fills.',
                            'No database writes, paper positions, orders, Telegram or scheduler changes.']}
+
+
+# V130: Cost sensitivity and risk/reward research. Read-only; all existing routes preserved.
+@app.get('/momentum-costs-v130')
+async def momentum_costs_v130(days: int = Query(default=30, ge=30, le=90)):
+    from collections import Counter
+    from itertools import product
+    from statistics import mean, median
+    now_ms = int(datetime.now(timezone.utc).timestamp()*1000)
+    split_ms = now_ms - days*86400000//3
+    symbols = tuple(_V106_SYMBOLS)
+    async with httpx.AsyncClient(timeout=httpx.Timeout(240.0)) as client:
+        sem = asyncio.Semaphore(3)
+        async def worker(sym):
+            async with sem:
+                try:
+                    cs = await get_5m_candles_days(client, sym, days)
+                    return sym, [c for c in cs if int(c['close_time']) <= now_ms], None
+                except Exception as exc:
+                    return sym, [], type(exc).__name__
+        fetched = await asyncio.gather(*(worker(sym) for sym in symbols))
+    failures = [{'symbol':s,'error_type':err} for s,_,err in fetched if err]
+    counts = Counter()
+    trades = []
+    for sym,cs,err in fetched:
+        if err or sym == 'BTCUSDT':
+            continue
+        if len(cs)<100:
+            counts['insufficient_history_symbols'] += 1
+            continue
+        cl=[float(c['close']) for c in cs]
+        op=[float(c['open']) for c in cs]
+        hi=[float(c['high']) for c in cs]
+        lo=[float(c['low']) for c in cs]
+        ts=[int(c['open_time']) for c in cs]
+        last_entry=-10**18
+        for i in range(3,len(cs)-26):
+            if cl[i-3]<=0 or cl[i]<=0:
+                continue
+            if any(ts[k+1]-ts[k]!=300000 for k in range(i-3,i+25)):
+                counts['gapped_windows']+=1
+                continue
+            rise=(cl[i]/cl[i-3]-1)*100
+            if not (1<=rise<2):
+                continue
+            counts['rise_events_before_cooldown']+=1
+            idx=i+1
+            entry_ms=ts[idx]
+            if entry_ms-last_entry<120*60000:
+                counts['cooldown_skipped']+=1
+                continue
+            if op[idx]<=0:
+                counts['invalid_entry']+=1
+                continue
+            last_entry=entry_ms
+            trades.append({'symbol':sym,'entry':op[idx],
+                           'split':'HOLDOUT_LAST_THIRD' if entry_ms>=split_ms else 'DEVELOPMENT_FIRST_TWO_THIRDS',
+                           'opens':op[idx:idx+25], 'highs':hi[idx:idx+24], 'lows':lo[idx:idx+24]})
+    def gross_exit(t,tp,sl,minutes):
+        entry=t['entry']
+        if tp is None:
+            return (t['opens'][minutes//5]/entry-1)*100,'TIME'
+        target=entry*(1+tp/100)
+        stop=entry*(1-sl/100)
+        for k in range(minutes//5):
+            o,h,l=t['opens'][k],t['highs'][k],t['lows'][k]
+            if o<=stop:
+                return (o/entry-1)*100,'STOP_GAP'
+            if o>=target:
+                return tp,'TAKE_GAP'
+            if l<=stop:
+                return -sl,'STOP'
+            if h>=target:
+                return tp,'TAKE'
+        return (t['opens'][minutes//5]/entry-1)*100,'TIME'
+    def summary(gross_pairs,cost):
+        if not gross_pairs:
+            return {'n':0,'mean_net_pct':None,'median_net_pct':None,'win_rate_pct':None,'profit_factor':None}
+        vals=[v-cost for v,_ in gross_pairs]
+        gains=sum(v for v in vals if v>0)
+        losses=-sum(v for v in vals if v<0)
+        return {'n':len(vals),'mean_gross_pct':round(mean(v for v,_ in gross_pairs),5),
+                'mean_net_pct':round(mean(vals),5),'median_net_pct':round(median(vals),5),
+                'win_rate_pct':round(100*sum(v>0 for v in vals)/len(vals),2),
+                'profit_factor':round(gains/losses,4) if losses else None,
+                'exit_counts':dict(Counter(reason for _,reason in gross_pairs))}
+    groups={k:[t for t in trades if t['split']==k] for k in ('DEVELOPMENT_FIRST_TWO_THIRDS','HOLDOUT_LAST_THIRD')}
+    costs=(0.0,0.10,0.15,0.30,0.50)
+    # Cost-independent exit paths are computed once per candidate and reused across costs.
+    choices=[(tp,sl,minutes) for tp,sl,minutes in product((0.5,0.8,1.2),(0.5,0.8,1.2),(30,60,120))]
+    cache={(split,tp,sl,m):[gross_exit(t,tp,sl,m) for t in group]
+           for split,group in groups.items() for tp,sl,m in choices}
+    dev='DEVELOPMENT_FIRST_TWO_THIRDS'
+    ranked=sorted(choices,key=lambda x:(-summary(cache[(dev,*x)],0.30)['mean_net_pct'],x))
+    selected=ranked[0]
+    def costs_for(pairs):
+        return {str(c):summary(pairs,c) for c in costs}
+    results={split:costs_for(cache[(split,*selected)]) for split in groups}
+    frozen=(0.5,0.8,60)
+    frozen_results={split:costs_for(cache[(split,*frozen)]) for split in groups}
+    baselines={split:{str(m):costs_for([gross_exit(t,None,None,m) for t in group])
+                      for m in (30,60,120)} for split,group in groups.items()}
+    dev_ranks=[{'tp_pct':tp,'sl_pct':sl,'hold_min':m,
+                'dev_mean_net_pct_at_030':summary(cache[(dev,tp,sl,m)],0.30)['mean_net_pct']}
+               for tp,sl,m in ranked[:5]]
+    return {'model':'ALT-MOMENTUM-V1','mode':'RESEARCH_PAPER_ONLY','trading':False,'orders':False,
+            'signal':False,'status':'PARTIAL' if failures else 'OK',
+            'study':'V130_COST_AND_RISK_REWARD_SENSITIVITY_HISTORICAL',
+            'generated_utc':datetime.now(timezone.utc).isoformat(),'days':days,
+            'symbols_requested':len(symbols),'symbols_fetched':sum(err is None for _,_,err in fetched),
+            'altcoins_fetched':sum(sym!='BTCUSDT' and err is None for sym,_,err in fetched),
+            'entry_rule':'V127 frozen: 15m rise >=1% and <2%, next 5m open, 120m per-symbol cooldown',
+            'split':'First 2/3 calendar development; last 1/3 holdout',
+            'round_trip_cost_pct_scenarios':list(costs),
+            'candidate_count':len(trades),'development_count':len(groups[dev]),
+            'holdout_count':len(groups['HOLDOUT_LAST_THIRD']),
+            'frozen_v127_exit':{'tp_pct':0.5,'sl_pct':0.8,'hold_min':60},
+            'frozen_v127_by_split_cost':frozen_results,
+            'selection_rule':'27 exit combinations ranked ONLY on development mean net at 0.30% cost',
+            'selected_on_development_only':{'tp_pct':selected[0],'sl_pct':selected[1],'hold_min':selected[2]},
+            'selected_by_split_cost':results,'fixed_time_baselines_by_split_cost':baselines,
+            'development_top_5_at_030':dev_ranks,'diagnostic_counts':dict(counts),
+            'fetch_failures':failures,'writes_to_database':False,'changes_to_existing_strategies':False,
+            'limitations':['Exploratory historical research; not proven profitable or independently prospective.',
+              '27-way optimization may overfit; holdout must not be reused for repeated tuning.',
+              'Overlapping symbol trades and survivorship may bias inference.',
+              'Stop-first when stop and target occur in the same 5m candle.',
+              'Stop gap uses adverse opening price; target assumes theoretical fill.',
+              'Costs are fixed scenarios and exclude variable liquidity/slippage.',
+              'Zero-cost scenario is theoretical, not an executable fee assumption.',
+              'No orders, paper positions, database writes, Telegram or scheduler changes.']}
