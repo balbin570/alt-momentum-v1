@@ -6813,7 +6813,9 @@ async def v22_telegram_send(message: str):
     if not (message.startswith("ALT V32.2 PAPER GIRIS") or
             message.startswith("ALT V32.2 PAPER CIKIS") or
             message.startswith("ALT V89.3 PAPER GIRIS") or
-            message.startswith("ALT V89.3 PAPER CIKIS")):
+            message.startswith("ALT V89.3 PAPER CIKIS") or
+            message.startswith("ALT V32.3-B PAPER GIRIS") or
+            message.startswith("ALT V32.3-B PAPER CIKIS")):
         return {"sent": False, "reason": "telegram_new_strategies_only"}
     if not V22_TG_TOKEN or not V22_TG_CHAT_ID:
         return {"sent": False, "reason": "telegram_not_configured"}
@@ -18940,6 +18942,82 @@ async def v323b_status(limit: int = Query(default=50, ge=1, le=200)):
                 "Historical API may not retain all needed candles after long delays",
                 "Not a live-fill model; overlapping signals may not be independent"],
             "generated_utc":utc_now()}
+
+# V32.3-B TELEGRAM: background notification observer, paper-only.
+# The existing status endpoint performs the same candle-based valuation.
+# No exchange order path is called. Deduplication is in RAM like the research book.
+V323B_TG_SENT = {}  # event key -> {entry: bool, exit: bool}
+V323B_TG_LAST = {"last_check_utc": None, "last_error": None, "last_send": None}
+V323B_TG_TASK = None
+
+async def v323b_telegram_cycle():
+    if not any(row.get("v323b_pass") for row in V323_FOLLOWUP_EVENTS):
+        return
+    report = await v323b_status(limit=200)
+    V323B_TG_LAST["last_check_utc"] = utc_now()
+    for trade in report.get("trades", []):
+        key = trade.get("key")
+        if not key or trade.get("status") not in ("OPEN_SHADOW", "CLOSED_SHADOW"):
+            continue
+        sent = V323B_TG_SENT.setdefault(key, {"entry": False, "exit": False})
+        symbol = trade.get("symbol", "?")
+        if not sent["entry"]:
+            msg = (f"ALT V32.3-B PAPER GIRIS\n"
+                   f"V32.3-B | SANAL ISLEM\n"
+                   f"Coin: {symbol}\n"
+                   f"Giris: {trade['entry_price']:.10g} USDT\n"
+                   f"Stop (-3%): {trade['stop_price']:.10g} USDT\n"
+                   f"Giris UTC: {trade['entry_utc']}\n"
+                   f"Gercek emir YOK")
+            response = await v22_telegram_send(msg)
+            if response.get("sent"):
+                sent["entry"] = True
+                V323B_TG_LAST["last_send"] = {"key": key, "type": "entry", "utc": utc_now()}
+            else:
+                V323B_TG_LAST["last_error"] = f"entry {key}: {response.get('reason', 'not_sent')}"
+                continue
+        if trade["status"] == "CLOSED_SHADOW" and not sent["exit"]:
+            msg = (f"ALT V32.3-B PAPER CIKIS\n"
+                   f"V32.3-B | SANAL ISLEM\n"
+                   f"Coin: {symbol}\n"
+                   f"Giris: {trade['entry_price']:.10g} USDT\n"
+                   f"Cikis: {trade['exit_price']:.10g} USDT\n"
+                   f"Net proxy: {trade['net_pct']:+.3f}% (varsayilan maliyet dahil)\n"
+                   f"Sebep: {trade['exit_reason']}\n"
+                   f"Gercek emir YOK")
+            response = await v22_telegram_send(msg)
+            if response.get("sent"):
+                sent["exit"] = True
+                V323B_TG_LAST["last_send"] = {"key": key, "type": "exit", "utc": utc_now()}
+            else:
+                V323B_TG_LAST["last_error"] = f"exit {key}: {response.get('reason', 'not_sent')}"
+
+async def v323b_telegram_loop():
+    while True:
+        try:
+            await v323b_telegram_cycle()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            V323B_TG_LAST["last_error"] = f"{type(exc).__name__}: {str(exc)[:180]}"
+            print("V323B_TELEGRAM_ERROR", V323B_TG_LAST["last_error"], flush=True)
+        await asyncio.sleep(45)
+
+@app.on_event("startup")
+async def v323b_telegram_startup():
+    global V323B_TG_TASK
+    if V323B_TG_TASK is None or V323B_TG_TASK.done():
+        V323B_TG_TASK = asyncio.create_task(v323b_telegram_loop())
+
+@app.get("/v323b-telegram-status")
+async def v323b_telegram_status():
+    return {"status": "OK", "version": "V32_3_B_RESEARCH_PAPER",
+            "telegram_configured": bool(V22_TG_TOKEN and V22_TG_CHAT_ID),
+            "worker_running": bool(V323B_TG_TASK and not V323B_TG_TASK.done()),
+            "entry_notifications_sent": sum(int(v["entry"]) for v in V323B_TG_SENT.values()),
+            "exit_notifications_sent": sum(int(v["exit"]) for v in V323B_TG_SENT.values()),
+            "last": V323B_TG_LAST, "trading": False, "orders": False,
+            "note": "RAM counters reset on restart; no replay of previous deployments"}
 
 @app.get("/v323-research")
 async def v323_research():
