@@ -6815,7 +6815,8 @@ async def v22_telegram_send(message: str):
             message.startswith("ALT V89.3 PAPER GIRIS") or
             message.startswith("ALT V89.3 PAPER CIKIS") or
             message.startswith("ALT V32.3-B PAPER GIRIS") or
-            message.startswith("ALT V32.3-B PAPER CIKIS")):
+            message.startswith("ALT V32.3-B PAPER CIKIS") or
+            message.startswith("ALT V32.3-B TELEGRAM TEST\n")):
         return {"sent": False, "reason": "telegram_new_strategies_only"}
     if not V22_TG_TOKEN or not V22_TG_CHAT_ID:
         return {"sent": False, "reason": "telegram_not_configured"}
@@ -19019,6 +19020,24 @@ async def v323b_telegram_startup():
     global V323B_TG_TASK
     if V323B_TG_TASK is None or V323B_TG_TASK.done():
         V323B_TG_TASK = asyncio.create_task(v323b_telegram_loop())
+
+@app.get("/v323b-telegram-test")
+async def v323b_telegram_test():
+    """Explicit manual Telegram delivery check; no paper state or order changes."""
+    try:
+        response = await v22_telegram_send(
+            "ALT V32.3-B TELEGRAM TEST\n"
+            "Bildirim baglantisi kontrolu - SANAL ISLEM DEGIL.\n"
+            "Gercek emir YOK | Paper pozisyon acilmadi."
+        )
+        sent = bool(response.get("sent"))
+        return {"status": "OK" if sent else "NOT_SENT",
+                "telegram": response, "trading": False, "orders": False,
+                "generated_utc": utc_now()}
+    except Exception as exc:
+        return {"status": "ERROR", "telegram": {"sent": False,
+                "error": f"{type(exc).__name__}: {str(exc)[:200]}"},
+                "trading": False, "orders": False, "generated_utc": utc_now()}
 
 @app.get("/v323b-telegram-status")
 async def v323b_telegram_status():
