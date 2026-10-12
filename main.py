@@ -60,7 +60,7 @@ MODEL = "ALT-MOMENTUM-V1"
 MIN_QUOTE_VOLUME_USDT = 250_000
 ROUND_TRIP_COST_PCT = 0.15
 
-# Altcoin araÃ…Å¸tÃ„Â±rmasÃ„Â± iÃƒÂ§in istemediÃ„Å¸imiz baz varlÃ„Â±klar
+# Altcoin araÃƒâ€¦Ã…Â¸tÃƒâ€Ã‚Â±rmasÃƒâ€Ã‚Â± iÃƒÆ’Ã‚Â§in istemediÃƒâ€Ã…Â¸imiz baz varlÃƒâ€Ã‚Â±klar
 EXCLUDED_BASES = {
     "BTC",
     "ETH",
@@ -294,16 +294,16 @@ def analyze_latest(symbol, candles, quote_volume):
 
 def historical_events(candles):
     """
-    Burada AL sinyali ÃƒÂ¼retmiyoruz.
+    Burada AL sinyali ÃƒÆ’Ã‚Â¼retmiyoruz.
 
-    AmaÃƒÂ§:
-    GeÃƒÂ§miÃ…Å¸te belirli momentum + hacim koÃ…Å¸ullarÃ„Â± oluÃ…Å¸tuÃ„Å¸unda
-    fiyatÃ„Â±n 15/30/60 dakika sonra ne yaptÃ„Â±Ã„Å¸Ã„Â±nÃ„Â± ÃƒÂ¶lÃƒÂ§mek.
+    AmaÃƒÆ’Ã‚Â§:
+    GeÃƒÆ’Ã‚Â§miÃƒâ€¦Ã…Â¸te belirli momentum + hacim koÃƒâ€¦Ã…Â¸ullarÃƒâ€Ã‚Â± oluÃƒâ€¦Ã…Â¸tuÃƒâ€Ã…Â¸unda
+    fiyatÃƒâ€Ã‚Â±n 15/30/60 dakika sonra ne yaptÃƒâ€Ã‚Â±Ãƒâ€Ã…Â¸Ãƒâ€Ã‚Â±nÃƒâ€Ã‚Â± ÃƒÆ’Ã‚Â¶lÃƒÆ’Ã‚Â§mek.
     """
 
     events = []
 
-    # Ã„Â°leri ÃƒÂ¶lÃƒÂ§ÃƒÂ¼m iÃƒÂ§in 12 mum = 60 dakika gerekir.
+    # Ãƒâ€Ã‚Â°leri ÃƒÆ’Ã‚Â¶lÃƒÆ’Ã‚Â§ÃƒÆ’Ã‚Â¼m iÃƒÆ’Ã‚Â§in 12 mum = 60 dakika gerekir.
     for i in range(7, len(candles) - 12):
 
         current = candles[i]["close"]
@@ -336,8 +336,8 @@ def historical_events(candles):
             else 0
         )
 
-        # Ã„Â°lk araÃ…Å¸tÃ„Â±rma koÃ…Å¸ulu.
-        # Bunlar nihai parametre deÃ„Å¸ildir.
+        # Ãƒâ€Ã‚Â°lk araÃƒâ€¦Ã…Â¸tÃƒâ€Ã‚Â±rma koÃƒâ€¦Ã…Â¸ulu.
+        # Bunlar nihai parametre deÃƒâ€Ã…Â¸ildir.
         if mom5 < 0.30:
             continue
 
@@ -350,7 +350,7 @@ def historical_events(candles):
         if volume_ratio < 1.20:
             continue
 
-        # Ãƒâ€¡oktan aÃ…Å¸Ã„Â±rÃ„Â± koÃ…Å¸muÃ…Å¸ hareketleri ilk aÃ…Å¸amada ayÃ„Â±r.
+        # ÃƒÆ’Ã¢â‚¬Â¡oktan aÃƒâ€¦Ã…Â¸Ãƒâ€Ã‚Â±rÃƒâ€Ã‚Â± koÃƒâ€¦Ã…Â¸muÃƒâ€¦Ã…Â¸ hareketleri ilk aÃƒâ€¦Ã…Â¸amada ayÃƒâ€Ã‚Â±r.
         if mom5 > 3.00:
             continue
 
@@ -576,8 +576,8 @@ async def backtest(
 ):
     """
     Research endpoint.
-    Emir ÃƒÂ¼retmez.
-    Paper trade aÃƒÂ§maz.
+    Emir ÃƒÆ’Ã‚Â¼retmez.
+    Paper trade aÃƒÆ’Ã‚Â§maz.
     """
 
     symbol = symbol.upper().strip()
@@ -627,8 +627,8 @@ async def backtest(
 
 def apply_cooldown(events, cooldown_minutes):
     """
-    AynÃ„Â± coin iÃƒÂ§in birbirine ÃƒÂ§ok yakÃ„Â±n eventleri baÃ„Å¸Ã„Â±msÃ„Â±z iÃ…Å¸lem gibi
-    saymamak amacÃ„Â±yla cooldown uygular.
+    AynÃƒâ€Ã‚Â± coin iÃƒÆ’Ã‚Â§in birbirine ÃƒÆ’Ã‚Â§ok yakÃƒâ€Ã‚Â±n eventleri baÃƒâ€Ã…Â¸Ãƒâ€Ã‚Â±msÃƒâ€Ã‚Â±z iÃƒâ€¦Ã…Â¸lem gibi
+    saymamak amacÃƒâ€Ã‚Â±yla cooldown uygular.
     """
     if not events:
         return []
@@ -654,8 +654,8 @@ def apply_cooldown(events, cooldown_minutes):
 
 def summarize_events_with_cost(events, cost_pct=ROUND_TRIP_COST_PCT):
     """
-    15/30/60 dk brÃƒÂ¼t sonuÃƒÂ§larÃ„Â± ve sabit round-trip maliyet sonrasÃ„Â±
-    net sonuÃƒÂ§larÃ„Â± birlikte ÃƒÂ¶zetler.
+    15/30/60 dk brÃƒÆ’Ã‚Â¼t sonuÃƒÆ’Ã‚Â§larÃƒâ€Ã‚Â± ve sabit round-trip maliyet sonrasÃƒâ€Ã‚Â±
+    net sonuÃƒÆ’Ã‚Â§larÃƒâ€Ã‚Â± birlikte ÃƒÆ’Ã‚Â¶zetler.
     """
     if not events:
         return {
@@ -728,17 +728,17 @@ async def backtest_all(
     ),
 ):
     """
-    Ãƒâ€¡oklu altcoin research/event-study endpointi.
+    ÃƒÆ’Ã¢â‚¬Â¡oklu altcoin research/event-study endpointi.
 
-    - Emir ÃƒÂ¼retmez.
-    - Paper trade aÃƒÂ§maz.
-    - Mevcut 24h likidite evreninden en yÃƒÂ¼ksek hacimli coinleri seÃƒÂ§er.
-    - Ham eventleri, 30 dk cooldown ve 60 dk cooldown sonuÃƒÂ§larÃ„Â±nÃ„Â± karÃ…Å¸Ã„Â±laÃ…Å¸tÃ„Â±rÃ„Â±r.
-    - %0.15 round-trip araÃ…Å¸tÃ„Â±rma maliyetini net sonuÃƒÂ§lardan dÃƒÂ¼Ã…Å¸er.
+    - Emir ÃƒÆ’Ã‚Â¼retmez.
+    - Paper trade aÃƒÆ’Ã‚Â§maz.
+    - Mevcut 24h likidite evreninden en yÃƒÆ’Ã‚Â¼ksek hacimli coinleri seÃƒÆ’Ã‚Â§er.
+    - Ham eventleri, 30 dk cooldown ve 60 dk cooldown sonuÃƒÆ’Ã‚Â§larÃƒâ€Ã‚Â±nÃƒâ€Ã‚Â± karÃƒâ€¦Ã…Â¸Ãƒâ€Ã‚Â±laÃƒâ€¦Ã…Â¸tÃƒâ€Ã‚Â±rÃƒâ€Ã‚Â±r.
+    - %0.15 round-trip araÃƒâ€¦Ã…Â¸tÃƒâ€Ã‚Â±rma maliyetini net sonuÃƒÆ’Ã‚Â§lardan dÃƒÆ’Ã‚Â¼Ãƒâ€¦Ã…Â¸er.
 
     Not:
-    Bu ilk geniÃ…Å¸ test current-universe yaklaÃ…Å¸Ã„Â±mÃ„Â± kullanÃ„Â±r; dolayÃ„Â±sÃ„Â±yla
-    survivorship / current-liquidity bias iÃƒÂ§erebilir.
+    Bu ilk geniÃƒâ€¦Ã…Â¸ test current-universe yaklaÃƒâ€¦Ã…Â¸Ãƒâ€Ã‚Â±mÃƒâ€Ã‚Â± kullanÃƒâ€Ã‚Â±r; dolayÃƒâ€Ã‚Â±sÃƒâ€Ã‚Â±yla
+    survivorship / current-liquidity bias iÃƒÆ’Ã‚Â§erebilir.
     """
     try:
         async with httpx.AsyncClient() as client:
@@ -803,7 +803,7 @@ async def backtest_all(
                 )
             )
 
-        # Coin listesini hacme gÃƒÂ¶re okunabilir sÃ„Â±rada tut.
+        # Coin listesini hacme gÃƒÆ’Ã‚Â¶re okunabilir sÃƒâ€Ã‚Â±rada tut.
         per_coin.sort(
             key=lambda x: x["quote_volume_24h"],
             reverse=True,
@@ -859,15 +859,15 @@ async def backtest_all(
 
 async def get_5m_candles_days(client, symbol, days=30):
     """
-    Binance 1000-kline limitini geriye doÃ„Å¸ru sayfalayarak tamamlanmÃ„Â±Ã…Å¸
-    5m mumlarÃ„Â± toplar. VarsayÃ„Â±lan 30 gÃƒÂ¼n ~= 8640 mum.
+    Binance 1000-kline limitini geriye doÃƒâ€Ã…Â¸ru sayfalayarak tamamlanmÃƒâ€Ã‚Â±Ãƒâ€¦Ã…Â¸
+    5m mumlarÃƒâ€Ã‚Â± toplar. VarsayÃƒâ€Ã‚Â±lan 30 gÃƒÆ’Ã‚Â¼n ~= 8640 mum.
     """
     now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
     start_ms = now_ms - (days * 24 * 60 * 60 * 1000)
     end_time = now_ms
     by_open_time = {}
 
-    # 30 gÃƒÂ¼n iÃƒÂ§in yaklaÃ…Å¸Ã„Â±k 9 istek gerekir. GÃƒÂ¼venli ÃƒÂ¼st sÃ„Â±nÃ„Â±r bÃ„Â±rakÃ„Â±yoruz.
+    # 30 gÃƒÆ’Ã‚Â¼n iÃƒÆ’Ã‚Â§in yaklaÃƒâ€¦Ã…Â¸Ãƒâ€Ã‚Â±k 9 istek gerekir. GÃƒÆ’Ã‚Â¼venli ÃƒÆ’Ã‚Â¼st sÃƒâ€Ã‚Â±nÃƒâ€Ã‚Â±r bÃƒâ€Ã‚Â±rakÃƒâ€Ã‚Â±yoruz.
     max_pages = max(2, int((days * 288) / 1000) + 3)
 
     for _ in range(max_pages):
@@ -910,10 +910,10 @@ async def get_5m_candles_days(client, symbol, days=30):
         if oldest_open <= start_ms:
             break
 
-        # Bir ÃƒÂ¶nceki sayfanÃ„Â±n sonundan daha eski veriye git.
+        # Bir ÃƒÆ’Ã‚Â¶nceki sayfanÃƒâ€Ã‚Â±n sonundan daha eski veriye git.
         end_time = oldest_open - 1
 
-        # Binance'a gereksiz burst yapmamak iÃƒÂ§in kÃƒÂ¼ÃƒÂ§ÃƒÂ¼k bir ara.
+        # Binance'a gereksiz burst yapmamak iÃƒÆ’Ã‚Â§in kÃƒÆ’Ã‚Â¼ÃƒÆ’Ã‚Â§ÃƒÆ’Ã‚Â¼k bir ara.
         await asyncio.sleep(0.03)
 
     candles = sorted(
@@ -927,17 +927,17 @@ async def get_5m_candles_days(client, symbol, days=30):
 def historical_trades_v2(candles, symbol):
     """
     V2 research trade modeli:
-    - Sinyal tamamlanmÃ„Â±Ã…Å¸ 5m mum kapanÃ„Â±Ã…Å¸Ã„Â±nda hesaplanÃ„Â±r.
-    - GiriÃ…Å¸ bir sonraki 5m mumun OPEN fiyatÃ„Â±dÃ„Â±r.
-    - Ãƒâ€¡Ã„Â±kÃ„Â±Ã…Å¸ giriÃ…Å¸ten tam 60 dakika sonraki mumun OPEN fiyatÃ„Â±dÃ„Â±r.
-    - AynÃ„Â± coin iÃƒÂ§in giriÃ…Å¸ler arasÃ„Â±nda en az 60 dakika cooldown.
-    - Sabit %0.15 round-trip araÃ…Å¸tÃ„Â±rma maliyeti.
+    - Sinyal tamamlanmÃƒâ€Ã‚Â±Ãƒâ€¦Ã…Â¸ 5m mum kapanÃƒâ€Ã‚Â±Ãƒâ€¦Ã…Â¸Ãƒâ€Ã‚Â±nda hesaplanÃƒâ€Ã‚Â±r.
+    - GiriÃƒâ€¦Ã…Â¸ bir sonraki 5m mumun OPEN fiyatÃƒâ€Ã‚Â±dÃƒâ€Ã‚Â±r.
+    - ÃƒÆ’Ã¢â‚¬Â¡Ãƒâ€Ã‚Â±kÃƒâ€Ã‚Â±Ãƒâ€¦Ã…Â¸ giriÃƒâ€¦Ã…Â¸ten tam 60 dakika sonraki mumun OPEN fiyatÃƒâ€Ã‚Â±dÃƒâ€Ã‚Â±r.
+    - AynÃƒâ€Ã‚Â± coin iÃƒÆ’Ã‚Â§in giriÃƒâ€¦Ã…Â¸ler arasÃƒâ€Ã‚Â±nda en az 60 dakika cooldown.
+    - Sabit %0.15 round-trip araÃƒâ€¦Ã…Â¸tÃƒâ€Ã‚Â±rma maliyeti.
     """
     trades = []
     last_entry_open_time = None
     cooldown_ms = 60 * 60 * 1000
 
-    # i sinyal mumu; i+1 giriÃ…Å¸; i+13 = giriÃ…Å¸ten 60 dk sonraki open.
+    # i sinyal mumu; i+1 giriÃƒâ€¦Ã…Â¸; i+13 = giriÃƒâ€¦Ã…Â¸ten 60 dk sonraki open.
     for i in range(7, len(candles) - 13):
         signal_close = candles[i]["close"]
 
@@ -1108,7 +1108,7 @@ def split_dev_oos(trades):
 
     split_index = int(len(ordered) * 2 / 3)
 
-    # Ãƒâ€¡ok kÃƒÂ¼ÃƒÂ§ÃƒÂ¼k ÃƒÂ¶rneklerde yine kronolojik bir ayrÃ„Â±m yap.
+    # ÃƒÆ’Ã¢â‚¬Â¡ok kÃƒÆ’Ã‚Â¼ÃƒÆ’Ã‚Â§ÃƒÆ’Ã‚Â¼k ÃƒÆ’Ã‚Â¶rneklerde yine kronolojik bir ayrÃƒâ€Ã‚Â±m yap.
     if len(ordered) >= 2:
         split_index = min(
             max(split_index, 1),
@@ -1132,15 +1132,15 @@ async def backtest30(
     ),
 ):
     """
-    30 gÃƒÂ¼nlÃƒÂ¼k ÃƒÂ§oklu-altcoin V2 araÃ…Å¸tÃ„Â±rma backtesti.
+    30 gÃƒÆ’Ã‚Â¼nlÃƒÆ’Ã‚Â¼k ÃƒÆ’Ã‚Â§oklu-altcoin V2 araÃƒâ€¦Ã…Â¸tÃƒâ€Ã‚Â±rma backtesti.
 
     Bu endpoint:
-    - gerÃƒÂ§ek emir ÃƒÂ¼retmez,
-    - paper trade aÃƒÂ§maz,
-    - next-candle-open giriÃ…Å¸ kullanÃ„Â±r,
-    - 60 dk hold + 60 dk same-symbol cooldown kullanÃ„Â±r,
-    - %0.15 maliyet dÃƒÂ¼Ã…Å¸er,
-    - kronolojik DEV/OOS raporu ÃƒÂ¼retir.
+    - gerÃƒÆ’Ã‚Â§ek emir ÃƒÆ’Ã‚Â¼retmez,
+    - paper trade aÃƒÆ’Ã‚Â§maz,
+    - next-candle-open giriÃƒâ€¦Ã…Â¸ kullanÃƒâ€Ã‚Â±r,
+    - 60 dk hold + 60 dk same-symbol cooldown kullanÃƒâ€Ã‚Â±r,
+    - %0.15 maliyet dÃƒÆ’Ã‚Â¼Ãƒâ€¦Ã…Â¸er,
+    - kronolojik DEV/OOS raporu ÃƒÆ’Ã‚Â¼retir.
     """
     try:
         async with httpx.AsyncClient(
@@ -1149,7 +1149,7 @@ async def backtest30(
             universe_data = await build_universe(client)
             selected = universe_data[:count]
 
-            # 30 coin x ~9 Binance sayfasÃ„Â±. Render/Binance iÃƒÂ§in kontrollÃƒÂ¼ eÃ…Å¸zamanlÃ„Â±lÃ„Â±k.
+            # 30 coin x ~9 Binance sayfasÃƒâ€Ã‚Â±. Render/Binance iÃƒÆ’Ã‚Â§in kontrollÃƒÆ’Ã‚Â¼ eÃƒâ€¦Ã…Â¸zamanlÃƒâ€Ã‚Â±lÃƒâ€Ã‚Â±k.
             semaphore = asyncio.Semaphore(3)
 
             async def worker(item):
@@ -1209,8 +1209,8 @@ async def backtest30(
                 }
             )
 
-        # BirleÃ…Å¸ik DEV/OOS coin baÃ…Å¸Ã„Â±na deÃ„Å¸il, tÃƒÂ¼m iÃ…Å¸lemlerin kronolojik
-        # ilk 2/3 ve son 1/3'ÃƒÂ¼ olarak da raporlanÃ„Â±r.
+        # BirleÃƒâ€¦Ã…Â¸ik DEV/OOS coin baÃƒâ€¦Ã…Â¸Ãƒâ€Ã‚Â±na deÃƒâ€Ã…Â¸il, tÃƒÆ’Ã‚Â¼m iÃƒâ€¦Ã…Â¸lemlerin kronolojik
+        # ilk 2/3 ve son 1/3'ÃƒÆ’Ã‚Â¼ olarak da raporlanÃƒâ€Ã‚Â±r.
         combined_dev, combined_oos = split_dev_oos(all_trades)
 
         return {
@@ -1282,12 +1282,12 @@ def ema_series(values, period):
 
 def btc_regime_map_from_5m(candles):
     """
-    BTC 5m verisini 1 saatlik kapanÃ„Â±Ã…Å¸lara indirger.
+    BTC 5m verisini 1 saatlik kapanÃƒâ€Ã‚Â±Ãƒâ€¦Ã…Â¸lara indirger.
     Rejim:
       BULL    = close > EMA50 > EMA200
       BEAR    = close < EMA50 < EMA200
-      NEUTRAL = diÃ„Å¸er durumlar
-    Her 5m zaman damgasÃ„Â± iÃƒÂ§in yalnÃ„Â±zca o ana kadar tamamlanmÃ„Â±Ã…Å¸ 1H bilgi kullanÃ„Â±lÃ„Â±r.
+      NEUTRAL = diÃƒâ€Ã…Â¸er durumlar
+    Her 5m zaman damgasÃƒâ€Ã‚Â± iÃƒÆ’Ã‚Â§in yalnÃƒâ€Ã‚Â±zca o ana kadar tamamlanmÃƒâ€Ã‚Â±Ãƒâ€¦Ã…Â¸ 1H bilgi kullanÃƒâ€Ã‚Â±lÃƒâ€Ã‚Â±r.
     """
     if not candles:
         return {}
@@ -1363,15 +1363,15 @@ def simulate_portfolio_v3(
     allocation_per_trade_pct=20.0,
 ):
     """
-    Daha gerÃƒÂ§ekÃƒÂ§i ortak-portfÃƒÂ¶y araÃ…Å¸tÃ„Â±rma simÃƒÂ¼lasyonu.
+    Daha gerÃƒÆ’Ã‚Â§ekÃƒÆ’Ã‚Â§i ortak-portfÃƒÆ’Ã‚Â¶y araÃƒâ€¦Ã…Â¸tÃƒâ€Ã‚Â±rma simÃƒÆ’Ã‚Â¼lasyonu.
 
-    - BaÃ…Å¸langÃ„Â±ÃƒÂ§ equity = 100.
-    - AynÃ„Â± anda en fazla max_positions.
-    - Her yeni pozisyon baÃ…Å¸langÃ„Â±ÃƒÂ§taki deÃ„Å¸il, o andaki equity'nin sabit yÃƒÂ¼zdesi
-      kadar nominal sermaye kullanÃ„Â±r.
-    - Pozisyonlar 60 dk sonra kapanÃ„Â±r.
-    - AynÃ„Â± timestamp'teki sinyaller deterministik olarak symbol sÃ„Â±rasÃ„Â±na gÃƒÂ¶re iÃ…Å¸lenir.
-    - KaldÃ„Â±raÃƒÂ§ yok; toplam hedef tahsis <= %100.
+    - BaÃƒâ€¦Ã…Â¸langÃƒâ€Ã‚Â±ÃƒÆ’Ã‚Â§ equity = 100.
+    - AynÃƒâ€Ã‚Â± anda en fazla max_positions.
+    - Her yeni pozisyon baÃƒâ€¦Ã…Â¸langÃƒâ€Ã‚Â±ÃƒÆ’Ã‚Â§taki deÃƒâ€Ã…Â¸il, o andaki equity'nin sabit yÃƒÆ’Ã‚Â¼zdesi
+      kadar nominal sermaye kullanÃƒâ€Ã‚Â±r.
+    - Pozisyonlar 60 dk sonra kapanÃƒâ€Ã‚Â±r.
+    - AynÃƒâ€Ã‚Â± timestamp'teki sinyaller deterministik olarak symbol sÃƒâ€Ã‚Â±rasÃƒâ€Ã‚Â±na gÃƒÆ’Ã‚Â¶re iÃƒâ€¦Ã…Â¸lenir.
+    - KaldÃƒâ€Ã‚Â±raÃƒÆ’Ã‚Â§ yok; toplam hedef tahsis <= %100.
     """
     if not trades:
         return {
@@ -1451,7 +1451,7 @@ def simulate_portfolio_v3(
         )
         accepted += 1
 
-    # Kalan pozisyonlarÃ„Â± son exit zamanÃ„Â±na kadar kapat.
+    # Kalan pozisyonlarÃƒâ€Ã‚Â± son exit zamanÃƒâ€Ã‚Â±na kadar kapat.
     if active:
         final_ms = max(x["exit_ms"] for x in active)
         close_due(final_ms)
@@ -1482,13 +1482,13 @@ async def backtest90(
 ):
     """
     ALT-MOMENTUM V3:
-    - 30-90 gÃƒÂ¼n sayfalÃ„Â± 5m veri
-    - next-candle-open giriÃ…Å¸
+    - 30-90 gÃƒÆ’Ã‚Â¼n sayfalÃƒâ€Ã‚Â± 5m veri
+    - next-candle-open giriÃƒâ€¦Ã…Â¸
     - 60 dk hold / 60 dk same-symbol cooldown
     - %0.15 round-trip cost
     - BTC 1H EMA50/EMA200 piyasa rejimi
     - kronolojik DEV/OOS
-    - max 5 eÃ…Å¸zamanlÃ„Â± pozisyonlu ortak portfÃƒÂ¶y simÃƒÂ¼lasyonu
+    - max 5 eÃƒâ€¦Ã…Â¸zamanlÃƒâ€Ã‚Â± pozisyonlu ortak portfÃƒÆ’Ã‚Â¶y simÃƒÆ’Ã‚Â¼lasyonu
     """
     try:
         async with httpx.AsyncClient(
@@ -1497,7 +1497,7 @@ async def backtest90(
             universe_data = await build_universe(client)
             selected = universe_data[:count]
 
-            # Ãƒâ€“nce BTC rejim verisi.
+            # ÃƒÆ’Ã¢â‚¬â€œnce BTC rejim verisi.
             btc_candles = await get_5m_candles_days(
                 client,
                 "BTCUSDT",
@@ -1507,7 +1507,7 @@ async def backtest90(
                 btc_candles
             )
 
-            # 90 gÃƒÂ¼n x 30 coin aÃ„Å¸Ã„Â±r bir iÃ…Å¸; kontrollÃƒÂ¼ concurrency.
+            # 90 gÃƒÆ’Ã‚Â¼n x 30 coin aÃƒâ€Ã…Â¸Ãƒâ€Ã‚Â±r bir iÃƒâ€¦Ã…Â¸; kontrollÃƒÆ’Ã‚Â¼ concurrency.
             semaphore = asyncio.Semaphore(3)
 
             async def worker(item):
@@ -1579,7 +1579,7 @@ async def backtest90(
             all_trades
         )
 
-        # PortfÃƒÂ¶y simÃƒÂ¼lasyonu aynÃ„Â± birleÃ…Å¸ik kronolojik trade akÃ„Â±Ã…Å¸Ã„Â±nda.
+        # PortfÃƒÆ’Ã‚Â¶y simÃƒÆ’Ã‚Â¼lasyonu aynÃƒâ€Ã‚Â± birleÃƒâ€¦Ã…Â¸ik kronolojik trade akÃƒâ€Ã‚Â±Ãƒâ€¦Ã…Â¸Ãƒâ€Ã‚Â±nda.
         portfolio_all = simulate_portfolio_v3(
             all_trades
         )
@@ -1677,13 +1677,13 @@ async def backtest90(
 
 def continuation_events_v4(candles, symbol):
     """
-    AmaÃƒÂ§ tahmin etmek deÃ„Å¸il:
-    Coin ZATEN yÃƒÂ¼kselmiÃ…Å¸ken ve hacim artmÃ„Â±Ã…Å¸ken, sonraki 60 dakikada
-    hareket devam ediyor mu sorusunu ÃƒÂ¶lÃƒÂ§mek.
+    AmaÃƒÆ’Ã‚Â§ tahmin etmek deÃƒâ€Ã…Â¸il:
+    Coin ZATEN yÃƒÆ’Ã‚Â¼kselmiÃƒâ€¦Ã…Â¸ken ve hacim artmÃƒâ€Ã‚Â±Ãƒâ€¦Ã…Â¸ken, sonraki 60 dakikada
+    hareket devam ediyor mu sorusunu ÃƒÆ’Ã‚Â¶lÃƒÆ’Ã‚Â§mek.
 
-    Sinyal tamamlanmÃ„Â±Ã…Å¸ 5m mum kapanÃ„Â±Ã…Å¸Ã„Â±nda gÃƒÂ¶rÃƒÂ¼lÃƒÂ¼r.
-    GiriÃ…Å¸ bir sonraki 5m mum OPEN.
-    Ãƒâ€¡Ã„Â±kÃ„Â±Ã…Å¸ 60 dakika sonraki OPEN.
+    Sinyal tamamlanmÃƒâ€Ã‚Â±Ãƒâ€¦Ã…Â¸ 5m mum kapanÃƒâ€Ã‚Â±Ãƒâ€¦Ã…Â¸Ãƒâ€Ã‚Â±nda gÃƒÆ’Ã‚Â¶rÃƒÆ’Ã‚Â¼lÃƒÆ’Ã‚Â¼r.
+    GiriÃƒâ€¦Ã…Â¸ bir sonraki 5m mum OPEN.
+    ÃƒÆ’Ã¢â‚¬Â¡Ãƒâ€Ã‚Â±kÃƒâ€Ã‚Â±Ãƒâ€¦Ã…Â¸ 60 dakika sonraki OPEN.
     """
     events = []
 
@@ -1704,7 +1704,7 @@ def continuation_events_v4(candles, symbol):
             if avg_volume > 0 else 0
         )
 
-        # Sadece halihazÃ„Â±rda yÃƒÂ¼kselmiÃ…Å¸ hareketleri inceliyoruz.
+        # Sadece halihazÃƒâ€Ã‚Â±rda yÃƒÆ’Ã‚Â¼kselmiÃƒâ€¦Ã…Â¸ hareketleri inceliyoruz.
         if mom5 <= 0 or mom15 <= 0 or mom30 < 0.50:
             continue
 
@@ -1745,8 +1745,8 @@ def bucket_label(value, cuts, labels):
 
 def continuation_bucket_report(events):
     """
-    Ãƒâ€“nceden belirlenmiÃ…Å¸ geniÃ…Å¸ kovalar.
-    Bunlar optimize edilmiÃ…Å¸ giriÃ…Å¸ eÃ…Å¸ikleri deÃ„Å¸ildir; davranÃ„Â±Ã…Å¸Ã„Â± gÃƒÂ¶rmek iÃƒÂ§indir.
+    ÃƒÆ’Ã¢â‚¬â€œnceden belirlenmiÃƒâ€¦Ã…Â¸ geniÃƒâ€¦Ã…Â¸ kovalar.
+    Bunlar optimize edilmiÃƒâ€¦Ã…Â¸ giriÃƒâ€¦Ã…Â¸ eÃƒâ€¦Ã…Â¸ikleri deÃƒâ€Ã…Â¸ildir; davranÃƒâ€Ã‚Â±Ãƒâ€¦Ã…Â¸Ãƒâ€Ã‚Â± gÃƒÆ’Ã‚Â¶rmek iÃƒÆ’Ã‚Â§indir.
     """
     momentum_labels = [
         "0.50-0.99%",
@@ -1834,8 +1834,8 @@ async def continuation90(
 ):
     """
     V4 continuation study:
-    'Hangisi yÃƒÂ¼kselecek?' deÃ„Å¸il,
-    'Zaten yÃƒÂ¼kselmiÃ…Å¸ coin ne zaman yÃƒÂ¼kselmeye devam ediyor?' testi.
+    'Hangisi yÃƒÆ’Ã‚Â¼kselecek?' deÃƒâ€Ã…Â¸il,
+    'Zaten yÃƒÆ’Ã‚Â¼kselmiÃƒâ€¦Ã…Â¸ coin ne zaman yÃƒÆ’Ã‚Â¼kselmeye devam ediyor?' testi.
     """
     try:
         async with httpx.AsyncClient(
@@ -1951,19 +1951,19 @@ async def continuation90(
 
 def continuation_quality_events_v5(candles, symbol):
     """
-    V5: Coin zaten yÃƒÂ¼kselmiÃ…Å¸ken hareketin KALÃ„Â°TESÃ„Â°NÃ„Â° ÃƒÂ¶lÃƒÂ§er.
-    GeleceÃ„Å¸i tahmin eden ÃƒÂ¶zellik kullanÃ„Â±lmaz.
+    V5: Coin zaten yÃƒÆ’Ã‚Â¼kselmiÃƒâ€¦Ã…Â¸ken hareketin KALÃƒâ€Ã‚Â°TESÃƒâ€Ã‚Â°NÃƒâ€Ã‚Â° ÃƒÆ’Ã‚Â¶lÃƒÆ’Ã‚Â§er.
+    GeleceÃƒâ€Ã…Â¸i tahmin eden ÃƒÆ’Ã‚Â¶zellik kullanÃƒâ€Ã‚Â±lmaz.
 
-    Sinyal anÃ„Â±nda bilinenler:
-    - son 30m yÃƒÂ¼kseliÃ…Å¸
-    - son altÃ„Â± 5m getirinin yapÃ„Â±sÃ„Â±
-    - pozitif 5m mum sayÃ„Â±sÃ„Â±
-    - son 15m / ilk 15m momentum karÃ…Å¸Ã„Â±laÃ…Å¸tÃ„Â±rmasÃ„Â±
-    - 30m iÃƒÂ§i peak'ten mevcut close'a geri ÃƒÂ§ekilme
-    - son 3 mum hacminin ÃƒÂ¶nceki 3 muma gÃƒÂ¶re devamlÃ„Â±lÃ„Â±Ã„Å¸Ã„Â±
+    Sinyal anÃƒâ€Ã‚Â±nda bilinenler:
+    - son 30m yÃƒÆ’Ã‚Â¼kseliÃƒâ€¦Ã…Â¸
+    - son altÃƒâ€Ã‚Â± 5m getirinin yapÃƒâ€Ã‚Â±sÃƒâ€Ã‚Â±
+    - pozitif 5m mum sayÃƒâ€Ã‚Â±sÃƒâ€Ã‚Â±
+    - son 15m / ilk 15m momentum karÃƒâ€¦Ã…Â¸Ãƒâ€Ã‚Â±laÃƒâ€¦Ã…Â¸tÃƒâ€Ã‚Â±rmasÃƒâ€Ã‚Â±
+    - 30m iÃƒÆ’Ã‚Â§i peak'ten mevcut close'a geri ÃƒÆ’Ã‚Â§ekilme
+    - son 3 mum hacminin ÃƒÆ’Ã‚Â¶nceki 3 muma gÃƒÆ’Ã‚Â¶re devamlÃƒâ€Ã‚Â±lÃƒâ€Ã‚Â±Ãƒâ€Ã…Â¸Ãƒâ€Ã‚Â±
 
-    GiriÃ…Å¸: sonraki 5m OPEN
-    Ãƒâ€¡Ã„Â±kÃ„Â±Ã…Å¸: giriÃ…Å¸ten 60m sonraki OPEN
+    GiriÃƒâ€¦Ã…Â¸: sonraki 5m OPEN
+    ÃƒÆ’Ã¢â‚¬Â¡Ãƒâ€Ã‚Â±kÃƒâ€Ã‚Â±Ãƒâ€¦Ã…Â¸: giriÃƒâ€¦Ã…Â¸ten 60m sonraki OPEN
     """
     events = []
 
@@ -1974,7 +1974,7 @@ def continuation_quality_events_v5(candles, symbol):
         mom15 = pct_change(candles[i - 3]["close"], signal_close)
         mom30 = pct_change(candles[i - 6]["close"], signal_close)
 
-        # Biz sadece zaten yÃƒÂ¼kselmiÃ…Å¸ hareketleri inceliyoruz.
+        # Biz sadece zaten yÃƒÆ’Ã‚Â¼kselmiÃƒâ€¦Ã…Â¸ hareketleri inceliyoruz.
         if mom5 <= 0 or mom15 <= 0 or mom30 < 0.50:
             continue
 
@@ -2059,9 +2059,9 @@ def continuation_quality_events_v5(candles, symbol):
 
 def quality_bucket_report_v5(events):
     """
-    Tek deÃ„Å¸iÃ…Å¸kenli davranÃ„Â±Ã…Å¸ raporu.
-    AmaÃƒÂ§ en iyi hÃƒÂ¼creyi seÃƒÂ§mek deÃ„Å¸il, hangi hareket ÃƒÂ¶zelliklerinin
-    OOS'ta continuation ile iliÃ…Å¸kili olduÃ„Å¸unu gÃƒÂ¶rmek.
+    Tek deÃƒâ€Ã…Â¸iÃƒâ€¦Ã…Â¸kenli davranÃƒâ€Ã‚Â±Ãƒâ€¦Ã…Â¸ raporu.
+    AmaÃƒÆ’Ã‚Â§ en iyi hÃƒÆ’Ã‚Â¼creyi seÃƒÆ’Ã‚Â§mek deÃƒâ€Ã…Â¸il, hangi hareket ÃƒÆ’Ã‚Â¶zelliklerinin
+    OOS'ta continuation ile iliÃƒâ€¦Ã…Â¸kili olduÃƒâ€Ã…Â¸unu gÃƒÆ’Ã‚Â¶rmek.
     """
     dimensions = {
         "positive_candle_count": [
@@ -2106,9 +2106,9 @@ def quality_bucket_report_v5(events):
 
 def focused_continuation_zone_v5(events):
     """
-    V4'te keÃ…Å¸fedilen genel bÃƒÂ¶lgeyi ayrÃ„Â± raporlar:
+    V4'te keÃƒâ€¦Ã…Â¸fedilen genel bÃƒÆ’Ã‚Â¶lgeyi ayrÃƒâ€Ã‚Â± raporlar:
     30m momentum 1.0%-1.99%.
-    Burada yeni kalite ÃƒÂ¶zelliklerini inceliyoruz; yeni eÃ…Å¸ik optimize etmiyoruz.
+    Burada yeni kalite ÃƒÆ’Ã‚Â¶zelliklerini inceliyoruz; yeni eÃƒâ€¦Ã…Â¸ik optimize etmiyoruz.
     """
     return [
         e for e in events
@@ -2221,9 +2221,9 @@ async def continuation_quality90(
 
 def combo_hypotheses_v6():
     """
-    Ãƒâ€“nceden tanÃ„Â±mlÃ„Â± continuation hipotezleri.
-    AmaÃƒÂ§ OOS sonucuna gÃƒÂ¶re eÃ…Å¸ik uydurmak deÃ„Å¸il; V4/V5'te gÃƒÂ¶zlenen
-    yapÃ„Â±larÃ„Â± ayrÃ„Â±, anlaÃ…Å¸Ã„Â±lÃ„Â±r hipotezler olarak test etmektir.
+    ÃƒÆ’Ã¢â‚¬â€œnceden tanÃƒâ€Ã‚Â±mlÃƒâ€Ã‚Â± continuation hipotezleri.
+    AmaÃƒÆ’Ã‚Â§ OOS sonucuna gÃƒÆ’Ã‚Â¶re eÃƒâ€¦Ã…Â¸ik uydurmak deÃƒâ€Ã…Â¸il; V4/V5'te gÃƒÆ’Ã‚Â¶zlenen
+    yapÃƒâ€Ã‚Â±larÃƒâ€Ã‚Â± ayrÃƒâ€Ã‚Â±, anlaÃƒâ€¦Ã…Â¸Ãƒâ€Ã‚Â±lÃƒâ€Ã‚Â±r hipotezler olarak test etmektir.
     """
     return [
         (
@@ -2341,7 +2341,7 @@ async def continuation_combo90(
         cooled = apply_symbol_cooldown_v4(raw, 60)
         dev, oos = split_dev_oos(cooled)
 
-        # AyrÃ„Â± coin geniÃ…Å¸liÃ„Å¸i: sonuÃƒÂ§ tek/az sayÃ„Â±da coin tarafÃ„Â±ndan mÃ„Â± taÃ…Å¸Ã„Â±nÃ„Â±yor?
+        # AyrÃƒâ€Ã‚Â± coin geniÃƒâ€¦Ã…Â¸liÃƒâ€Ã…Â¸i: sonuÃƒÆ’Ã‚Â§ tek/az sayÃƒâ€Ã‚Â±da coin tarafÃƒâ€Ã‚Â±ndan mÃƒâ€Ã‚Â± taÃƒâ€¦Ã…Â¸Ãƒâ€Ã‚Â±nÃƒâ€Ã‚Â±yor?
         breadth = {}
         for name, predicate in combo_hypotheses_v6():
             coin_rows = []
@@ -2690,13 +2690,13 @@ async def h6_validate_v7(
 
 def enrich_h6_with_regime_v8(events, alt_candles, btc_candles):
     """
-    V8: H6 eÃ…Å¸iklerine DOKUNMADAN, sinyal anÃ„Â±ndaki rejimi ekler.
-    Gelecek veri kullanÃ„Â±lmaz.
+    V8: H6 eÃƒâ€¦Ã…Â¸iklerine DOKUNMADAN, sinyal anÃƒâ€Ã‚Â±ndaki rejimi ekler.
+    Gelecek veri kullanÃƒâ€Ã‚Â±lmaz.
 
-    Rejim deÃ„Å¸iÃ…Å¸kenleri:
+    Rejim deÃƒâ€Ã…Â¸iÃƒâ€¦Ã…Â¸kenleri:
       BTC 1h / 4h / 24h return
       ALT 1h / 4h / 24h return
-    5m tamamlanmÃ„Â±Ã…Å¸ mumlardan hesaplanÃ„Â±r.
+    5m tamamlanmÃƒâ€Ã‚Â±Ãƒâ€¦Ã…Â¸ mumlardan hesaplanÃƒâ€Ã‚Â±r.
     """
     alt_by_close = {c["close_time"]: idx for idx, c in enumerate(alt_candles)}
     btc_by_close = {c["close_time"]: idx for idx, c in enumerate(btc_candles)}
@@ -2768,9 +2768,9 @@ def enrich_h6_with_regime_v8(events, alt_candles, btc_candles):
 
 def regime_report_v8(events):
     """
-    Ãƒâ€“nceden tanÃ„Â±mlÃ„Â±, kaba rejim ayrÃ„Â±mlarÃ„Â±.
-    AmaÃƒÂ§ 'en iyi eÃ…Å¸ik' aramak deÃ„Å¸il; H6'nÃ„Â±n hangi piyasa yÃƒÂ¶nÃƒÂ¼nde
-    bozulduÃ„Å¸unu veya iyileÃ…Å¸tiÃ„Å¸ini gÃƒÂ¶rmek.
+    ÃƒÆ’Ã¢â‚¬â€œnceden tanÃƒâ€Ã‚Â±mlÃƒâ€Ã‚Â±, kaba rejim ayrÃƒâ€Ã‚Â±mlarÃƒâ€Ã‚Â±.
+    AmaÃƒÆ’Ã‚Â§ 'en iyi eÃƒâ€¦Ã…Â¸ik' aramak deÃƒâ€Ã…Â¸il; H6'nÃƒâ€Ã‚Â±n hangi piyasa yÃƒÆ’Ã‚Â¶nÃƒÆ’Ã‚Â¼nde
+    bozulduÃƒâ€Ã…Â¸unu veya iyileÃƒâ€¦Ã…Â¸tiÃƒâ€Ã…Â¸ini gÃƒÆ’Ã‚Â¶rmek.
     """
     regimes = [
         ("ALL", lambda e: True),
@@ -5732,7 +5732,7 @@ async def v18_regime_validate(
         }
 
 # =========================
-# V18 LIGHT Ã¢â‚¬â€ RENDER SAFE
+# V18 LIGHT ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â RENDER SAFE
 # =========================
 @app.get("/v18-light")
 async def v18_light():
@@ -7163,7 +7163,7 @@ async def v27_status():
     }
 
 # ============================================================
-# V28 CHALLENGER DIAGNOSTIC Ã¢â‚¬â€ SIGNAL FUNNEL ONLY
+# V28 CHALLENGER DIAGNOSTIC ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â SIGNAL FUNNEL ONLY
 # V27 forward paper remains unchanged.
 # No orders, no live trading, no V28 paper entries yet.
 # ============================================================
@@ -7761,7 +7761,7 @@ async def v28_btc_block(
 
 
 # ============================================================
-# V29 TOP-N CONTINUATION RANKING Ã¢â‚¬â€ LIGHT 3-DAY BLOCK
+# V29 TOP-N CONTINUATION RANKING ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â LIGHT 3-DAY BLOCK
 # Research only. V27 forward paper remains untouched.
 # Ranking uses information already known at the 60m decision point.
 # ============================================================
@@ -8172,7 +8172,7 @@ async def v30_confirmation_top1(
 
 
 # ============================================================
-# V31 REGIME DIAGNOSTIC Ã¢â‚¬â€ TOP1 / 60M FROZEN CHALLENGER
+# V31 REGIME DIAGNOSTIC ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â TOP1 / 60M FROZEN CHALLENGER
 # Research only. No V27/V29/V30 forward logic is changed.
 # All regime variables are known at the entry decision time.
 # ============================================================
@@ -8401,7 +8401,7 @@ async def v31_regime_block(
 
 
 # ============================================================
-# V32 FORWARD CHALLENGER Ã¢â‚¬â€ FROZEN AFTER V31
+# V32 FORWARD CHALLENGER ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â FROZEN AFTER V31
 # BTC-independent + Top1 + 60m confirmation + 120m hold
 # Separate PostgreSQL state/table. V27 state/rules untouched.
 # Research paper only; no trading/orders.
@@ -8955,7 +8955,7 @@ async def v32_scan_once():
 
 
 # ============================================================
-# V87 Ã¢â‚¬â€ V86 FORWARD QUALITY TAG (OBSERVATIONAL ONLY)
+# V87 ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â V86 FORWARD QUALITY TAG (OBSERVATIONAL ONLY)
 # Adds frozen V86 0..4 quality score to NEW V32 paper entries
 # and Telegram ENTRY messages. Does NOT gate entries/exits.
 # ============================================================
@@ -13123,7 +13123,7 @@ async def v61_event_study():
 
 
 # ============================================================
-# V61.2 Ã¢â‚¬â€ PERSISTENT SAFE EVENT-STUDY CONTROL PLANE
+# V61.2 ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â PERSISTENT SAFE EVENT-STUDY CONTROL PLANE
 # ============================================================
 V612_JOB = {
     "status": "IDLE",
@@ -13361,7 +13361,7 @@ async def v612_start(
 
 
 # ============================================================
-# V62 SHADOW CHALLENGER Ã¢â‚¬â€ RESEARCH ONLY
+# V62 SHADOW CHALLENGER ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â RESEARCH ONLY
 # Active V61.1/V55 entries, FAST_3S exits and paper state are untouched.
 # Goal: compare timing, not promote a new strategy.
 # ============================================================
@@ -13566,7 +13566,7 @@ async def v62_shadow_status():
 
 
 # ============================================================
-# V63 Ã¢â‚¬â€ PULLBACK/REACCEL EXIT VALIDATION (RESEARCH ONLY)
+# V63 ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â PULLBACK/REACCEL EXIT VALIDATION (RESEARCH ONLY)
 # Entry is frozen from V62. No active V61/V55/FAST_3S changes.
 # Predeclared exits: TIME120, hard -3%, catastrophe -5%, late trailing.
 # ============================================================
@@ -13667,7 +13667,7 @@ async def v63_validation_status():
 
 
 # ============================================================
-# V64 Ã¢â‚¬â€ WINNER vs LOSER DIAGNOSTIC (RESEARCH ONLY)
+# V64 ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â WINNER vs LOSER DIAGNOSTIC (RESEARCH ONLY)
 # Frozen V62 pullback/reaccel entry + TIME120 control.
 # Descriptive diagnostics only: NO filter promotion / NO strategy change.
 # ============================================================
@@ -13790,7 +13790,7 @@ async def v64_diagnostic_status():
 BINANCE_BASE = "https://api.binance.com"
 
 # ============================================================
-# V65 Ã¢â‚¬â€ COMBINED EARLY BREAKOUT CHALLENGER (PAPER/RESEARCH ONLY)
+# V65 ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â COMBINED EARLY BREAKOUT CHALLENGER (PAPER/RESEARCH ONLY)
 # Adds: Binance server-time offset, immediate live ASK forward helper,
 # and a predeclared early breakout challenger (>=0.50% 5m + volume ratio >=1.20).
 # Existing V61/V55/FAST_3S control remains unchanged.
@@ -13913,7 +13913,7 @@ async def v65_time_sync():
 
 
 # ============================================================
-# V66 Ã¢â‚¬â€ EARLY BREAKOUT: MICRO-CONFIRMATION + FAILURE EXIT STUDY
+# V66 ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â EARLY BREAKOUT: MICRO-CONFIRMATION + FAILURE EXIT STUDY
 # Research only. Active V61/V55/FAST_3S remains unchanged.
 # Frozen source breakout: >=0.50% completed 5m candle + volume ratio >=1.20.
 # ============================================================
@@ -13999,7 +13999,7 @@ async def v66_status():return {**MODE_INFO,'status':'OK','panel':'V66_BREAKOUT_F
 
 
 # ============================================================
-# V67 Ã¢â‚¬â€ CONFIRM_10M POST-ENTRY WINNER/LOSER DIAGNOSTIC
+# V67 ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â CONFIRM_10M POST-ENTRY WINNER/LOSER DIAGNOSTIC
 # Frozen entry: +0.50% 5m breakout, volume >=1.20x, 10m confirmation.
 # Exit label/control: TIME120. Diagnostic only; no strategy change.
 # ============================================================
@@ -14072,7 +14072,7 @@ async def v67_status():return {**MODE_INFO,'status':'OK','panel':'V67_POST_ENTRY
 
 
 # ============================================================
-# V68 Ã¢â‚¬â€ FROZEN CONFIRM_10M + MOMENTUM FAILURE EXIT VALIDATION
+# V68 ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â FROZEN CONFIRM_10M + MOMENTUM FAILURE EXIT VALIDATION
 # Entry unchanged from V66/V67.
 # Predeclared exit challengers only; no threshold mining.
 # ============================================================
@@ -14182,7 +14182,7 @@ async def v68_status():
 
 
 # ============================================================
-# V69 Ã¢â‚¬â€ DYNAMIC BTC + MARKET REGIME VALIDATION
+# V69 ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â DYNAMIC BTC + MARKET REGIME VALIDATION
 # Frozen entry: V66 CONFIRM_10M. Frozen exit: TIME120.
 # Regime research only; active forward strategy unchanged.
 # ============================================================
@@ -14302,7 +14302,7 @@ async def v69_status():
 
 
 # ============================================================
-# V70 Ã¢â‚¬â€ BTC30 x ALT-BREADTH REGIME INTERSECTION VALIDATION
+# V70 ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â BTC30 x ALT-BREADTH REGIME INTERSECTION VALIDATION
 # Frozen entry: V66 CONFIRM_10M. Frozen exit: TIME120.
 # No new thresholds; validates the V69 intersection hypothesis.
 # ============================================================
@@ -14398,7 +14398,7 @@ async def v70_status():
 
 
 # ============================================================
-# V71 Ã¢â‚¬â€ GOOD vs BAD REGIME DIAGNOSTIC
+# V71 ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â GOOD vs BAD REGIME DIAGNOSTIC
 # Frozen cohort: V70 primary candidate
 # BTC30 > 0 AND ALT breadth30 > 0
 # Frozen entry V66 CONFIRM_10M + TIME120.
@@ -14520,7 +14520,7 @@ async def v71_status():
 
 
 # ============================================================
-# V72 Ã¢â‚¬â€ 4H MARKET BREADTH MONOTONICITY / BTC4H CROSS-CHECK
+# V72 ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â 4H MARKET BREADTH MONOTONICITY / BTC4H CROSS-CHECK
 # Frozen cohort: V70 BTC30>0 AND ALT breadth30>0
 # Frozen entry V66 CONFIRM_10M + TIME120.
 # Quantile buckets are descriptive; no optimized numeric cutoff.
@@ -14643,7 +14643,7 @@ async def v73_fetch_window(client, symbol, start_ms, end_ms):
     return sorted(out.values(),key=lambda x:x["open_time"])
 
 # ============================================================
-# V73.4 Ã¢â‚¬â€ TRUE RESUME OOS MID-ZONE VALIDATION
+# V73.4 ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â TRUE RESUME OOS MID-ZONE VALIDATION
 # Operational durability only. Frozen research rules are unchanged.
 # Per-symbol candles are persisted to PostgreSQL so a Render restart resumes
 # from the first unfinished symbol instead of restarting the study.
@@ -14863,7 +14863,7 @@ async def v73_status():
 
 
 # ============================================================
-# V74 Ã¢â‚¬â€ PROSPECTIVE PAPER: FROZEN MID-REGIME HYPOTHESIS
+# V74 ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â PROSPECTIVE PAPER: FROZEN MID-REGIME HYPOTHESIS
 # User-requested prospective application of the latest hypothesis.
 # PAPER ONLY. No exchange orders. Active V61/V55/FAST_3S remains untouched.
 #
@@ -15050,7 +15050,7 @@ async def v74_status():
 
 
 # ============================================================
-# V75 Ã¢â‚¬â€ COMBINED VALIDATION PANEL
+# V75 ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â COMBINED VALIDATION PANEL
 # Runs alongside V74 prospective paper strategy.
 # Combines:
 # 1) independent older OOS,
@@ -15246,7 +15246,7 @@ async def v75_status():
 
 
 # ============================================================
-# V76 Ã¢â‚¬â€ LOW-RAM COMBINED OOS VALIDATION
+# V76 ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â LOW-RAM COMBINED OOS VALIDATION
 # Reuses V75 durable candle cache, but rebuilds ONLY compact arrays needed by
 # frozen V66/V70/V72 validation. It does NOT call v61_extract_symbol.
 # V74 prospective paper loop remains unchanged and continues independently.
@@ -15397,7 +15397,7 @@ async def v76_status():
 
 
 # ============================================================
-# V77 Ã¢â‚¬â€ REGIME SHIFT DIAGNOSTIC
+# V77 ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â REGIME SHIFT DIAGNOSTIC
 # Diagnostic only. Explains why frozen BASE V70 performs differently across time.
 # No threshold selection, no strategy promotion, no real orders.
 # Reuses V75 durable OOS cache and V76 compact-memory approach.
@@ -15603,7 +15603,7 @@ async def v77_status():
 
 
 # ============================================================
-# V78 Ã¢â‚¬â€ REGIME STRUCTURE VALIDATION
+# V78 ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â REGIME STRUCTURE VALIDATION
 # Frozen entry/exit: V66 CONFIRM_10M + TIME120.
 # Tests 24h BTC/ALT regime + dispersion structure.
 # Research only; no orders; active V61/V74 unchanged.
@@ -15819,7 +15819,7 @@ async def v78_status():
 
 
 # ============================================================
-# V79 Ã¢â‚¬â€ NEWER 40D DISPERSION VALIDATION
+# V79 ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â NEWER 40D DISPERSION VALIDATION
 # Independent newer window, frozen V66 CONFIRM10 + TIME120.
 # Tests V78 discovery hypothesis without retuning:
 # CONTROL vs HIGH dispersion using FROZEN V78 cutoff 0.69157.
@@ -16021,7 +16021,7 @@ async def v79_status():
 
 
 # ============================================================
-# V79.4 Ã¢â‚¬â€ RESUMABLE / RESTART-SAFE WORKER
+# V79.4 ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â RESUMABLE / RESTART-SAFE WORKER
 # Scientific rules unchanged. This is operational resilience only.
 # - persistent job definition/checkpoint
 # - auto-resume after Render restart
@@ -16198,7 +16198,7 @@ async def v794_status():
 
 
 # ============================================================
-# V80 Ã¢â‚¬â€ REGIME TRANSITION DIAGNOSTIC
+# V80 ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â REGIME TRANSITION DIAGNOSTIC
 # Diagnostic only: compare V79 newer-window bad half vs good half.
 # No new thresholds, no strategy promotion, no execution changes.
 # Reuses durable V79 cache and frozen V66/BASE-V70 cohort.
@@ -16421,7 +16421,7 @@ async def v801_status():
 
 
 # ============================================================
-# V81 Ã¢â‚¬â€ COMPREHENSIVE REGIME RESEARCH ENGINE
+# V81 ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â COMPREHENSIVE REGIME RESEARCH ENGINE
 # One deploy / one start:
 # 1) reconstruct frozen V66 + BASE-V70 + TIME120 cohort
 # 2) attach regime context
@@ -16661,7 +16661,7 @@ async def v81_status():
 
 
 # ============================================================
-# V82 Ã¢â‚¬â€ ONE-SHOT INDEPENDENT OOS + FINALIST REGIME VALIDATION
+# V82 ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â ONE-SHOT INDEPENDENT OOS + FINALIST REGIME VALIDATION
 #
 # Purpose:
 # - Keep active V61/V74 untouched.
@@ -17059,7 +17059,7 @@ async def v82_autoresume_startup():
 
 
 # ============================================================
-# V83 Ã¢â‚¬â€ CAUSAL EDGE-STATE ENGINE
+# V83 ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â CAUSAL EDGE-STATE ENGINE
 # ============================================================
 # Research only. Active V61/V74 unchanged.
 # Uses V82's frozen older 60d cohort/cache.
@@ -17291,7 +17291,7 @@ async def v83_status():
 
 
 # ============================================================
-# V83.1 Ã¢â‚¬â€ LOW-RAM + POSTGRES PERSISTENT EDGE-STATE
+# V83.1 ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â LOW-RAM + POSTGRES PERSISTENT EDGE-STATE
 # New endpoints: /v831-start and /v831-status
 # ============================================================
 
@@ -17546,7 +17546,7 @@ async def v831_resume():
 
 
 # ============================================================
-# V84 Ã¢â‚¬â€ FROZEN 90D OLDER OOS EDGE-STATE VALIDATION
+# V84 ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â FROZEN 90D OLDER OOS EDGE-STATE VALIDATION
 # Research/paper only. V61/V74 unchanged.
 # Frozen V83.1 rule: previous 30 completed trades PF > 1.05 AND mean > 0.
 # Window: 90d ending exactly where V82 report window begins.
@@ -17789,7 +17789,7 @@ async def v84_resume():
 
 
 # ============================================================
-# V85 Ã¢â‚¬â€ COMBINED WINNER/LOSER + MARKET-STATE DISCOVERY
+# V85 ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â COMBINED WINNER/LOSER + MARKET-STATE DISCOVERY
 # Uses frozen V82 + V84 cohorts. NO threshold fitting.
 # Automatically sends an OBSERVATIONAL research summary to Telegram.
 # Active V61/V74 signal logic remains unchanged.
@@ -17942,22 +17942,22 @@ def v85_load_window(which):
 def v85_tg_text(result):
     stable=[x for x in result["feature_stability"] if x["status"]=="STABLE_OBSERVATIONAL"]
     lines=[
-        "ÄŸÅ¸â€Â¬ V85 MARKET-STATE / WINNER-LOSER",
-        "OBSERVATIONAL ONLY Ã¢â‚¬â€ sinyal engellemez",
+        "Ã„Å¸Ã…Â¸Ã¢â‚¬ÂÃ‚Â¬ V85 MARKET-STATE / WINNER-LOSER",
+        "OBSERVATIONAL ONLY ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â sinyal engellemez",
         "",
         f"V84: n={result['windows']['V84']['performance']['n']} PF={result['windows']['V84']['performance']['pf']}",
         f"V82: n={result['windows']['V82']['performance']['n']} PF={result['windows']['V82']['performance']['pf']}",
-        f"BirleÃ…Å¸ik: n={result['combined']['performance']['n']} PF={result['combined']['performance']['pf']}",
+        f"BirleÃƒâ€¦Ã…Â¸ik: n={result['combined']['performance']['n']} PF={result['combined']['performance']['pf']}",
         "",
-        "Zamanlar arasÃ„Â± daha istikrarlÃ„Â± ÃƒÂ¶zellikler:"
+        "Zamanlar arasÃƒâ€Ã‚Â± daha istikrarlÃƒâ€Ã‚Â± ÃƒÆ’Ã‚Â¶zellikler:"
     ]
     if stable:
         for x in stable[:5]:
-            arrow="Ã¢â€ â€˜" if x["v82_diff"]>0 else "Ã¢â€ â€œ"
-            lines.append(f"Ã¢â‚¬Â¢ {x['feature']} {arrow} | blok {x['block_direction_agreement']} | etki {x['average_abs_effect']}")
+            arrow="ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬Ëœ" if x["v82_diff"]>0 else "ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬Å“"
+            lines.append(f"ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¢ {x['feature']} {arrow} | blok {x['block_direction_agreement']} | etki {x['average_abs_effect']}")
     else:
-        lines.append("Ã¢â‚¬Â¢ GÃƒÂ¼venilir tekrar eden ÃƒÂ¶zellik bulunmadÃ„Â±.")
-    lines += ["","V61/V74 deÃ„Å¸iÃ…Å¸medi. GerÃƒÂ§ek emir yok."]
+        lines.append("ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¢ GÃƒÆ’Ã‚Â¼venilir tekrar eden ÃƒÆ’Ã‚Â¶zellik bulunmadÃƒâ€Ã‚Â±.")
+    lines += ["","V61/V74 deÃƒâ€Ã…Â¸iÃƒâ€¦Ã…Â¸medi. GerÃƒÆ’Ã‚Â§ek emir yok."]
     return "\n".join(lines)
 
 async def v85_run():
@@ -18045,7 +18045,7 @@ async def v85_resume():
 
 
 # ============================================================
-# V86 Ã¢â‚¬â€ FROZEN 4-FACTOR QUALITY SCORE VALIDATION
+# V86 ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â FROZEN 4-FACTOR QUALITY SCORE VALIDATION
 # Discovery factors come ONLY from V85:
 #   disp30, alt30, btc30, breakout_change_pct
 # Thresholds are learned ONCE from older V84 winners (medians),
@@ -18125,16 +18125,16 @@ def v86_label(score):
 def v86_tg_text(res):
     v=res["validation_v82"]
     lines=[
-        "ÄŸÅ¸Â§Âª V86 4-FAKTOR KALÃ„Â°TE DOÃ„ÂRULAMA",
-        "Paper/research only Ã¢â‚¬â€ sinyali engellemez",
+        "Ã„Å¸Ã…Â¸Ã‚Â§Ã‚Âª V86 4-FAKTOR KALÃƒâ€Ã‚Â°TE DOÃƒâ€Ã‚ÂRULAMA",
+        "Paper/research only ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â sinyali engellemez",
         "",
-        "FaktÃƒÂ¶rler: disp30 + alt30 + btc30 + breakout",
+        "FaktÃƒÆ’Ã‚Â¶rler: disp30 + alt30 + btc30 + breakout",
         f"V82 kontrol: n={v['all']['n']} PF={v['all']['pf']} ort={v['all']['mean']}%",
-        f"Skor Ã¢â€°Â¥3: n={v['cumulative']['3+']['n']} PF={v['cumulative']['3+']['pf']} ort={v['cumulative']['3+']['mean']}%",
+        f"Skor ÃƒÂ¢Ã¢â‚¬Â°Ã‚Â¥3: n={v['cumulative']['3+']['n']} PF={v['cumulative']['3+']['pf']} ort={v['cumulative']['3+']['mean']}%",
         f"Skor 4/4: n={v['cumulative']['4+']['n']} PF={v['cumulative']['4+']['pf']} ort={v['cumulative']['4+']['mean']}%",
         "",
         f"Karar: {res['decision']}",
-        "V61/V74 deÃ„Å¸iÃ…Å¸medi; gerÃƒÂ§ek emir yok."
+        "V61/V74 deÃƒâ€Ã…Â¸iÃƒâ€¦Ã…Â¸medi; gerÃƒÆ’Ã‚Â§ek emir yok."
     ]
     return "\n".join(lines)
 
@@ -18250,7 +18250,7 @@ async def v87_status():
             "generated_utc":utc_now()}
 
 # ============================================================
-# V88 Ã¢â‚¬â€ CAUSAL AUDIT OF V86 QUALITY SCORE
+# V88 ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â CAUSAL AUDIT OF V86 QUALITY SCORE
 # Fixes market-context alignment: at entry OPEN, only candles with
 # open_time < entry_time are allowed. No active strategy/risk changes.
 # ============================================================
@@ -18399,7 +18399,7 @@ async def v88_status():
     return {**MODE_INFO,"status":"OK","panel":"V88_CAUSAL_AUDIT_V86_4_FACTOR","trading":False,"orders":False,"entry_gate":False,"v61_unchanged":True,"v74_unchanged":True,"study":s,"generated_utc":utc_now()}
 
 # ============================================================
-# V89 Ã¢â‚¬â€ FORWARD SHADOW: V66 CONFIRM10 + V88 CAUSAL QUALITY
+# V89 ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â FORWARD SHADOW: V66 CONFIRM10 + V88 CAUSAL QUALITY
 # PAPER/RESEARCH ONLY. No entry gate: records ALL frozen V66 CONFIRM10 Top1 entries.
 # Quality score is observational only (0-2 vs 3-4). TIME120 frozen exit.
 # V32/V61/V74 unchanged.
@@ -19026,7 +19026,7 @@ async def v92_failed_rally_study(limit: int = Query(default=1000, ge=1, le=1000)
         ], "generated_utc": utc_now()}
 
 
-# V93 Ã¢â‚¬â€ independent prospective observational cohort; NO V89/V91 mutation.
+# V93 ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â independent prospective observational cohort; NO V89/V91 mutation.
 V93_THRESHOLDS = {"alt30_pct": 0.175735, "disp30_pct": 1.118592}
 V93_ACTIVATION_MS = None
 V93_ACTIVATION_ERROR = None
@@ -19148,7 +19148,7 @@ async def alt_v32_trades_export(
 
 
 # ============================================================
-# V94 Ã¢â‚¬â€ V62 SPREAD/VOLUME SHADOW COHORT (V32 PAPER ENTRIES)
+# V94 ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â V62 SPREAD/VOLUME SHADOW COHORT (V32 PAPER ENTRIES)
 # Observational only. Does not gate V32, V55, V87, V89 or V91.
 # Frozen thresholds, prospective new entries only; no real orders.
 # ============================================================
@@ -19272,7 +19272,7 @@ async def v94_spread_volume_shadow():
 
 
 # ============================================================
-# V95 Ã¢â‚¬â€ MOMENTUM / VOLUME OBSERVATIONAL SHADOW COHORT
+# V95 ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â MOMENTUM / VOLUME OBSERVATIONAL SHADOW COHORT
 # Prospective tags on new V32 paper entries only.
 # No entry gate, no exit/risk changes, no real orders.
 # ============================================================
@@ -19420,7 +19420,7 @@ async def v95_momentum_volume_shadow():
 
 
 # ============================================================
-# V97 MEAN REVERSION SHORT DIAGNOSTIC â€” RESEARCH ONLY
+# V97 MEAN REVERSION SHORT DIAGNOSTIC Ã¢â‚¬â€ RESEARCH ONLY
 # Does not open paper positions, send orders, or alter V96.
 # ============================================================
 
@@ -19596,7 +19596,7 @@ async def mean_reversion90_v97(
 
 
 # ============================================================
-# V98 VOLATILITY SQUEEZE BREAKOUT â€” DIAGNOSTIC, RESEARCH ONLY
+# V98 VOLATILITY SQUEEZE BREAKOUT Ã¢â‚¬â€ DIAGNOSTIC, RESEARCH ONLY
 # Independent frozen hypothesis; no V96/paper/order modifications.
 # ============================================================
 
@@ -19750,7 +19750,7 @@ async def squeeze_breakout90_v98(
                 'error':str(exc),'generated_utc':utc_now()}
 
 # ============================================================
-# V99 FALSE BREAKOUT REVERSAL â€” RESEARCH ONLY
+# V99 FALSE BREAKOUT REVERSAL Ã¢â‚¬â€ RESEARCH ONLY
 # Breakout close -> first confirmed re-entry close within 30m -> next open.
 # No V96/paper/order code is modified.
 # ============================================================
@@ -19893,7 +19893,7 @@ async def false_breakout90_v99(
 
 
 # ============================================================
-# V100 TRADE PATH / EXIT DIAGNOSTIC â€” READ-ONLY RESEARCH
+# V100 TRADE PATH / EXIT DIAGNOSTIC Ã¢â‚¬â€ READ-ONLY RESEARCH
 # Reuses the frozen V99 event definitions; no trading state changes.
 # ============================================================
 def _v100_stats(rows):
@@ -20029,7 +20029,7 @@ async def trade_path90_v100(
 
 
 # ============================================================
-# V101 15-MIN EARLY EXIT â€” RESEARCH ONLY, NO ORDER PLACEMENT
+# V101 15-MIN EARLY EXIT Ã¢â‚¬â€ RESEARCH ONLY, NO ORDER PLACEMENT
 # V99 frozen entries, observe 15m (open idx+3), act at next
 # 5m candle open (idx+4). Positive holds until idx+24 open.
 # ============================================================
@@ -20161,7 +20161,7 @@ async def early_exit90_v101(
 
 
 # ============================================================
-# V102 EXIT TIMING GRID â€” DIAGNOSTIC ONLY
+# V102 EXIT TIMING GRID Ã¢â‚¬â€ DIAGNOSTIC ONLY
 # V99 entries and 120-minute per-symbol cooldown preserved.
 # All decisions use already observed 5m OPEN prices.
 # 15m exit requires a 10m decision; 20/30/60m exits use
@@ -20302,8 +20302,8 @@ async def exit_timing90_v102(
 
 
 # ============================================================
-# V103 BACKTEST INTEGRITY AUDIT â€” RESEARCH ONLY
-# Does not change any V96â€“V102 route, signal, order or policy.
+# V103 BACKTEST INTEGRITY AUDIT Ã¢â‚¬â€ RESEARCH ONLY
+# Does not change any V96Ã¢â‚¬â€œV102 route, signal, order or policy.
 # ============================================================
 def _v103_stats(vals):
     if not vals:
@@ -20430,7 +20430,7 @@ async def integrity_audit90_v103(
 
 
 # ==============================================================
-# V104 ATR + PARTIAL TP RESEARCH â€” NO ORDERS / NO V96 MODIFICATION
+# V104 ATR + PARTIAL TP RESEARCH Ã¢â‚¬â€ NO ORDERS / NO V96 MODIFICATION
 # Frozen test specification:
 # ATR14 on completed 5m candles, SL 2 ATR, TP1 1.5 ATR (50%),
 # TP2 3 ATR (25%), last 25% trails by 2 ATR after TP1.
@@ -20632,7 +20632,7 @@ async def atr_partial_tp90_v104(
 
 
 # ============================================================
-# V105 EXECUTION AUDIT â€” diagnostic only; V96â€“V104 unchanged
+# V105 EXECUTION AUDIT Ã¢â‚¬â€ diagnostic only; V96Ã¢â‚¬â€œV104 unchanged
 # Conservative strict alternative: no TP1+TP2 within same 5m bar;
 # TP1 break-even/trail starts NEXT bar; stop checked before target.
 # ============================================================
@@ -20808,7 +20808,7 @@ async def atr_execution_audit90_v105(
                     'Current coin universe and reused 90-day sample are not independent forward data.',
                     'TP2 may not be reachable if remaining shares stop out earlier; no exchange fill simulation.',
                     'Short financing, spreads, slippage and real-time data delays not fully modeled.',
-                    'Existing V96â€“V104 endpoints and paper signals remain unchanged.',
+                    'Existing V96Ã¢â‚¬â€œV104 endpoints and paper signals remain unchanged.',
                 ]}
     except Exception as exc:
         return {**MODE_INFO,'status':'ERROR','signal':False,
@@ -21220,7 +21220,7 @@ async def btc_regime_v109(days: int = Query(default=90,ge=30,le=90)):
                 'study':'V109_BTC_TREND_REGIME_RESEARCH','error':str(exc),'generated_utc':utc_now()}
 
 
-# V110 â€” robustness of the V109 selected cohort; retrospective only.
+# V110 Ã¢â‚¬â€ robustness of the V109 selected cohort; retrospective only.
 # Does not change detector, original routes, trade execution, or frozen forward rules.
 @app.get('/btc-regime-robustness-v110')
 async def btc_regime_robustness_v110(days: int = Query(default=90, ge=30, le=90)):
@@ -22935,11 +22935,11 @@ async def v321_independent_entries(client, top1_rows, good):
     # Send only after successful persistence; failures do not change paper state.
     for pos in new_entries_for_notify:
         await v321_notify_telegram(
-            "ğŸ“ˆ V32.1 PAPER GÄ°RÄ°Å\n"
+            "ÄŸÅ¸â€œË† V32.1 PAPER GÃ„Â°RÃ„Â°Ã…Â\n"
             f"Coin: {pos['symbol']}\n"
-            f"GiriÅŸ: {pos['entry_price']:.10g} USDT\n"
+            f"GiriÃ…Å¸: {pos['entry_price']:.10g} USDT\n"
             f"Gecikme: {pos['entry_delay_seconds']:.2f} sn\n"
-            "GerÃ§ek emir yok."
+            "GerÃƒÂ§ek emir yok."
         )
 
 async def v321_independent_exit_tick(client):
@@ -22997,11 +22997,11 @@ async def v321_independent_exit_tick(client):
         v321_shadow_save()
     for pos in closed_for_notify:
         await v321_notify_telegram(
-            "ğŸ“‰ V32.1 PAPER Ã‡IKIÅ\n"
+            "ÄŸÅ¸â€œâ€° V32.1 PAPER Ãƒâ€¡IKIÃ…Â\n"
             f"Coin: {pos['symbol']}\n"
             f"Net: {pos['net_pct']:+.4f}%\n"
             f"Neden: {pos['exit_reason']}\n"
-            "GerÃ§ek emir yok."
+            "GerÃƒÂ§ek emir yok."
         )
 
 async def v321_independent_exit_loop():
@@ -23057,3 +23057,106 @@ async def v321_independent_status():
         "limitations":["Uses V32 TOP1 candidate generation; independent capacity/cooldown and fills.",
                        "Requires live quote and <60s checkpoint latency; no synthetic fills.",
                        "Prospective paper only; filters selected on historical data."]}
+
+
+
+# V123: Read-only diagnostics for V122 candidate selection.
+# Does not alter V122 rules, orders, paper state, PostgreSQL, or other endpoints.
+@app.get('/squeeze-diagnostic-v123')
+async def squeeze_diagnostic_v123():
+    from collections import Counter
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    counts = Counter()
+    failures = []
+    examples = []
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(240.0)) as client:
+            sem = asyncio.Semaphore(3)
+            async def worker(sym):
+                async with sem:
+                    try:
+                        cs = await get_5m_candles_days(client, sym, 3)
+                        return sym, [c for c in cs if int(c['close_time']) <= now_ms], None
+                    except Exception as exc:
+                        return sym, [], type(exc).__name__
+            fetched = await asyncio.gather(*(worker(sym) for sym in _V106_SYMBOLS))
+        data = {sym: cs for sym, cs, err in fetched if err is None}
+        failures = [{'symbol':sym,'error_type':err} for sym,cs,err in fetched if err]
+        btc = data.get('BTCUSDT', [])
+        btc_vol = {}
+        if len(btc) >= 577:
+            bc = [float(c['close']) for c in btc]
+            bh = [float(c['high']) for c in btc]
+            bl = [float(c['low']) for c in btc]
+            bt = [int(c['open_time']) for c in btc]
+            tr = [bh[0]-bl[0]] + [max(bh[j]-bl[j],abs(bh[j]-bc[j-1]),abs(bl[j]-bc[j-1])) for j in range(1,len(bc))]
+            for j in range(576,len(bc)):
+                if bc[j] > 0:
+                    btc_vol[bt[j]] = 100 * sum(tr[j-13:j+1]) / 14 / bc[j]
+        counts['symbols_requested'] = len(_V106_SYMBOLS)
+        counts['symbols_fetched'] = len(data)
+        counts['btc_volatility_timestamps'] = len(btc_vol)
+        for sym, cs in data.items():
+            n = len(cs)
+            if n < 700:
+                counts['symbols_under_700_candles'] += 1
+                continue
+            counts['symbols_eligible'] += 1
+            cl = [float(c['close']) for c in cs]
+            hi = [float(c['high']) for c in cs]
+            lo = [float(c['low']) for c in cs]
+            vol = [float(c['volume']) for c in cs]
+            times = [int(c['open_time']) for c in cs]
+            ema50 = _v109_ema(cl,50)
+            last_entry = -10**18
+            accepted_entry_times = set()
+            for j in range(200,n-1):
+                if ema50[j] is None or cl[j-1]<=0 or times[j+1]-times[j]!=300000:
+                    continue
+                ph=max(hi[j-20:j]); pl=min(lo[j-20:j]); vb=sum(vol[j-20:j])/20
+                vj=vol[j]/vb if vb>0 else 0
+                bj=((ph-pl)/cl[j-1]<0.025 and cl[j]>ph and vj>=1.5 and cl[j]>ema50[j])
+                if bj and times[j+1]-last_entry>=120*60000:
+                    last_entry=times[j+1]
+                    accepted_entry_times.add(last_entry)
+            for i in range(200,n-1):
+                if ema50[i] is None or cl[i-1] <= 0 or times[i+1]-times[i] != 300000:
+                    continue
+                entry_ms = times[i+1]
+                if not (0 <= now_ms-entry_ms < 15*60000):
+                    continue
+                counts['recent_eligible_candles'] += 1
+                prior_hi = max(hi[i-20:i]); prior_lo = min(lo[i-20:i])
+                vbase = sum(vol[i-20:i])/20
+                vr = vol[i]/vbase if vbase>0 else 0
+                breakout = ((prior_hi-prior_lo)/cl[i-1]<0.025 and cl[i]>prior_hi
+                            and vr>=1.5 and cl[i]>ema50[i])
+                if not breakout:
+                    counts['recent_breakout_failed'] += 1
+                    continue
+                counts['recent_breakout_passed'] += 1
+                # Match V122 cooldown ordering: update before BTC ATR filtering.
+                if entry_ms not in accepted_entry_times:
+                    counts['recent_blocked_by_cooldown'] += 1
+                    continue
+                counts['recent_after_cooldown'] += 1
+                atr_pct=btc_vol.get(times[i])
+                if atr_pct is None:
+                    counts['recent_btc_atr_missing'] += 1
+                elif not 0.25 <= atr_pct < 0.60:
+                    counts['recent_btc_atr_outside_range'] += 1
+                else:
+                    counts['recent_v122_qualified'] += 1
+                    if len(examples)<10:
+                        examples.append({'symbol':sym,'entry_utc':datetime.fromtimestamp(entry_ms/1000,timezone.utc).isoformat(),
+                                         'volume_ratio':round(vr,3),'btc_atr_pct':round(atr_pct,4)})
+        return {**MODE_INFO,'study':'V123_V122_READ_ONLY_DIAGNOSTIC',
+                'status':'PARTIAL' if failures else 'OK','signal':False,
+                'generated_utc':utc_now(),'lookback_minutes':15,
+                'counts':dict(counts),'qualified_examples':examples,'fetch_failures':failures,
+                'writes_to_database':False,'changes_to_v122':False,
+                'note':'Counts diagnose the last 15 minutes only; zero candidates in one poll is not a malfunction. No orders or DB writes.'}
+    except Exception as exc:
+        return {**MODE_INFO,'study':'V123_V122_READ_ONLY_DIAGNOSTIC','status':'ERROR',
+                'signal':False,'error_type':type(exc).__name__,
+                'error':'Diagnostic failed; check server logs.'}
