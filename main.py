@@ -18786,6 +18786,89 @@ def v323_observe_candidate(key, symbol, features, v322_gate):
                "error": "MISSING_OR_INVALID_FEATURE"}
     r["recent"].append(row)
     del r["recent"][:-100]
+    if "error" not in row:
+        V323_FOLLOWUP_EVENTS.append(dict(row))
+        del V323_FOLLOWUP_EVENTS[:-250]
+
+# Observational, read-only follow-up; no changes to trade books or execution.
+# RAM only: observations disappear on restart.
+V323_FOLLOWUP_EVENTS = []
+
+@app.get("/v323-followup")
+async def v323_followup(limit: int = Query(default=25, ge=1, le=100)):
+    """Evaluate observed candidates at fixed 30/60/120m horizons, no paper trades."""
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    rows = list(V323_FOLLOWUP_EVENTS[-limit:])
+    semaphore = asyncio.Semaphore(3)
+    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
+        async def measure(row):
+            async with semaphore:
+                result = dict(row)
+                result["horizons"] = {}
+                try:
+                    observed_ms = int(datetime.fromisoformat(row["utc"]).timestamp() * 1000)
+                    # First 1m candle starting AFTER observation: no pre-observation fill.
+                    entry_ms = ((observed_ms // 60000) + 1) * 60000
+                    result["proxy_entry_utc"] = datetime.fromtimestamp(entry_ms / 1000, tz=timezone.utc).isoformat()
+                    if now_ms < entry_ms + 120000:
+                        result["note"] = "Waiting for first completed 1m candle"
+                        return result
+                    elapsed_minutes = (now_ms - entry_ms) // 60000
+                    max_horizon = min(120, max(0, int(elapsed_minutes) - 1))
+                    raw = await get_json(client, "/api/v3/klines", params={
+                        "symbol": row["symbol"], "interval": "1m",
+                        "startTime": entry_ms, "endTime": entry_ms + 121 * 60000,
+                        "limit": 125})
+                    by_open = {int(k[0]): k for k in raw if int(k[6]) < now_ms}
+                    entry = by_open.get(entry_ms)
+                    if entry is None:
+                        result["error"] = "NO_CAUSAL_ENTRY_CANDLE"
+                        return result
+                    entry_price = float(entry[1])
+                    if entry_price <= 0:
+                        result["error"] = "INVALID_ENTRY_PRICE"
+                        return result
+                    result["proxy_entry_price"] = entry_price
+                    for minutes in (30, 60, 120):
+                        if minutes > max_horizon:
+                            result["horizons"][str(minutes)] = {"status": "PENDING"}
+                            continue
+                        # Close of minute [entry + horizon - 1] = horizon-minute mark.
+                        candle = by_open.get(entry_ms + (minutes - 1) * 60000)
+                        if candle is None:
+                            result["horizons"][str(minutes)] = {"status": "MISSING_CANDLE"}
+                            continue
+                        gross = (float(candle[4]) / entry_price - 1.0) * 100.0
+                        result["horizons"][str(minutes)] = {
+                            "status": "COMPLETE", "gross_pct": round(gross, 4),
+                            "net_proxy_pct": round(gross - ROUND_TRIP_COST_PCT, 4)}
+                except Exception as exc:
+                    result["error"] = f"{type(exc).__name__}: {exc}"
+                return result
+        measured = await asyncio.gather(*(measure(row) for row in rows))
+    groups = {"v322_pass": [], "v323_only": [], "both_reject": []}
+    for row in measured:
+        label = "v322_pass" if row.get("v322_pass") else ("v323_only" if row.get("v323_pass") else "both_reject")
+        groups[label].append(row)
+    summary = {}
+    for group, members in groups.items():
+        summary[group] = {"observed": len(members), "horizons": {}}
+        for horizon in ("30", "60", "120"):
+            values = [m["horizons"][horizon]["net_proxy_pct"] for m in members
+                      if m.get("horizons", {}).get(horizon, {}).get("status") == "COMPLETE"]
+            summary[group]["horizons"][horizon] = {
+                "n": len(values), "mean_net_proxy_pct": round(mean(values), 4) if values else None,
+                "positive_rate_pct": round(100 * sum(x > 0 for x in values) / len(values), 2) if values else None}
+    return {**MODE_INFO, "status": "OK", "paper_only": True, "execution_enabled": False,
+            "comparison": "CAUSAL_NEXT_1M_OPEN_FIXED_HORIZON_OBSERVATION",
+            "cost_assumption_pct": ROUND_TRIP_COST_PCT, "summary": summary,
+            "observations": measured,
+            "limitations": ["RAM only; resets on restart", "Only pre-filter candidates observed after deployment",
+                "Proxy entry at next 1m open; NOT executable fill or original V32 entry",
+                "Fixed 30/60/120m close; NOT V32 stop/trailing/exit replication",
+                "Fixed round-trip cost, no variable slippage", "Not a historical backtest or evidence of profitability",
+                "Repeated symbols and overlapping events are not independent"],
+            "generated_utc": utc_now()}
 
 @app.get("/v323-research")
 async def v323_research():
