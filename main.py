@@ -18771,6 +18771,7 @@ def v323_observe_candidate(key, symbol, features, v322_gate):
         ret60, volume, z, delay = vals
         # Proposed research thresholds only; DO NOT execute these entries.
         v323_pass = ret60 >= 2.5 and 0.8 <= volume < 3.0 and z < 2.5 and 0 <= delay < 90
+        v323b_pass = ret60 >= 2.5 and 0.8 <= volume < 3.5 and z < 3.5 and 0 <= delay < 120
         v322_pass = bool(v322_gate.get("v321_pass"))
         if v322_pass: r["v322_pass"] += 1
         if v323_pass: r["v323_pass"] += 1
@@ -18779,7 +18780,7 @@ def v323_observe_candidate(key, symbol, features, v322_gate):
         row = {"utc": utc_now(), "key": key, "symbol": symbol,
                "ret60_pct": round(ret60, 4), "volume_ratio": round(volume, 4),
                "z": round(z, 4), "delay_seconds": round(delay, 2),
-               "v322_pass": v322_pass, "v323_pass": v323_pass}
+               "v322_pass": v322_pass, "v323_pass": v323_pass, "v323b_pass": v323b_pass}
     except (KeyError, TypeError, ValueError, OverflowError):
         r["missing_features"] += 1
         row = {"utc": utc_now(), "key": key, "symbol": symbol,
@@ -18870,6 +18871,76 @@ async def v323_followup(limit: int = Query(default=25, ge=1, le=100)):
                 "Repeated symbols and overlapping events are not independent"],
             "generated_utc": utc_now()}
 
+
+# V32.3-B independent research paper book. Candidate event -> next 1m candle open.
+# No orders, no Telegram, no mutation of V32.2/V89.3 state. RAM only.
+# Closed trades are evaluated using subsequent 1m candle LOW for a -3% stop,
+# and the 120th candle close otherwise. Stop fills assumed at stop price,
+# which is optimistic for gaps; this is NOT live execution simulation.
+@app.get("/v323b-status")
+async def v323b_status(limit: int = Query(default=50, ge=1, le=200)):
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    events = [r for r in V323_FOLLOWUP_EVENTS if r.get("v323b_pass")]
+    sem = asyncio.Semaphore(3)
+    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
+        async def assess(row):
+            async with sem:
+                result = {"symbol":row["symbol"],"key":row["key"],
+                          "signal_utc":row["utc"],"status":"PENDING_ENTRY"}
+                try:
+                    observed_ms = int(datetime.fromisoformat(row["utc"]).timestamp()*1000)
+                    entry_ms = ((observed_ms//60000)+1)*60000
+                    result["entry_utc"] = datetime.fromtimestamp(entry_ms/1000,tz=timezone.utc).isoformat()
+                    if now_ms < entry_ms+60000:
+                        return result
+                    raw = await get_json(client,"/api/v3/klines",params={
+                        "symbol":row["symbol"],"interval":"1m",
+                        "startTime":entry_ms,"endTime":entry_ms+120*60000,
+                        "limit":121})
+                    candles = sorted((k for k in raw if int(k[6]) < now_ms),key=lambda k:int(k[0]))
+                    if not candles or int(candles[0][0])!=entry_ms:
+                        result["status"]="DATA_UNAVAILABLE";return result
+                    price=float(candles[0][1]);stop=price*0.97
+                    if price<=0:result["status"]="INVALID_ENTRY";return result
+                    result.update(entry_price=price,stop_price=round(stop,10),status="OPEN_SHADOW")
+                    for idx,k in enumerate(candles[:120]):
+                        if int(k[0])!=entry_ms+idx*60000:
+                            result["status"]="DATA_GAP";return result
+                        if float(k[3])<=stop:
+                            result.update(status="CLOSED_SHADOW",exit_reason="STOP3_CANDLE_LOW_PROXY",
+                                          exit_price=stop,exit_utc=datetime.fromtimestamp(int(k[6])/1000,tz=timezone.utc).isoformat())
+                            break
+                        if idx==119:
+                            result.update(status="CLOSED_SHADOW",exit_reason="TIME120",
+                                          exit_price=float(k[4]),exit_utc=datetime.fromtimestamp(int(k[6])/1000,tz=timezone.utc).isoformat())
+                    if result["status"]=="CLOSED_SHADOW":
+                        gross=(result["exit_price"]/price-1)*100
+                        result.update(gross_pct=round(gross,4),net_pct=round(gross-ROUND_TRIP_COST_PCT,4))
+                    return result
+                except Exception as exc:
+                    result.update(status="ERROR",error=f"{type(exc).__name__}: {exc}"[:200]);return result
+        trades=await asyncio.gather(*(assess(r) for r in events[-limit:]))
+    closed=[t for t in trades if t["status"]=="CLOSED_SHADOW"]
+    vals=[t["net_pct"] for t in closed]
+    return {**MODE_INFO,"status":"OK","version":"V32_3_B_RESEARCH_PAPER",
+            "trading":False,"orders":False,"execution_enabled":False,
+            "v322_unchanged":True,"v893_unchanged":True,"telegram_unchanged":True,
+            "filters":{"ret60_min_pct":2.5,"volume_min":0.8,"volume_max_exclusive":3.5,
+                       "z_max_exclusive":3.5,"delay_max_exclusive_seconds":120},
+            "exit_model":"NEXT_1M_OPEN_STOP3_CANDLE_LOW_OR_TIME120",
+            "cost_assumption_pct":ROUND_TRIP_COST_PCT,
+            "observed_pass":len(events),"open_count":sum(t["status"]=="OPEN_SHADOW" for t in trades),
+            "closed_count":len(closed),"performance":{"n":len(vals),
+                "mean_net_pct":round(mean(vals),4) if vals else None,
+                "win_rate_pct":round(100*sum(v>0 for v in vals)/len(vals),2) if vals else None},
+            "trades":trades,"limitations":["RAM only; resets on restart",
+                "Read-only on-demand paper valuation; no exchange orders or Telegram",
+                "Only candidates reaching V32.2 pre-filter",
+                "Stop approximated from 1m candle lows at exact stop price; gaps/slippage not modeled",
+                "Historical API may not retain all needed candles after long delays",
+                "Not a live-fill model; overlapping signals may not be independent"],
+            "generated_utc":utc_now()}
+
 @app.get("/v323-research")
 async def v323_research():
     return {**MODE_INFO, "status": "OK", "paper_only": True,
@@ -18878,6 +18949,7 @@ async def v323_research():
             "v322_thresholds": {"ret60_min_pct": 3.9, "volume_min": 0.9,
                                 "volume_max_exclusive": 3.0, "z_max_exclusive": 2.0,
                                 "delay_max_exclusive_seconds": 60},
+            "v323b_test_thresholds": {"ret60_min_pct": 2.5, "volume_min": 0.8, "volume_max_exclusive": 3.5, "z_max_exclusive": 3.5, "delay_max_exclusive_seconds": 120},
             "v323_test_thresholds": {"ret60_min_pct": 2.5, "volume_min": 0.8,
                                      "volume_max_exclusive": 3.0, "z_max_exclusive": 2.5,
                                      "delay_max_exclusive_seconds": 90},
