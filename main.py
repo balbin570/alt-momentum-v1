@@ -8728,7 +8728,7 @@ async def v32_scan_once():
 
         # Independent V32.1 shadow book. Failures never block V32.
         try:
-            await v321_independent_entries(client, top1_rows, good)
+            pass  # V32.1 legacy new entries retired; V32.2 is the active filtered book.
         except Exception as exc:
             import traceback as _v321_traceback
             V321_SHADOW["last_error"] = "entry: " + str(exc)
@@ -8775,6 +8775,16 @@ async def v32_scan_once():
                 "alt_market_mean_30m_pct": round(e["alt_market_mean_30m_pct"], 4),
                 "status": "OPEN_PAPER", "execution_version": "V53_CAUSAL_CHECKPOINT_OPEN",
             }
+            # V32.2: evaluate causal V32.1 filter before requesting a live fill.
+            _v322_context = v61_entry_context(good.get(e["symbol"]), good.get("BTCUSDT"), int(e["entry_open_time"]), float(price))
+            _v322_pre = {**_v322_context, "relative_momentum_z": e.get("relative_momentum_z"),
+                         "entry_delay_seconds": max(0.0, (alt_now_ms()-int(e["entry_open_time"]))/1000.0)}
+            _v322_gate = v321_candidate_tag(_v322_pre)
+            if not _v322_gate["v321_pass"]:
+                V32_STATE["seen_signal_keys"].add(key)
+                V47_SEEN_KEYS["V32"].add(key)
+                alt_log_skip(V32_STATE, {**pos, **_v322_gate}, "V32_2_FILTER:" + _v322_gate["v321_reason"])
+                continue
             entry_funnel["quote_or_entry_attempted"] += 1
             ok_entry, skip_reason = await apply_live_entry(client, pos, price, V32_HOLD_MS)
             pos["execution_version"] = V55_EXECUTION_VERSION
@@ -8785,6 +8795,13 @@ async def v32_scan_once():
             pos.update(v95_momentum_volume_tag(pos))
             # V32.1: prospective matched-cohort research tag (no change to V32 entries).
             pos.update(v321_candidate_tag(pos))
+            # V32.2 final gate uses the ACTUAL live entry delay, not a placeholder.
+            if ok_entry and not pos.get("v321_pass", False):
+                ok_entry = False
+                skip_reason = "V32_2_FILTER:" + str(pos.get("v321_reason", "UNKNOWN"))
+            if ok_entry:
+                pos["strategy"] = "V32_2_V32_TOP1_V321_FILTERED"
+                pos["strategy_version"] = "V32_2"
             # V87: informational V86 score only; never blocks the paper entry.
             pos.update(v87_quality_at_entry(good, e))
             pos["risk_engine"] = {
@@ -18523,6 +18540,38 @@ async def v89_scan_once():
           await alt_safe_send(f"ALT V89.2 FILTRELI SHADOW CIKIS\nCoin: {p2['symbol']}\nNet: {p2['net_pct']}%\nCikis: {reason2}\nPAPER - GERCEK EMIR YOK","V892_EXIT",p2["symbol"])
         V89_STATE["v892_open"]=v892_still
         V89_STATE["v892_closed"]=V89_STATE.get("v892_closed",[])[-1000:]
+        # V89.3 independent paper exits. Legacy V89.1/V89.2 exits above remain intact.
+        v893_still=[]
+        for p3 in V89_STATE.get("v893_open",[]):
+          due3=now>=int(p3["exit_due_ms"])
+          p3["last_stop_check_utc"]=utc_now()
+          try:
+            q3=await live_quote(client,p3["symbol"])
+          except Exception as ex3:
+            q3=None
+            p3["last_quote_error"]=f"{type(ex3).__name__}: {ex3}"[:250]
+          xp3=float(q3["bid"]) if q3 and q3.get("bid") is not None else None
+          if xp3 is None:
+            p3["missing_quote_checks"]=int(p3.get("missing_quote_checks",0))+1
+            if not due3:
+              v893_still.append(p3);continue
+            cc3=data.get(p3["symbol"],[])
+            xp3=float(cc3[-1]["close"]) if cc3 else float(p3["entry_price"])
+          gross3=v74_pct(float(p3["entry_price"]),xp3)
+          p3["last_checked_bid"]=xp3
+          stopped3=gross3<=-V89_STOP_PCT
+          if not stopped3 and not due3:
+            v893_still.append(p3);continue
+          reason3="STOP3" if stopped3 else "TIME120"
+          p3.update(exit_price=xp3,exit_utc=utc_now(),exit_reason=reason3,
+                    gross_pct=round(gross3,4),cost_pct=0.15,
+                    net_pct=round(gross3-0.15,4),status="CLOSED_SHADOW",
+                    stop_overshoot_pct=round(max(0.0,-V89_STOP_PCT-gross3),4))
+          V89_STATE.setdefault("v893_closed",[]).append(p3)
+          v89_save()
+          await alt_safe_send(f"ALT V89.3 PAPER CIKIS\nCoin: {p3['symbol']}\nNet: {p3['net_pct']}%\nCikis: {reason3}\nGERCEK EMIR YOK","V893_EXIT",p3["symbol"])
+        V89_STATE["v893_open"]=v893_still
+        V89_STATE["v893_closed"]=V89_STATE.get("v893_closed",[])[-1000:]
         # Causal market context: all candles here are completed before live entry.
         b30=v74_pct(btc[-7]["close"],btc[-1]["close"])
         a30=[v74_pct(c[-7]["close"],c[-1]["close"]) for c in data.values() if len(c)>=7]
@@ -18539,7 +18588,7 @@ async def v89_scan_once():
           candidates.append({"symbol":sym,"breakout_time":bo["open_time"],"breakout_change_pct":ch,"volume_ratio":vr,"breakout_close":bo["close"],"confirm2_close":c[i+2]["close"]})
         candidates.sort(key=lambda x:(x["breakout_change_pct"],x["volume_ratio"]),reverse=True)
         accepted=None
-        if candidates:
+        if False and candidates:  # V32.2/V89.3 migration: legacy V89.1 entries retired
           e=candidates[0];key=f'{e["symbol"]}:{e["breakout_time"]}';seen=set(V89_STATE.get("seen",[]));already=any(p["symbol"]==e["symbol"] for p in V89_STATE.get("open",[]))
           if key not in seen and not already:
             q=await live_quote(client,e["symbol"])
@@ -18554,7 +18603,7 @@ async def v89_scan_once():
         # V89.2 observes the SAME Top1 signal as V89.1, with three gates.
         # Do not promote a lower-ranked coin when Top1 fails a filter.
         v892_accepted=None
-        if candidates:
+        if False and candidates:  # Legacy V89.2 entries retired; exits preserved
           e2=candidates[0]
           key2=f'{e2["symbol"]}:{e2["breakout_time"]}'
           seen2=set(V89_STATE.get("v892_seen",[]))
@@ -18583,6 +18632,39 @@ async def v89_scan_once():
                 v892_accepted=p2
                 v89_save()
                 await alt_safe_send(f"ALT V89.2 FILTRELI SHADOW GIRIS\nCoin: {e2['symbol']}\nBreakout: {e2['breakout_change_pct']:.3f}% | Vol: {e2['volume_ratio']:.2f}x\nDisp30: {disp30:.3f}\nSTOP -3% / TIME120 | PAPER - GERCEK EMIR YOK","V892_ENTRY",e2["symbol"])
+        # V89.3: frozen CONFIRM10 Top1 + V89.2 gates, independent paper book.
+        v893_accepted=None
+        if candidates:
+          e3=candidates[0]
+          key3=f'{e3["symbol"]}:{e3["breakout_time"]}'
+          seen3=set(V89_STATE.get("v893_seen",[]))
+          if key3 not in seen3:
+            seen3.add(key3)
+            V89_STATE["v893_seen"]=list(seen3)[-2000:]
+            passes3=(float(e3["volume_ratio"])<V892_VOLUME_MAX
+              and float(e3["breakout_change_pct"])<V892_BREAKOUT_MAX
+              and not (V892_DISP_LOW<=disp30<=V892_DISP_HIGH))
+            already3=any(p3["symbol"]==e3["symbol"] for p3 in V89_STATE.get("v893_open",[]))
+            if passes3 and not already3:
+              q3=await live_quote(client,e3["symbol"])
+              if q3 and q3.get("ask") and q3.get("bid") and q3["spread_pct"]<=SPREAD_MAX_PCT:
+                ep3=float(q3["ask"]);ms3=alt_now_ms()
+                p3={**e3,"entry_price":ep3,"entry_utc":utc_now(),"entry_ms":ms3,
+                  "exit_due_ms":ms3+120*60*1000,"status":"OPEN_SHADOW",
+                  "execution_version":"V89_3_FILTERED_CONFIRM10_STOP3_TIME120",
+                  "stop_loss_pct":V89_STOP_PCT,
+                  "stop_price":round(ep3*(1-V89_STOP_PCT/100),12),
+                  "spread_pct":round(float(q3["spread_pct"]),4),
+                  "alt30_pct":round(alt30,6),"btc30_pct":round(b30,6),
+                  "disp30_pct":round(disp30,6),"entry_gate":True,
+                  "missing_quote_checks":0,"last_stop_check_utc":None,
+                  "v893_filters":{"volume_lt":V892_VOLUME_MAX,
+                    "breakout_lt_pct":V892_BREAKOUT_MAX,
+                    "disp30_excluded_pct":[V892_DISP_LOW,V892_DISP_HIGH]}}
+                V89_STATE.setdefault("v893_open",[]).append(p3)
+                v893_accepted=p3
+                v89_save()
+                await alt_safe_send(f"ALT V89.3 PAPER GIRIS\nCoin: {e3['symbol']}\nBreakout: {e3['breakout_change_pct']:.3f}% | Vol: {e3['volume_ratio']:.2f}x\nDisp30: {disp30:.3f}\nSTOP -3% / TIME120 | GERCEK EMIR YOK","V893_ENTRY",e3["symbol"])
         V89_STATE["last_scan"]={"utc":scan_utc,"symbols":len(data),"errors":len(errs),"confirm10_candidates":len(candidates),"accepted":accepted["symbol"] if accepted else None,"alt30_pct":round(alt30,4),"btc30_pct":round(b30,4),"disp30_pct":round(disp30,4)}
         V89_STATE["errors"]=errs[-20:];v89_save();return V89_STATE["last_scan"]
     except Exception as e:
@@ -18630,6 +18712,23 @@ async def v892_status():
       "v892_closed_count":len(filtered),"v892_performance":v89_perf(filtered),
       "v892_open":V89_STATE.get("v892_open",[])[-10:],
       "v892_recent_closed":filtered[-30:],"generated_utc":utc_now()}
+
+@app.get("/v322-status")
+async def v322_status():
+    cl=[p for p in V32_STATE.get("closed",[]) if p.get("strategy_version")=="V32_2"]
+    op=[p for p in V32_STATE.get("open",{}).values() if p.get("strategy_version")=="V32_2"]
+    return {**MODE_INFO,"status":"OK","version":"V32_2","paper_only":True,
+            "open_count":len(op),"closed_count":len(cl),"performance":v321_summary(cl),
+            "open":op[-10:],"recent_closed":cl[-20:],"generated_utc":utc_now()}
+
+@app.get("/v893-status")
+async def v893_status():
+    cl=V89_STATE.get("v893_closed",[])
+    return {**MODE_INFO,"status":"OK","version":"V89_3_FILTERED_CONFIRM10_STOP3_TIME120",
+            "paper_only":True,"open_count":len(V89_STATE.get("v893_open",[])),
+            "closed_count":len(cl),"performance":v89_perf(cl),
+            "open":V89_STATE.get("v893_open",[])[-10:],"recent_closed":cl[-20:],
+            "generated_utc":utc_now()}
 
 # V90 - READ-ONLY COUNTERFACTUAL EXIT RESEARCH FOR V89 CLOSED SHADOWS
 # Does not mutate V89 state or any paper strategy.
