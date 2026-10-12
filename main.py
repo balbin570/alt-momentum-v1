@@ -8789,6 +8789,7 @@ async def v32_scan_once():
             _v322_pre = {**_v322_context, "relative_momentum_z": e.get("relative_momentum_z"),
                          "entry_delay_seconds": max(0.0, (alt_now_ms()-int(e["entry_open_time"]))/1000.0)}
             _v322_gate = v321_candidate_tag(_v322_pre)
+            v323_observe_candidate(key, e.get("symbol"), _v322_pre, _v322_gate)
             V322_DIAG["filter_checked"] += 1
             if not _v322_gate["v321_pass"]:
                 V322_DIAG["filter_rejected"] += 1
@@ -18750,6 +18751,59 @@ async def v892_status():
       "v892_closed_count":len(filtered),"v892_performance":v89_perf(filtered),
       "v892_open":V89_STATE.get("v892_open",[])[-10:],
       "v892_recent_closed":filtered[-30:],"generated_utc":utc_now()}
+
+# V32.3 CANDIDATE RESEARCH (observation only, NO paper entries)
+# Both gates evaluate the same candidate at the same pre-quote checkpoint.
+# No mutation of V32/V89 books, execution, alerts, or entry filters.
+V323_RESEARCH = {"checked": 0, "v322_pass": 0, "v323_pass": 0,
+                 "v323_only": 0, "both_reject": 0, "missing_features": 0,
+                 "recent": []}
+
+def v323_observe_candidate(key, symbol, features, v322_gate):
+    r = V323_RESEARCH
+    r["checked"] += 1
+    fields = ("ctx_ret_60m_pct", "ctx_vol_ratio_15m_vs_4h",
+              "relative_momentum_z", "entry_delay_seconds")
+    try:
+        vals = [float(features[k]) for k in fields]
+        if not all(math.isfinite(v) for v in vals):
+            raise ValueError("nonfinite")
+        ret60, volume, z, delay = vals
+        # Proposed research thresholds only; DO NOT execute these entries.
+        v323_pass = ret60 >= 2.5 and 0.8 <= volume < 3.0 and z < 2.5 and 0 <= delay < 90
+        v322_pass = bool(v322_gate.get("v321_pass"))
+        if v322_pass: r["v322_pass"] += 1
+        if v323_pass: r["v323_pass"] += 1
+        if v323_pass and not v322_pass: r["v323_only"] += 1
+        if not v323_pass and not v322_pass: r["both_reject"] += 1
+        row = {"utc": utc_now(), "key": key, "symbol": symbol,
+               "ret60_pct": round(ret60, 4), "volume_ratio": round(volume, 4),
+               "z": round(z, 4), "delay_seconds": round(delay, 2),
+               "v322_pass": v322_pass, "v323_pass": v323_pass}
+    except (KeyError, TypeError, ValueError, OverflowError):
+        r["missing_features"] += 1
+        row = {"utc": utc_now(), "key": key, "symbol": symbol,
+               "error": "MISSING_OR_INVALID_FEATURE"}
+    r["recent"].append(row)
+    del r["recent"][:-100]
+
+@app.get("/v323-research")
+async def v323_research():
+    return {**MODE_INFO, "status": "OK", "paper_only": True,
+            "execution_enabled": False, "strategy_unchanged": True,
+            "comparison": "SAME_CANDIDATES_PRE_QUOTE",
+            "v322_thresholds": {"ret60_min_pct": 3.9, "volume_min": 0.9,
+                                "volume_max_exclusive": 3.0, "z_max_exclusive": 2.0,
+                                "delay_max_exclusive_seconds": 60},
+            "v323_test_thresholds": {"ret60_min_pct": 2.5, "volume_min": 0.8,
+                                     "volume_max_exclusive": 3.0, "z_max_exclusive": 2.5,
+                                     "delay_max_exclusive_seconds": 90},
+            "diagnostics": V323_RESEARCH,
+            "limitations": ["RAM only; resets after restart",
+                            "Not a historical backtest; no counterfactual fills/exits",
+                            "Pass count is not trade count or profit",
+                            "Observed only for candidates reaching V32.2 pre-filter"],
+            "generated_utc": utc_now()}
 
 # Read-only diagnostic counters; RAM only, reset on process restart.
 # No strategy, state, order, or historical trade mutations.
