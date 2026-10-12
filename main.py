@@ -24534,3 +24534,248 @@ async def research_batch_v133(days: int = Query(default=90, ge=30, le=90)):
        'Current fixed symbol universe and overlapping signals can bias results.',
        'Next-candle-open entries and fixed-time exits; fixed costs do not model variable slippage.',
        'No database writes, orders, Telegram or scheduler changes.']}
+
+
+# V134: independent BTC-regime research and forward-only paper observations.
+# No order endpoints, existing strategy settings, Telegram or existing DB tables are changed.
+V134_POLL_TASK = None
+V134_START_MS = int(datetime.now(timezone.utc).timestamp()*1000)
+V134_VARIANTS = ('PB_06_10_BASE','PB_06_10_BTC_NONNEG','PB_06_10_BTC_NONNEG_RSI','PB_06_10_BTC_NONNEG_VOL')
+
+def v134_rsi(values, n=14):
+    if len(values)<n+2:return None
+    gains=[max(values[j]-values[j-1],0) for j in range(1,len(values))]
+    losses=[max(values[j-1]-values[j],0) for j in range(1,len(values))]
+    ag=sum(gains[:n])/n;al=sum(losses[:n])/n
+    for j in range(n,len(gains)):
+        ag=(ag*(n-1)+gains[j])/n;al=(al*(n-1)+losses[j])/n
+    return 100. if al==0 else 100-100/(1+ag/al)
+
+def v134_summary(trades):
+    if not trades:return {'n':0,'mean_net_pct':None,'win_rate_pct':None,'profit_factor':None}
+    net=[t-.30 for t in trades]
+    profit=sum(x for x in net if x>0);loss=-sum(x for x in net if x<0)
+    return {'n':len(net),'mean_net_pct':round(sum(net)/len(net),5),
+            'win_rate_pct':round(100*sum(x>0 for x in net)/len(net),2),
+            'profit_factor':round(profit/loss,4) if loss else None}
+
+@app.get('/research-batch-v134')
+async def research_batch_v134(days: int = Query(default=90,ge=30,le=90)):
+    # Read-only historical research. Frozen base pullback, fixed 60m exit and .30% cost.
+    now_ms=int(datetime.now(timezone.utc).timestamp()*1000)
+    symbols=tuple(_V106_SYMBOLS)
+    async with httpx.AsyncClient(timeout=httpx.Timeout(240.0)) as client:
+        sem=asyncio.Semaphore(3)
+        async def fetch(symbol):
+            async with sem:
+                try:return symbol,await get_5m_candles_days(client,symbol,days),None
+                except Exception as exc:return symbol,[],type(exc).__name__
+        fetched=await asyncio.gather(*(fetch(s) for s in symbols))
+    data={s:cs for s,cs,e in fetched if e is None}
+    btc=data.get('BTCUSDT',[])
+    btc_cl={int(c['open_time']):float(c['close']) for c in btc}
+    btc_range={int(c['open_time']):float(c['high'])-float(c['low']) for c in btc}
+    results={}
+    rows={name:[] for name in V134_VARIANTS}
+    failures=[{'symbol':s,'error_type':e} for s,cs,e in fetched if e]
+    split_ms=now_ms-days*86400000//3
+    for sym,cs in data.items():
+        if sym=='BTCUSDT' or len(cs)<100:continue
+        cl=[float(c['close']) for c in cs];op=[float(c['open']) for c in cs]
+        vol=[float(c['volume']) for c in cs];ts=[int(c['open_time']) for c in cs]
+        last={k:-10**18 for k in rows}
+        for i in range(60,len(cs)-14):
+            if ts[i+13]-ts[i-60]!=73*300000:continue
+            if min(cl[i-7],cl[i-1],cl[i],op[i+1])<=0:continue
+            rise=100*(cl[i-1]/cl[i-7]-1)
+            depth=100*(cl[i-1]/cl[i]-1)
+            if rise<1 or not .6<=depth<1.:continue
+            bnow=btc_cl.get(ts[i]);bprev=btc_cl.get(ts[i]-3600000)
+            if not bnow or not bprev:continue
+            b60=100*(bnow/bprev-1)
+            branges=[btc_range.get(ts[i]-k*300000) for k in range(1,13)]
+            bprices=[btc_cl.get(ts[i]-k*300000) for k in range(1,13)]
+            if any(v is None for v in branges+bprices):continue
+            # Simple, explicitly labeled intrabar range proxy (not true ATR).
+            volatility=100*sum(branges)/sum(bprices)
+            direction='BTC_UP' if b60>=.3 else ('BTC_DOWN' if b60<=-.3 else 'BTC_SIDEWAYS')
+            vol_regime='BTC_HIGH_RANGE' if volatility>=.35 else 'BTC_LOW_RANGE'
+            vbase=sum(vol[i-20:i])/20
+            vr=vol[i]/vbase if vbase>0 else 0
+            rsi=v134_rsi(cl[:i+1])
+            flags={'PB_06_10_BASE':True,'PB_06_10_BTC_NONNEG':b60>=0,
+                   'PB_06_10_BTC_NONNEG_RSI':b60>=0 and rsi is not None and 50<=rsi<70,
+                   'PB_06_10_BTC_NONNEG_VOL':b60>=0 and vr>=1.5}
+            for name,ok in flags.items():
+                if not ok or ts[i+1]-last[name]<7200000:continue
+                last[name]=ts[i+1]
+                gross=100*(op[i+13]/op[i+1]-1)
+                rows[name].append({'time':ts[i+1],'gross':gross,'direction':direction,
+                                   'volatility':vol_regime,'symbol':sym})
+    for name,trades in rows.items():
+        def group(ts):
+            return {'overall':v134_summary([x['gross'] for x in ts]),
+                    'by_btc_direction':{k:v134_summary([x['gross'] for x in ts if x['direction']==k])
+                         for k in ('BTC_UP','BTC_SIDEWAYS','BTC_DOWN')},
+                    'by_btc_range':{k:v134_summary([x['gross'] for x in ts if x['volatility']==k])
+                         for k in ('BTC_LOW_RANGE','BTC_HIGH_RANGE')}}
+        results[name]={'development':group([x for x in trades if x['time']<split_ms]),
+                       'previously_inspected_historical_holdout':group([x for x in trades if x['time']>=split_ms]),
+                       'unique_symbols':len(set(x['symbol'] for x in trades))}
+    return {**MODE_INFO,'status':'PARTIAL' if failures else 'OK','signal':False,
+            'study':'V134_BTC_REGIMES_FIXED_PULLBACK','days':days,'symbols_fetched':len(data),
+            'cost_round_trip_pct':.30,'hold_minutes':60,'btc_direction_threshold_pct':.30,
+            'btc_range_proxy_threshold_pct':.35,'scenarios':results,'fetch_failures':failures,
+            'writes_to_database':False,'limitations':['Repeatedly inspected holdout is not independent validation.',
+            'BTC volatility proxy is mean 5m high-low range divided by mean close, not ATR.',
+            'Regime buckets and strategy subsets can be small and correlated.',
+            'No variable slippage, funding or actual executable fill simulation.']}
+
+def v134_db_init():
+    dburl=os.getenv('DATABASE_URL','').strip()
+    if not dburl:return False
+    with psycopg.connect(dburl,connect_timeout=7) as conn:
+        with conn.cursor() as cur:
+            cur.execute('CREATE SCHEMA IF NOT EXISTS alt_momentum_v134')
+            cur.execute('CREATE TABLE IF NOT EXISTS alt_momentum_v134.polls (polled_ms BIGINT PRIMARY KEY, signals_seen INTEGER NOT NULL, candidates_saved INTEGER NOT NULL, failures INTEGER NOT NULL, stage_counts TEXT NOT NULL)')
+            cur.execute('CREATE TABLE IF NOT EXISTS alt_momentum_v134.observations (id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, variant TEXT NOT NULL, symbol TEXT NOT NULL, signal_ms BIGINT NOT NULL, observed_ms BIGINT NOT NULL, reference_price DOUBLE PRECISION NOT NULL, btc_60m_pct DOUBLE PRECISION, volume_ratio DOUBLE PRECISION, rsi DOUBLE PRECISION, UNIQUE(variant,symbol,signal_ms))')
+            cur.execute('CREATE TABLE IF NOT EXISTS alt_momentum_v134.outcomes (observation_id BIGINT PRIMARY KEY REFERENCES alt_momentum_v134.observations(id), settled_ms BIGINT NOT NULL, reference_exit_price DOUBLE PRECISION NOT NULL, gross_pct DOUBLE PRECISION NOT NULL)')
+    return True
+
+async def v134_poll_once():
+    # Called only by independent scheduler; records current quote, not a retrospective next-open fill.
+    import json as _json
+    now_ms=int(datetime.now(timezone.utc).timestamp()*1000)
+    symbols=tuple(_V106_SYMBOLS)
+    stage={'symbols':0,'rise_ge_1':0,'depth_06_10':0,'btc_available':0,
+           'btc_nonnegative':0,'rsi_50_70':0,'volume_ge_1_5':0}
+    failures=0; candidates=[]
+    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
+        sem=asyncio.Semaphore(3)
+        async def fetch(sym):
+            async with sem:
+                try:return sym,await get_completed_5m_candles(client,sym,limit=80),None
+                except Exception as e:return sym,[],type(e).__name__
+        fetched=await asyncio.gather(*(fetch(s) for s in symbols))
+        data={s:cs for s,cs,e in fetched if e is None}
+        failures=sum(e is not None for s,cs,e in fetched)
+        btc=data.get('BTCUSDT',[])
+        btc_cl={int(c['open_time']):float(c['close']) for c in btc}
+        for sym,cs in data.items():
+            if sym=='BTCUSDT' or len(cs)<30:continue
+            stage['symbols']+=1
+            i=len(cs)-1
+            cl=[float(c['close']) for c in cs];vol=[float(c['volume']) for c in cs]
+            ts=int(cs[i]['open_time'])
+            # Only signals from the last closed candle, no historical backfill.
+            if now_ms-(ts+300000)>420000 or now_ms<ts+300000:continue
+            if cl[i-7]<=0 or cl[i]<=0:continue
+            if 100*(cl[i-1]/cl[i-7]-1)<1:continue
+            stage['rise_ge_1']+=1
+            depth=100*(cl[i-1]/cl[i]-1)
+            if not .6<=depth<1.:continue
+            stage['depth_06_10']+=1
+            bnow=btc_cl.get(ts);bprev=btc_cl.get(ts-3600000)
+            if not bnow or not bprev:continue
+            stage['btc_available']+=1
+            b60=100*(bnow/bprev-1)
+            if b60>=0:stage['btc_nonnegative']+=1
+            rsi=v134_rsi(cl)
+            if rsi is not None and 50<=rsi<70:stage['rsi_50_70']+=1
+            vbase=sum(vol[i-20:i])/20
+            vr=vol[i]/vbase if vbase>0 else 0
+            if vr>=1.5:stage['volume_ge_1_5']+=1
+            flags={'PB_06_10_BASE':True,'PB_06_10_BTC_NONNEG':b60>=0,
+                   'PB_06_10_BTC_NONNEG_RSI':b60>=0 and rsi is not None and 50<=rsi<70,
+                   'PB_06_10_BTC_NONNEG_VOL':b60>=0 and vr>=1.5}
+            if not any(flags.values()):continue
+            try:
+                price_data=await get_json(client,'/api/v3/ticker/price',{'symbol':sym})
+                price=float(price_data['price'])
+                if price<=0:raise ValueError('nonpositive price')
+            except Exception:
+                failures+=1;continue
+            for variant,ok in flags.items():
+                if ok:candidates.append((variant,sym,ts,now_ms,price,b60,vr,rsi))
+    dburl=os.getenv('DATABASE_URL','').strip()
+    if not dburl:return
+    with psycopg.connect(dburl,connect_timeout=7) as conn:
+        with conn.cursor() as cur:
+            for record in candidates:
+                cur.execute('INSERT INTO alt_momentum_v134.observations (variant,symbol,signal_ms,observed_ms,reference_price,btc_60m_pct,volume_ratio,rsi) VALUES (%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (variant,symbol,signal_ms) DO NOTHING',record)
+            cur.execute('INSERT INTO alt_momentum_v134.polls (polled_ms,signals_seen,candidates_saved,failures,stage_counts) VALUES (%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING',
+                        (now_ms,stage['depth_06_10'],len(candidates),failures,_json.dumps(stage)))
+            cur.execute('SELECT o.id,o.symbol,o.observed_ms,o.reference_price FROM alt_momentum_v134.observations o LEFT JOIN alt_momentum_v134.outcomes x ON x.observation_id=o.id WHERE x.observation_id IS NULL AND o.observed_ms<=%s ORDER BY o.observed_ms LIMIT 100', (now_ms-3600000,))
+            pending=cur.fetchall()
+    # Settlement uses a new contemporaneous quote; time horizon can exceed 60m when polling is delayed.
+    if pending:
+        prices={}
+        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
+            for sym in set(r[1] for r in pending):
+                try:prices[sym]=float((await get_json(client,'/api/v3/ticker/price',{'symbol':sym}))['price'])
+                except Exception:pass
+        with psycopg.connect(dburl,connect_timeout=7) as conn:
+            with conn.cursor() as cur:
+                for oid,sym,observed_ms,entry in pending:
+                    px=prices.get(sym)
+                    if px and entry>0:
+                        cur.execute('INSERT INTO alt_momentum_v134.outcomes (observation_id,settled_ms,reference_exit_price,gross_pct) VALUES (%s,%s,%s,%s) ON CONFLICT DO NOTHING',
+                                    (oid,int(datetime.now(timezone.utc).timestamp()*1000),px,100*(px/entry-1)))
+
+async def v134_poll_loop():
+    while True:
+        try:
+            if v134_db_init():await v134_poll_once()
+        except asyncio.CancelledError:raise
+        except Exception as exc:
+            print('V134 independent prospective poll error:',type(exc).__name__,str(exc)[:180],flush=True)
+        await asyncio.sleep(300)
+
+@app.on_event('startup')
+async def v134_startup():
+    global V134_POLL_TASK
+    if os.getenv('DATABASE_URL','').strip() and V134_POLL_TASK is None:
+        V134_POLL_TASK=asyncio.create_task(v134_poll_loop())
+
+@app.on_event('shutdown')
+async def v134_shutdown():
+    global V134_POLL_TASK
+    if V134_POLL_TASK is not None:
+        V134_POLL_TASK.cancel()
+        try:await V134_POLL_TASK
+        except asyncio.CancelledError:pass
+        V134_POLL_TASK=None
+
+@app.get('/prospective-v134')
+async def prospective_v134():
+    # Read-only status. No polling or writes triggered by this endpoint.
+    dburl=os.getenv('DATABASE_URL','').strip()
+    if not dburl:return {**MODE_INFO,'status':'UNAVAILABLE','reason':'DATABASE_URL not configured'}
+    try:
+        with psycopg.connect(dburl,connect_timeout=7) as conn:
+            with conn.cursor() as cur:
+                cur.execute('BEGIN READ ONLY')
+                cur.execute('SELECT COUNT(*),MAX(polled_ms),COALESCE(SUM(failures),0) FROM alt_momentum_v134.polls')
+                polls,last_poll,failures=cur.fetchone()
+                cur.execute('SELECT variant,COUNT(*) FROM alt_momentum_v134.observations GROUP BY variant ORDER BY variant')
+                observations=dict(cur.fetchall())
+                cur.execute('SELECT o.variant,COUNT(*),AVG(x.gross_pct-.30),SUM(CASE WHEN x.gross_pct>.30 THEN 1 ELSE 0 END) FROM alt_momentum_v134.outcomes x JOIN alt_momentum_v134.observations o ON o.id=x.observation_id GROUP BY o.variant ORDER BY o.variant')
+                settled=[{'variant':v,'n':n,'mean_net_pct':round(float(avg),5),'wins':wins} for v,n,avg,wins in cur.fetchall()]
+                cur.execute('SELECT stage_counts FROM alt_momentum_v134.polls ORDER BY polled_ms DESC LIMIT 1')
+                latest=cur.fetchone()
+                cur.execute('SELECT COUNT(*) FROM alt_momentum_v134.observations o LEFT JOIN alt_momentum_v134.outcomes x ON x.observation_id=o.id WHERE x.observation_id IS NULL')
+                unsettled=cur.fetchone()[0]
+        import json as _json
+        return {**MODE_INFO,'status':'OK','study':'V134_FORWARD_ONLY_PAPER_REFERENCE',
+                'polls':polls,'last_poll_ms':last_poll,'poll_failures':failures,
+                'observations_by_variant':observations,'settled_by_variant':settled,
+                'unsettled':unsettled,'latest_filter_counts':_json.loads(latest[0]) if latest else None,
+                'writes_to_database_by_background_poll':True,'trading':False,'orders':False,
+                'notes':['New independent v134 tables only; never writes to V122 tables.',
+                         'Quotes observed at poll time, not simulated next-candle fills.',
+                         'Settlements occur on first successful poll after 60m; actual horizon can be longer.',
+                         'Sleep, restarts, multiple Render workers and connectivity can create missed polls or duplicates.',
+                         'No commissions/slippage executed; 0.30% hypothetical round-trip cost applied to summary.']}
+    except Exception as exc:
+        return {**MODE_INFO,'status':'UNAVAILABLE','error_type':type(exc).__name__,
+                'message':'V134 table not initialized yet or database unavailable'}
