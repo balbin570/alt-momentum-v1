@@ -24411,3 +24411,126 @@ async def research_batch_v132(days: int = Query(default=90, ge=30, le=90)):
                            'The last third of this historical window is repeatedly inspected, not independent prospective validation',
                            'Current fixed symbols cause survivorship bias; signals can overlap across symbols',
                            'All results are exploratory and are not validated trading signals']}
+
+
+# V133 - read-only pullback research; does not change live strategies or V122 writes.
+@app.get('/research-batch-v133')
+async def research_batch_v133(days: int = Query(default=90, ge=30, le=90)):
+    from collections import Counter
+    from statistics import mean
+    now_ms=int(datetime.now(timezone.utc).timestamp()*1000)
+    symbols=tuple(_V106_SYMBOLS)
+    async with httpx.AsyncClient(timeout=httpx.Timeout(240.0)) as client:
+        semaphore=asyncio.Semaphore(3)
+        async def fetch(symbol):
+            async with semaphore:
+                try:return symbol,await get_5m_candles_days(client,symbol,days),None
+                except Exception as exc:return symbol,[],type(exc).__name__
+        fetched=await asyncio.gather(*(fetch(s) for s in symbols))
+    data={s:cs for s,cs,error in fetched if error is None}
+    failures=[{'symbol':s,'error_type':error} for s,cs,error in fetched if error]
+    btc={int(c['open_time']):float(c['close']) for c in data.get('BTCUSDT',[])}
+    depths=[('PB_02_06',.2,.6),('PB_06_10',.6,1.0),('PB_10_15',1.,1.5)]
+    regimes=['BTC_ANY','BTC_NONNEGATIVE']
+    filters=['BASE','VOLUME_GE_1_5','RSI_50_TO_70']
+    names=[f'{d}_{b}_{f}' for d,_,_ in depths for b in regimes for f in filters]
+    rows={n:[] for n in names}
+    diag=Counter()
+    for sym,cs in data.items():
+        if sym=='BTCUSDT' or len(cs)<150:continue
+        cl=[float(c['close']) for c in cs]
+        op=[float(c['open']) for c in cs]
+        vol=[float(c['volume']) for c in cs]
+        ts=[int(c['open_time']) for c in cs]
+        last={name:-10**18 for name in names}
+        # Wilder RSI(14), strictly using candle i and earlier.
+        gains=[max(cl[j]-cl[j-1],0.) for j in range(1,len(cl))]
+        losses=[max(cl[j-1]-cl[j],0.) for j in range(1,len(cl))]
+        rsi=[None]*len(cl)
+        ag=sum(gains[:14])/14;al=sum(losses[:14])/14
+        for i in range(14,len(cl)):
+            if i>14:
+                ag=(ag*13+gains[i-1])/14
+                al=(al*13+losses[i-1])/14
+            rsi[i]=100. if al==0 else 100-100/(1+ag/al)
+        for i in range(30,len(cs)-26):
+            if any(ts[j+1]-ts[j]!=300000 for j in range(i-30,i+26)):
+                diag['gapped_windows']+=1;continue
+            if min(cl[i],cl[i-1],cl[i-7],op[i+1])<=0:continue
+            rise=100*(cl[i-1]/cl[i-7]-1)
+            retrace=100*(cl[i-1]/cl[i]-1)
+            if rise<1:continue
+            vbase=sum(vol[i-20:i])/20
+            vr=vol[i]/vbase if vbase>0 else 0
+            bprev=btc.get(ts[i]-3600000);bnow=btc.get(ts[i])
+            btc_nonneg=(bprev is not None and bnow is not None and bprev>0 and bnow>=bprev)
+            for depth,lower,upper in depths:
+                if not lower<=retrace<upper:continue
+                for regime in regimes:
+                    if regime=='BTC_NONNEGATIVE' and not btc_nonneg:continue
+                    for filt in filters:
+                        if filt=='VOLUME_GE_1_5' and vr<1.5:continue
+                        if filt=='RSI_50_TO_70' and not (rsi[i] is not None and 50<=rsi[i]<70):continue
+                        name=f'{depth}_{regime}_{filt}'
+                        diag['raw_'+name]+=1
+                        if ts[i+1]-last[name]<7200000:continue
+                        last[name]=ts[i+1]
+                        entry=op[i+1]
+                        rows[name].append({'symbol':sym,'time':ts[i+1],
+                           'gross_30':100*(op[i+7]/entry-1),
+                           'gross_60':100*(op[i+13]/entry-1),
+                           'gross_120':100*(op[i+25]/entry-1)})
+    # Time boundary fixed, not split by event counts.
+    split_ms=now_ms-(days*86400000)//3
+    def summary(trades,hold,cost):
+        values=[t['gross_'+str(hold)]-cost for t in trades]
+        if not values:return {'n':0,'mean_net_pct':None,'win_rate_pct':None,'profit_factor':None}
+        profit=sum(x for x in values if x>0)
+        loss=-sum(x for x in values if x<0)
+        return {'n':len(values),'mean_net_pct':round(mean(values),5),
+                'win_rate_pct':round(100*sum(x>0 for x in values)/len(values),2),
+                'profit_factor':round(profit/loss,4) if loss else None}
+    result={}
+    for name,trades in rows.items():
+        dev=[t for t in trades if t['time']<split_ms]
+        holdout=[t for t in trades if t['time']>=split_ms]
+        result[name]={'total':len(trades),'unique_symbols':len(set(t['symbol'] for t in trades)),
+          'development':{str(h):summary(dev,h,.3) for h in (30,60,120)},
+          'historical_holdout':{str(h):summary(holdout,h,.3) for h in (30,60,120)},
+          'historical_holdout_60m_cost_0_15':summary(holdout,60,.15)}
+    # Ranking is exclusively from development, 60m, 0.30% cost.
+    eligible=[(name,x) for name,x in result.items() if x['development']['60']['n']>=30]
+    eligible.sort(key=lambda item:item[1]['development']['60']['mean_net_pct'],reverse=True)
+    selected=[name for name,x in eligible[:3]]
+    audit={'status':'UNAVAILABLE','reason':'DATABASE_URL not configured'}
+    dburl=os.getenv('DATABASE_URL','').strip()
+    if dburl:
+        try:
+            with psycopg.connect(dburl,connect_timeout=6) as conn:
+                with conn.cursor() as cur:
+                    cur.execute('BEGIN READ ONLY')
+                    cur.execute('SELECT COUNT(*),MIN(polled_ms),MAX(polled_ms),COALESCE(SUM(observed_added),0),COALESCE(SUM(settled_added),0),COALESCE(SUM(failure_count),0) FROM alt_momentum_v122.polls')
+                    n,first,last,added,settled,failed=cur.fetchone()
+                    cur.execute('SELECT COUNT(*) FROM alt_momentum_v122.observations')
+                    obs=cur.fetchone()[0]
+                    cur.execute('SELECT COUNT(*) FROM alt_momentum_v122.outcomes')
+                    outcomes=cur.fetchone()[0]
+                    audit={'status':'OK','polls':n,'first_poll_ms':first,'last_poll_ms':last,
+                      'polls_reporting_observations':added,'polls_reporting_settlements':settled,
+                      'poll_failures_total':failed,'observations':obs,'outcomes':outcomes,
+                      'source_logic':'V122 requires BTC ATR 0.25%-0.60%, 20-candle range <2.5%, breakout above prior high, volume ratio >=1.5, above EMA50, entry within 15 minutes of polling.',
+                      'interpretation':'Zero observations cannot by itself distinguish rare qualification from scheduler/recording issues.'}
+        except Exception as exc:audit={'status':'UNAVAILABLE','error_type':type(exc).__name__}
+    return {**MODE_INFO,'status':'PARTIAL' if failures else 'OK','signal':False,
+       'study':'V133_18_PULLBACK_FILTERS_AND_V122_READ_ONLY_AUDIT','generated_utc':utc_now(),
+       'days':days,'symbols_requested':len(symbols),'symbols_fetched':len(data),
+       'scenario_count':len(names),'exit_horizons_minutes':[30,60,120],
+       'scenarios':result,'top_three_selected_on_development_only':selected,
+       'v122_audit':audit,'diagnostics':dict(diag),'fetch_failures':failures,
+       'writes_to_database':False,'changes_to_existing_strategies':False,
+       'limitations':['All historical holdout periods have been previously inspected and are not independent prospective validation.',
+       '18 overlapping variants and 3 exit horizons are exploratory multiple comparisons.',
+       'Selection uses development only; do not optimize on historical holdout.',
+       'Current fixed symbol universe and overlapping signals can bias results.',
+       'Next-candle-open entries and fixed-time exits; fixed costs do not model variable slippage.',
+       'No database writes, orders, Telegram or scheduler changes.']}
