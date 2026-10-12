@@ -23836,3 +23836,150 @@ async def momentum_winners_losers_v128(days: int = Query(default=30, ge=30, le=9
                            'Historical holdout is not prospective validation.',
                            'Fixed fees omit variable slippage and liquidity.',
                            'No orders, Telegram, database or scheduler changes.']}
+
+
+# V129: Read-only descriptive market-regime analysis, no strategy changes.
+@app.get('/momentum-regimes-v129')
+async def momentum_regimes_v129(days: int = Query(default=30, ge=30, le=90)):
+    from collections import Counter
+    from statistics import mean, median
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    split_ms = now_ms - days * 86400000 // 3
+    symbols = tuple(_V106_SYMBOLS)
+    async with httpx.AsyncClient(timeout=httpx.Timeout(240.0)) as client:
+        sem = asyncio.Semaphore(3)
+        async def fetch(sym):
+            async with sem:
+                try:
+                    cs = await get_5m_candles_days(client, sym, days)
+                    return sym, [c for c in cs if int(c['close_time']) <= now_ms], None
+                except Exception as exc:
+                    return sym, [], type(exc).__name__
+        fetched = await asyncio.gather(*(fetch(sym) for sym in symbols))
+    failures = [{'symbol':s,'error_type':e} for s,_,e in fetched if e]
+    by_symbol = {s:cs for s,cs,e in fetched if e is None}
+    # Exact timestamp matching; no look-ahead and no substitution for missing data.
+    closes = {s:{int(c['open_time']):float(c['close']) for c in cs}
+              for s,cs in by_symbol.items()}
+    btc = closes.get('BTCUSDT', {})
+    alt_symbols = [s for s in symbols if s != 'BTCUSDT' and s in closes]
+    counts = Counter()
+    rows = []
+    for sym in alt_symbols:
+        cs = by_symbol[sym]
+        n = len(cs)
+        if n < 100:
+            counts['insufficient_history_symbols'] += 1
+            continue
+        cl = [float(c['close']) for c in cs]
+        op = [float(c['open']) for c in cs]
+        hi = [float(c['high']) for c in cs]
+        lo = [float(c['low']) for c in cs]
+        ts = [int(c['open_time']) for c in cs]
+        for window in (5,15,30):
+            steps = window//5
+            last_entry = -10**18
+            for i in range(13, n-26):
+                if any(ts[k+1]-ts[k] != 300000 for k in range(i-12,i+25)):
+                    counts['gapped_windows'] += 1
+                    continue
+                if cl[i-steps] <= 0 or cl[i] <= 0:
+                    continue
+                rise = (cl[i]/cl[i-steps]-1)*100
+                if not (1 <= rise < 2):
+                    continue
+                counts[f'raw_{window}m'] += 1
+                idx = i+1
+                entry_ms = ts[idx]
+                if entry_ms-last_entry < 120*60000:
+                    counts[f'cooldown_skipped_{window}m'] += 1
+                    continue
+                entry = op[idx]
+                if entry <= 0:
+                    continue
+                last_entry = entry_ms
+                btc_now = btc.get(ts[i]); btc_15 = btc.get(ts[i-3]); btc_60 = btc.get(ts[i-12])
+                btc15 = (btc_now/btc_15-1)*100 if btc_now and btc_15 and btc_15>0 else None
+                btc60 = (btc_now/btc_60-1)*100 if btc_now and btc_60 and btc_60>0 else None
+                # Breadth: share of OTHER available altcoins with positive 30m return.
+                breadth_vals = []
+                for other in alt_symbols:
+                    if other == sym:
+                        continue
+                    a = closes[other].get(ts[i]); b = closes[other].get(ts[i-6])
+                    if a is not None and b is not None and b>0:
+                        breadth_vals.append(a>b)
+                breadth = sum(breadth_vals)/len(breadth_vals) if len(breadth_vals)>=5 else None
+                # Frozen V127 exit: TP 0.5%, SL 0.8%, max 60m, stop first, 0.30% cost.
+                take = entry*1.005; stop = entry*0.992
+                net = None; reason = None
+                for k in range(12):
+                    o,h,l = op[idx+k],hi[idx+k],lo[idx+k]
+                    if o <= stop:
+                        net = (o/entry-1)*100-0.30; reason='STOP_GAP'; break
+                    if o >= take:
+                        net = 0.20; reason='TAKE_GAP'; break
+                    if l <= stop:
+                        net = -1.10; reason='STOP'; break
+                    if h >= take:
+                        net = 0.20; reason='TAKE'; break
+                if net is None:
+                    net = (op[idx+12]/entry-1)*100-0.30
+                    reason = 'TIME'
+                rows.append({'window':window,'split':'HOLDOUT_LAST_THIRD' if entry_ms>=split_ms else 'DEVELOPMENT_FIRST_TWO_THIRDS',
+                             'net':net,'reason':reason,'btc15':btc15,'btc60':btc60,'breadth':breadth})
+    def stats(group):
+        if not group:
+            return {'n':0,'mean_net_pct':None,'median_net_pct':None,'win_rate_pct':None,'profit_factor':None}
+        vals=[r['net'] for r in group]
+        gains=sum(v for v in vals if v>0)
+        losses=-sum(v for v in vals if v<0)
+        return {'n':len(vals),'mean_net_pct':round(mean(vals),5),
+                'median_net_pct':round(median(vals),5),
+                'win_rate_pct':round(100*sum(v>0 for v in vals)/len(vals),2),
+                'profit_factor':round(gains/losses,4) if losses else None}
+    output={}
+    for split in ('DEVELOPMENT_FIRST_TWO_THIRDS','HOLDOUT_LAST_THIRD'):
+        group=[r for r in rows if r['split']==split]
+        output[split]={
+            'overall':stats(group),
+            'by_rise_window_minutes':{str(w):stats([r for r in group if r['window']==w]) for w in (5,15,30)},
+            'btc_60m':{
+                'NEGATIVE':stats([r for r in group if r['btc60'] is not None and r['btc60']<0]),
+                'FLAT_0_TO_0_3':stats([r for r in group if r['btc60'] is not None and 0<=r['btc60']<0.3]),
+                'UP_AT_LEAST_0_3':stats([r for r in group if r['btc60'] is not None and r['btc60']>=0.3]),
+                'MISSING':stats([r for r in group if r['btc60'] is None])},
+            'altcoin_breadth_30m':{
+                'WEAK_BELOW_40PCT':stats([r for r in group if r['breadth'] is not None and r['breadth']<0.4]),
+                'MIXED_40_TO_60PCT':stats([r for r in group if r['breadth'] is not None and 0.4<=r['breadth']<0.6]),
+                'BROAD_AT_LEAST_60PCT':stats([r for r in group if r['breadth'] is not None and r['breadth']>=0.6]),
+                'MISSING':stats([r for r in group if r['breadth'] is None])},
+            'btc15_sign':{
+                'NEGATIVE':stats([r for r in group if r['btc15'] is not None and r['btc15']<0]),
+                'NONNEGATIVE':stats([r for r in group if r['btc15'] is not None and r['btc15']>=0]),
+                'MISSING':stats([r for r in group if r['btc15'] is None])},
+            'by_rise_window_and_btc60':{
+                str(w):{
+                    'BTC_NEGATIVE':stats([r for r in group if r['window']==w and r['btc60'] is not None and r['btc60']<0]),
+                    'BTC_NONNEGATIVE':stats([r for r in group if r['window']==w and r['btc60'] is not None and r['btc60']>=0])}
+                for w in (5,15,30)}
+        }
+    return {'model':'ALT-MOMENTUM-V1','mode':'RESEARCH_PAPER_ONLY','trading':False,'orders':False,'signal':False,
+            'status':'PARTIAL' if failures else 'OK','study':'V129_MOMENTUM_MARKET_REGIMES_DESCRIPTIVE',
+            'generated_utc':datetime.now(timezone.utc).isoformat(),'days':days,
+            'symbols_requested':len(symbols),'symbols_fetched':len(by_symbol),
+            'altcoins_fetched':len(alt_symbols),
+            'entry_rule':'5/15/30m rise >=1% and <2%; next 5m open; independent 120m cooldown per symbol per rise window',
+            'outcome_rule':'Frozen V127 TP +0.5%, SL -0.8%, max 60m, stop-first, 0.30% round-trip cost',
+            'split':'First 2/3 calendar development; last 1/3 holdout',
+            'btc_regime':'BTC 60m close return using signal-time closed 5m candles',
+            'breadth_regime':'Fraction of other available altcoins with positive 30m return; at least 5 required',
+            'candidate_count':len(rows),'diagnostic_counts':dict(counts),'by_split':output,
+            'fetch_failures':failures,'writes_to_database':False,'changes_to_existing_strategies':False,
+            'limitations':['Descriptive only: no parameter selection, strategy promotion or proven profitability.',
+                           'Different rise windows may include overlapping signals; do not pool as independent trades.',
+                           'Holdout is historical and not independent prospective evidence.',
+                           'Breadth uses the same small fixed altcoin universe; not a market-wide breadth index.',
+                           'Fixed 0.30% costs omit variable slippage and liquidity.',
+                           'Stop-first same-candle assumption and theoretical target fills.',
+                           'No database writes, paper positions, orders, Telegram or scheduler changes.']}
