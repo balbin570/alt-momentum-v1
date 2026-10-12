@@ -24114,3 +24114,170 @@ async def momentum_costs_v130(days: int = Query(default=30, ge=30, le=90)):
               'Costs are fixed scenarios and exclude variable liquidity/slippage.',
               'Zero-cost scenario is theoretical, not an executable fee assumption.',
               'No orders, paper positions, database writes, Telegram or scheduler changes.']}
+
+# V131: Single-request six-part batch research. Strictly read-only.
+@app.get('/research-batch-v131')
+async def research_batch_v131(days: int = Query(default=90, ge=30, le=90)):
+    from collections import Counter
+    from statistics import mean, median
+    from itertools import product
+    now_ms = int(datetime.now(timezone.utc).timestamp()*1000)
+    symbols = tuple(_V106_SYMBOLS)
+    failures = []
+    async with httpx.AsyncClient(timeout=httpx.Timeout(240.0)) as client:
+        sem = asyncio.Semaphore(3)
+        async def worker(sym):
+            async with sem:
+                try:
+                    cs = await get_5m_candles_days(client, sym, days)
+                    return sym, [c for c in cs if int(c['close_time']) <= now_ms], None
+                except Exception as exc:
+                    return sym, [], type(exc).__name__
+        fetched = await asyncio.gather(*(worker(s) for s in symbols))
+    data = {s:cs for s,cs,e in fetched if e is None}
+    failures = [{'symbol':s,'error_type':e} for s,_,e in fetched if e]
+    btc = {int(c['open_time']):float(c['close']) for c in data.get('BTCUSDT',[])}
+    btc_times = sorted(btc)
+    btc60 = {btc_times[i]:100*(btc[btc_times[i]]/btc[btc_times[i-12]]-1)
+             for i in range(12,len(btc_times)) if btc[btc_times[i-12]]>0 and btc_times[i]-btc_times[i-12]==3600000}
+    rows=[]
+    counts=Counter()
+    # Pre-declared, non-optimized alternatives; one shared data download.
+    for sym,cs in data.items():
+        if sym=='BTCUSDT' or len(cs)<100: continue
+        cl=[float(c['close']) for c in cs]
+        op=[float(c['open']) for c in cs]
+        hi=[float(c['high']) for c in cs]
+        lo=[float(c['low']) for c in cs]
+        vol=[float(c['volume']) for c in cs]
+        ts=[int(c['open_time']) for c in cs]
+        last=-10**18
+        for i in range(20,len(cs)-26):
+            if cl[i-3]<=0 or op[i+1]<=0: continue
+            rise=100*(cl[i]/cl[i-3]-1)
+            if not 1<=rise<2: continue
+            counts['raw_rises']+=1
+            if ts[i+1]-last<7200000:
+                counts['cooldown_skipped']+=1
+                continue
+            if any(ts[k+1]-ts[k]!=300000 for k in range(i-3,i+25)):
+                counts['gapped_candles']+=1
+                continue
+            avgvol=sum(vol[i-20:i])/20
+            if avgvol<=0:continue
+            last=ts[i+1]
+            entry=op[i+1]
+            b=btc60.get(ts[i])
+            own30=100*(cl[i]/cl[i-6]-1) if cl[i-6]>0 else None
+            btc30=(100*(btc[ts[i]]/btc[ts[i]-1800000]-1)
+                   if ts[i] in btc and ts[i]-1800000 in btc and btc[ts[i]-1800000]>0 else None)
+            # RSI uses only candles available at signal close.
+            delta=[cl[j]-cl[j-1] for j in range(i-13,i+1)]
+            up=sum(max(d,0) for d in delta)/14
+            down=sum(max(-d,0) for d in delta)/14
+            rsi=100 if down==0 else 100-100/(1+up/down)
+            rows.append({'symbol':sym,'entry_ms':ts[i+1], 'entry':entry,
+                         'opens':op[i+1:i+26], 'highs':hi[i+1:i+25], 'lows':lo[i+1:i+25],
+                         'btc60':b,'relative30':own30-btc30 if btc30 is not None and own30 is not None else None,
+                         'volume':vol[i]/avgvol,'rsi':rsi})
+    split_ms=now_ms-days*86400000//3
+    costs=(0,0.1,0.15,0.3,0.5)
+    def gross(t,tp=0.5,sl=0.8,hold=60):
+        entry=t['entry']
+        if tp is None:
+            return 100*(t['opens'][hold//5]/entry-1)
+        target=entry*(1+tp/100)
+        stop=entry*(1-sl/100)
+        for k in range(hold//5):
+            o,h,l=t['opens'][k],t['highs'][k],t['lows'][k]
+            if o<=stop: return 100*(o/entry-1)
+            if o>=target: return tp
+            if l<=stop: return -sl
+            if h>=target: return tp
+        return 100*(t['opens'][hold//5]/entry-1)
+    def stats(v,cost=0.3):
+        if not v:return {'n':0,'mean_net_pct':None,'win_rate_pct':None,'profit_factor':None}
+        net=[x-cost for x in v]
+        gain=sum(x for x in net if x>0)
+        loss=-sum(x for x in net if x<0)
+        return {'n':len(net),'mean_gross_pct':round(mean(v),5),
+                'mean_net_pct':round(mean(net),5),
+                'win_rate_pct':round(100*sum(x>0 for x in net)/len(net),2),
+                'profit_factor':round(gain/loss,4) if loss else None}
+    for t in rows:
+        t['gross']=gross(t)
+        t['split']='DEVELOPMENT' if t['entry_ms']<split_ms else 'HISTORICAL_HOLDOUT'
+    splits={k:[t for t in rows if t['split']==k] for k in ('DEVELOPMENT','HISTORICAL_HOLDOUT')}
+    # 1: V122 prospective audit, only SELECT queries, never create or update tables.
+    v122={'status':'UNAVAILABLE','reason':'DATABASE_URL not configured'}
+    url=os.getenv('DATABASE_URL','').strip()
+    if url:
+        try:
+            with psycopg.connect(url,connect_timeout=6) as conn:
+                with conn.cursor() as cur:
+                    cur.execute('BEGIN READ ONLY')
+                    cur.execute('SELECT COUNT(*), MIN(polled_ms), MAX(polled_ms), COALESCE(SUM(failure_count),0) FROM alt_momentum_v122.polls')
+                    n,first,last,failed=cur.fetchone()
+                    cur.execute('SELECT COUNT(*) FROM alt_momentum_v122.observations')
+                    observed=cur.fetchone()[0]
+                    cur.execute('SELECT gross_pct FROM alt_momentum_v122.outcomes')
+                    outcome=[float(x[0]) for x in cur.fetchall()]
+                    v122={'status':'OK','polls':n,'first_poll_ms':first,'last_poll_ms':last,
+                          'poll_failures_total':failed,'observations':observed,
+                          'settled_outcomes':len(outcome),'unsettled':observed-len(outcome),
+                          'outcomes_by_cost':{str(c):stats(outcome,c) for c in costs},
+                          'note':'Prospective records are not automatically independent if scheduling/data quality is poor.'}
+        except Exception as exc:
+            v122={'status':'UNAVAILABLE','error_type':type(exc).__name__,
+                  'reason':'Read-only V122 tables could not be queried'}
+    # 2: rolling horizons using the same frozen 15m entry/exit.
+    horizons={str(d):stats([t['gross'] for t in rows if t['entry_ms']>=now_ms-d*86400000])
+              for d in (30,60,90) if d<=days}
+    # 3: BTC regime, 4: descriptive signal characteristics.
+    regime={s:{name:stats([t['gross'] for t in group if t['btc60'] is not None and test(t['btc60'])])
+               for name,test in [('BTC_NEGATIVE',lambda x:x<0),('BTC_FLAT_0_TO_0_3',lambda x:0<=x<0.3),
+                                 ('BTC_UP_AT_LEAST_0_3',lambda x:x>=0.3)]}
+            for s,group in splits.items()}
+    filters={}
+    conditions=[('VOLUME_BELOW_1',lambda t:t['volume']<1),
+                ('VOLUME_1_TO_2',lambda t:1<=t['volume']<2),
+                ('VOLUME_AT_LEAST_2',lambda t:t['volume']>=2),
+                ('RSI_BELOW_60',lambda t:t['rsi']<60),
+                ('RSI_60_TO_70',lambda t:60<=t['rsi']<70),
+                ('RSI_AT_LEAST_70',lambda t:t['rsi']>=70),
+                ('RELATIVE_ABOVE_BTC',lambda t:t['relative30'] is not None and t['relative30']>=0),
+                ('RELATIVE_BELOW_BTC',lambda t:t['relative30'] is not None and t['relative30']<0)]
+    for s,group in splits.items():
+        filters[s]={name:stats([t['gross'] for t in group if condition(t)]) for name,condition in conditions}
+    # 5: Pre-specified exit grid, all variants reported in both periods; no winner promoted.
+    exit_grid=[]
+    for tp,sl,hold in product((0.5,0.8,1.2),(0.5,0.8,1.2),(30,60,120)):
+        exit_grid.append({'tp_pct':tp,'sl_pct':sl,'hold_min':hold,
+                          'development':stats([gross(t,tp,sl,hold) for t in splits['DEVELOPMENT']]),
+                          'historical_holdout':stats([gross(t,tp,sl,hold) for t in splits['HISTORICAL_HOLDOUT']])})
+    # 6: Cost sensitivity and fixed-time baselines.
+    sensitivity={s:{str(c):stats([t['gross'] for t in group],c) for c in costs}
+                 for s,group in splits.items()}
+    fixed={s:{str(hold):stats([gross(t,None,None,hold) for t in group]) for hold in (30,60,120)}
+           for s,group in splits.items()}
+    return {**MODE_INFO,'status':'PARTIAL' if failures else 'OK','signal':False,
+            'study':'V131_SIX_PART_READ_ONLY_BATCH','generated_utc':utc_now(),
+            'days':days,'symbols_requested':len(symbols),'symbols_fetched':len(data),
+            'candidate_count':len(rows),'development_count':len(splits['DEVELOPMENT']),
+            'historical_holdout_count':len(splits['HISTORICAL_HOLDOUT']),
+            'frozen_entry':'15m rise >=1% and <2%, next 5m open, 120m symbol cooldown',
+            'frozen_reference_exit':'TP 0.5%, SL 0.8%, hold 60m, stop first',
+            'tests':{'1_v122_prospective_audit':v122,
+                     '2_rolling_30_60_90_days':horizons,
+                     '3_btc_60m_regimes':regime,
+                     '4_volume_rsi_relative_strength':filters,
+                     '5_tp_sl_hold_grid_27':exit_grid,
+                     '6_costs_and_fixed_time':{'cost_sensitivity':sensitivity,'fixed_time_baselines':fixed}},
+            'diagnostics':dict(counts),'fetch_failures':failures,
+            'writes_to_database':False,'changes_to_existing_strategies':False,
+            'limitations':['Historical holdout has been inspected repeatedly in prior V127-V130 studies; not fresh independent validation.',
+                           '30/60/90-day windows overlap; do not interpret as independent samples.',
+                           'Grid and filter results are exploratory, not validated strategies.',
+                           'Current fixed symbol universe and overlapping trades can bias results.',
+                           'Fixed cost scenarios omit variable slippage; TP fills are theoretical.',
+                           'No database writes, orders, Telegram or scheduler changes.']}
