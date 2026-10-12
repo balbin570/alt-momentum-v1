@@ -23310,3 +23310,137 @@ async def momentum_continuation_v124(days: int = Query(default=30, ge=30, le=90)
                 'status':'ERROR','signal':False,'generated_utc':utc_now(),
                 'error_type':type(exc).__name__,'fetch_failures':failures,
                 'writes_to_database':False}
+
+
+# V125: Historical rise -> pullback -> re-acceleration study. READ ONLY.
+# All existing endpoints, database schemas, schedulers and trading controls unchanged.
+@app.get('/momentum-pullback-v125')
+async def momentum_pullback_v125(days: int = Query(default=30, ge=30, le=90)):
+    from collections import Counter
+    from statistics import mean, median
+    now_ms = int(datetime.now(timezone.utc).timestamp()*1000)
+    split_ms = now_ms - days*86400000//3
+    symbols = tuple(_V106_SYMBOLS)
+    failures = []
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(240.0)) as client:
+            sem = asyncio.Semaphore(3)
+            async def worker(sym):
+                async with sem:
+                    try:
+                        cs = await get_5m_candles_days(client, sym, days)
+                        return sym, [c for c in cs if int(c['close_time']) <= now_ms], None
+                    except Exception as exc:
+                        return sym, [], type(exc).__name__
+            fetched = await asyncio.gather(*(worker(s) for s in symbols))
+        data = {s:c for s,c,e in fetched if e is None}
+        failures = [{'symbol':s,'error_type':e} for s,c,e in fetched if e]
+        btc = data.get('BTCUSDT', [])
+        bt = [int(c['open_time']) for c in btc]
+        bc = [float(c['close']) for c in btc]
+        btc30 = {bt[i]:(bc[i]/bc[i-6]-1)*100 for i in range(6,len(bc)) if bc[i-6]>0}
+        counters=Counter()
+        rows=[]
+        # Frozen research definition: 15m 1-2% rise, then 1-6 candles of
+        # 0.3-0.8% close-based pullback from signal close, followed by
+        # a 5m close above the previous close and previous candle high.
+        # Entry is next 5m open; no future candle is used to qualify.
+        for sym,cs in data.items():
+            if sym=='BTCUSDT':
+                continue
+            n=len(cs)
+            if n<100:
+                counters['symbols_insufficient_data']+=1
+                continue
+            cl=[float(c['close']) for c in cs]
+            op=[float(c['open']) for c in cs]
+            hi=[float(c['high']) for c in cs]
+            vol=[float(c['volume']) for c in cs]
+            tm=[int(c['open_time']) for c in cs]
+            ema20=_v109_ema(cl,20)
+            ema50=_v109_ema(cl,50)
+            last_entry=-10**18
+            # One potential setup per rise event; cooldown across ALL candidates.
+            for i in range(60,n-32):
+                if cl[i-3]<=0 or cl[i]<=0 or ema20[i] is None or ema50[i] is None:
+                    continue
+                if any(tm[k+1]-tm[k]!=300000 for k in range(i-3,i+8)):
+                    continue
+                rise=(cl[i]/cl[i-3]-1)*100
+                if not (1<=rise<2):
+                    continue
+                counters['initial_15m_rises']+=1
+                if not (cl[i]>ema20[i]>ema50[i]):
+                    counters['rise_trend_filter_failed']+=1
+                    continue
+                avgvol=sum(vol[i-20:i])/20
+                if avgvol<=0 or vol[i]/avgvol<1.5:
+                    counters['rise_volume_filter_failed']+=1
+                    continue
+                counters['rise_qualified']+=1
+                # Search forward at most 6 candles; keep first reacceleration.
+                for j in range(i+2,min(i+8,n-25)):
+                    # Pullback must have occurred strictly before the confirmation candle.
+                    prior_lows=min(cl[i+1:j])
+                    pullback=(cl[i]/prior_lows-1)*100 if prior_lows>0 else 0
+                    if not 0.3<=pullback<=0.8:
+                        continue
+                    if not (cl[j]>cl[j-1] and cl[j]>hi[j-1]):
+                        continue
+                    counters['reacceleration_confirmed']+=1
+                    entry=tm[j+1]
+                    if entry-last_entry<120*60000:
+                        counters['cooldown_skipped']+=1
+                        break
+                    last_entry=entry
+                    b=btc30.get(tm[j])
+                    if b is None or b<0:
+                        counters['btc_filter_failed_or_missing']+=1
+                        break
+                    if op[j+1]<=0 or tm[j+1]-tm[j]!=300000:
+                        counters['entry_gap_or_bad_price']+=1
+                        break
+                    row={'symbol':sym,'entry_ms':entry,'split':'HOLDOUT_LAST_THIRD' if entry>=split_ms else 'DEVELOPMENT_FIRST_TWO_THIRDS',
+                         'rise_pct':rise,'pullback_pct':pullback,'btc_30m_pct':b}
+                    for m in (15,30,60,120):
+                        k=j+1+m//5
+                        row[str(m)]=(op[k]/op[j+1]-1)*100 if k<n and tm[k]-entry==m*60000 else None
+                    rows.append(row)
+                    break
+        def stats(rr,m,cost):
+            vals=[r[str(m)]-cost for r in rr if r[str(m)] is not None]
+            if not vals:
+                return {'n':0,'mean_net_pct':None,'median_net_pct':None,'win_rate_pct':None,'profit_factor':None}
+            gains=sum(v for v in vals if v>0)
+            losses=-sum(v for v in vals if v<0)
+            return {'n':len(vals),'mean_net_pct':round(mean(vals),5),
+                    'median_net_pct':round(median(vals),5),
+                    'win_rate_pct':round(100*sum(v>0 for v in vals)/len(vals),2),
+                    'profit_factor':round(gains/losses,4) if losses>0 else None}
+        results={split:{str(cost):{str(m):stats([r for r in rows if r['split']==split],m,cost)
+                     for m in (15,30,60,120)} for cost in (0.15,0.30)}
+                 for split in ('DEVELOPMENT_FIRST_TWO_THIRDS','HOLDOUT_LAST_THIRD')}
+        return {**MODE_INFO,'study':'V125_MOMENTUM_PULLBACK_REACCELERATION_HISTORICAL',
+                'status':'PARTIAL' if failures else 'OK','signal':False,
+                'generated_utc':utc_now(),'days':days,
+                'symbols_requested':len(symbols),'symbols_fetched':len(data),
+                'altcoins_fetched':len([s for s in data if s!='BTCUSDT']),
+                'frozen_entry_rule':'15m rise >=1% and <2%; signal close > EMA20 > EMA50; signal volume >=1.5x prior 20; within next 6 candles, close-based pullback 0.3%-0.8% before confirmation; confirmation close > previous close and previous high; BTC 30m >=0; next 5m open entry; 120m symbol cooldown',
+                'exit_rule':'Fixed 15/30/60/120m after theoretical next-open entry',
+                'predeclared_primary':'Holdout 60m net at 0.30% round-trip cost; no strategy promotion without prospective confirmation',
+                'split':'First 2/3 calendar time development; final 1/3 chronological holdout',
+                'diagnostic_counts':dict(counters),'candidate_count':len(rows),
+                'by_split_cost_horizon':results,'fetch_failures':failures,
+                'writes_to_database':False,'changes_to_existing_strategies':False,
+                'limitations':['Exploratory historical research, not independently verified edge.',
+                    'The rise event can repeat across adjacent candles; cooldown reduces but does not eliminate dependence.',
+                    'Same-symbol cooldown is applied before BTC filtering.',
+                    'Cross-symbol entries may overlap; historical symbol selection may bias results.',
+                    'Fixed theoretical next-open fills and fixed costs omit variable slippage and liquidity.',
+                    'Holdout is only a chronological historical split, not prospective validation.',
+                    'No live orders, Telegram changes, paper-position writes or changes to other strategies.']}
+    except Exception as exc:
+        return {**MODE_INFO,'study':'V125_MOMENTUM_PULLBACK_REACCELERATION_HISTORICAL',
+                'status':'ERROR','signal':False,'generated_utc':utc_now(),
+                'error_type':type(exc).__name__,'fetch_failures':failures,
+                'writes_to_database':False,'changes_to_existing_strategies':False}
