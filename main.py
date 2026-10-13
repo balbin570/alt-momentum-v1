@@ -18590,6 +18590,10 @@ async def v89_scan_once():
                     net_pct=round(gross3-0.15,4),status="CLOSED_SHADOW",
                     stop_overshoot_pct=round(max(0.0,-V89_STOP_PCT-gross3),4))
           V89_STATE.setdefault("v893_closed",[]).append(p3)
+          V893_RESEARCH["exit_events"].append({"symbol":p3["symbol"],"entry_utc":p3.get("entry_utc"),
+            "exit_utc":p3["exit_utc"],"entry_price":p3["entry_price"],"exit_price":xp3,
+            "reason":reason3,"net_pct":p3["net_pct"],"stop_overshoot_pct":p3["stop_overshoot_pct"]})
+          del V893_RESEARCH["exit_events"][:-100]
           v89_save()
           await alt_safe_send(f"ALT V89.3 PAPER CIKIS\nCoin: {p3['symbol']}\nNet: {p3['net_pct']}%\nCikis: {reason3}\nGERCEK EMIR YOK","V893_EXIT",p3["symbol"])
         V89_STATE["v893_open"]=v893_still
@@ -18602,12 +18606,33 @@ async def v89_scan_once():
 
         # Frozen V66 CONFIRM10 Top1 candidate: breakout + two completed rising closes.
         candidates=[]
+        # V89.3 research-only funnel. Counts do not alter entry selection.
+        funnel={"utc":scan_utc,"symbols":len(data),"insufficient_candles":0,
+                "breakout_below_0_50":0,"volume_below_1_20":0,
+                "first_rising_close_failed":0,"second_rising_close_failed":0,
+                "eligible_candidates":0}
         for sym,c in data.items():
-          if len(c)<25:continue
+          if len(c)<25:
+            funnel["insufficient_candles"]+=1
+            continue
           i=len(c)-3;bo=c[i];ch=v74_pct(bo["open"],bo["close"]);av=sum(x["volume"] for x in c[i-20:i])/20;vr=(bo["volume"]/av) if av>0 else 0
+          # First-failure counters match the original short-circuit order.
+          if ch<0.50:
+            funnel["breakout_below_0_50"]+=1
+          elif vr<1.20:
+            funnel["volume_below_1_20"]+=1
+          elif not (c[i+1]["close"]>bo["close"]):
+            funnel["first_rising_close_failed"]+=1
+          elif not (c[i+2]["close"]>c[i+1]["close"]):
+            funnel["second_rising_close_failed"]+=1
+          else:
+            funnel["eligible_candidates"]+=1
           if ch<0.50 or vr<1.20:continue
           if not(c[i+1]["close"]>bo["close"] and c[i+2]["close"]>c[i+1]["close"]):continue
           candidates.append({"symbol":sym,"breakout_time":bo["open_time"],"breakout_change_pct":ch,"volume_ratio":vr,"breakout_close":bo["close"],"confirm2_close":c[i+2]["close"]})
+        V893_RESEARCH["last_funnel"]=funnel
+        V893_RESEARCH["funnel_history"].append(funnel)
+        del V893_RESEARCH["funnel_history"][:-120]
         candidates.sort(key=lambda x:(x["breakout_change_pct"],x["volume_ratio"]),reverse=True)
         accepted=None
         if False and candidates:  # V32.2/V89.3 migration: legacy V89.1 entries retired
@@ -18703,6 +18728,11 @@ async def v89_scan_once():
                     "breakout_lt_pct":V892_BREAKOUT_MAX,
                     "disp30_excluded_pct":[V892_DISP_LOW,V892_DISP_HIGH]}}
                 V89_STATE.setdefault("v893_open",[]).append(p3)
+                V893_RESEARCH["entry_events"].append({"symbol":p3["symbol"],"entry_utc":p3["entry_utc"],
+                  "entry_price":ep3,"stop_price":p3["stop_price"],"exit_due_ms":p3["exit_due_ms"],
+                  "breakout_change_pct":p3["breakout_change_pct"],"volume_ratio":p3["volume_ratio"],
+                  "disp30_pct":p3["disp30_pct"],"paper_only":True})
+                del V893_RESEARCH["entry_events"][:-100]
                 V893_DIAG["accepted"] += 1
                 v893_accepted=p3
                 v89_save()
@@ -19318,6 +19348,24 @@ V322_DIAG = {"scan_checks": 0, "filter_checked": 0, "filter_rejected": 0,
 V893_DIAG = {"scan_checks": 0, "no_candidate": 0, "top1_seen": 0,
              "already_seen": 0, "filter_rejected": 0, "already_open": 0,
              "quote_rejected": 0, "accepted": 0, "reasons": {}, "recent": []}
+# RAM-only supplementary diagnostics; original V89.3 paper ledger remains authoritative.
+V893_RESEARCH = {"last_funnel":None,"funnel_history":[],"entry_events":[],"exit_events":[]}
+
+@app.get("/v893-research")
+async def v893_research():
+    closed=V89_STATE.get("v893_closed",[])
+    opened=V89_STATE.get("v893_open",[])
+    return {**MODE_INFO,"status":"OK","paper_only":True,
+      "note":"RAM funnel/events reset on restart; existing paper ledger persists as configured",
+      "funnel":V893_RESEARCH["last_funnel"],
+      "funnel_history":V893_RESEARCH["funnel_history"][-20:],
+      "recent_paper_entries":V893_RESEARCH["entry_events"][-20:],
+      "recent_paper_exits":V893_RESEARCH["exit_events"][-20:],
+      "paper_open_count":len(opened),"paper_closed_count":len(closed),
+      "paper_performance":v89_perf(closed),
+      "recent_paper_open":opened[-10:],"recent_paper_closed":closed[-10:],
+      "generated_utc":utc_now()}
+
 
 def _research_diag_mark(book, reason, symbol=None):
     book["reasons"][reason] = book["reasons"].get(reason, 0) + 1
