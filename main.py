@@ -25711,3 +25711,59 @@ async def v323b_stop_diagnostics(limit: int = Query(default=200, ge=1, le=500)):
                 'Stop exit uses exact 3% proxy without gap or slippage.',
                 'Post-stop returns are market observations, not realized profits.',
                 'Only the most recent database records requested are included.']}
+
+# V32.3-B independent counterfactual exit audit: read-only, no strategy changes.
+@app.get('/v323b-exit-comparison')
+async def v323b_exit_comparison(limit: int = Query(default=200, ge=1, le=500)):
+    def _load():
+        with v323b_db_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute('BEGIN READ ONLY')
+                cur.execute('SELECT payload FROM alt_v323b_paper_trades ORDER BY signal_utc DESC LIMIT %s', (limit,))
+                return [r[0] for r in cur.fetchall()]
+    try:
+        records = await asyncio.to_thread(_load)
+    except Exception as exc:
+        return {**MODE_INFO,'status':'ERROR','stage':'database_read','error_type':type(exc).__name__,'message':str(exc)[:160]}
+    closed = sorted([r for r in records if r.get('status')=='CLOSED_SHADOW' and r.get('entry_utc') and r.get('entry_price')],key=lambda r:(r['entry_utc'],str(r.get('key',''))))
+    now_ms=int(datetime.now(timezone.utc).timestamp()*1000)
+    sem=asyncio.Semaphore(3)
+    async with httpx.AsyncClient(timeout=httpx.Timeout(35.0)) as client:
+        async def evaluate(t):
+            base={'key':t.get('key'),'symbol':t.get('symbol'),'entry_utc':t.get('entry_utc'),'recorded_net_pct':t.get('net_pct'),'recorded_exit_reason':t.get('exit_reason')}
+            try:
+                entry=float(t['entry_price'])
+                start=int(datetime.fromisoformat(t['entry_utc']).timestamp()*1000)
+                if entry<=0:return {**base,'status':'INVALID_ENTRY'}
+                async with sem:
+                    raw=await get_json(client,'/api/v3/klines',params={'symbol':t['symbol'],'interval':'1m','startTime':start,'endTime':start+120*60000-1,'limit':120})
+                candles={int(k[0]):k for k in raw if int(k[6])<now_ms}
+                if not candles:return {**base,'status':'NO_CANDLES'}
+                scenarios={}
+                for stop_pct in (3,4,5):
+                    outcome=None
+                    for i in range(120):
+                        k=candles.get(start+i*60000)
+                        if k is None:break
+                        if float(k[3])<=entry*(1-stop_pct/100):
+                            outcome={'status':'COMPLETE','exit_reason':'STOP_CANDLE_LOW_PROXY','exit_minute':i+1,'gross_pct':-float(stop_pct),'net_pct':round(-float(stop_pct)-.15,4)}
+                            break
+                    if outcome is None:
+                        k=candles.get(start+119*60000)
+                        if k is not None:
+                            gross=(float(k[4])/entry-1)*100
+                            outcome={'status':'COMPLETE','exit_reason':'TIME120','exit_minute':120,'gross_pct':round(gross,4),'net_pct':round(gross-.15,4)}
+                        else:outcome={'status':'INCOMPLETE_CANDLES','available_minutes':len(candles)}
+                    scenarios[str(stop_pct)]=outcome
+                return {**base,'status':'OK','scenarios':scenarios}
+            except Exception as exc:
+                return {**base,'status':'ERROR','error_type':type(exc).__name__,'message':str(exc)[:120]}
+        evaluated=await asyncio.gather(*(evaluate(t) for t in closed))
+    summary={}
+    for pct in ('3','4','5'):
+        complete=[r['scenarios'][pct]['net_pct'] for r in evaluated if r.get('status')=='OK' and r['scenarios'][pct]['status']=='COMPLETE']
+        summary[pct]={'n':len(complete),'mean_net_pct':round(sum(complete)/len(complete),4) if complete else None,'win_rate_pct':round(100*sum(x>0 for x in complete)/len(complete),2) if complete else None,'sum_net_pct_unweighted':round(sum(complete),4) if complete else None}
+    # Compare a fixed common sample; missing candles cannot be silently treated as wins.
+    common=[r for r in evaluated if r.get('status')=='OK' and all(r['scenarios'][p]['status']=='COMPLETE' for p in ('3','4','5'))]
+    common_summary={p:{'n':len(common),'mean_net_pct':round(sum(r['scenarios'][p]['net_pct'] for r in common)/len(common),4) if common else None} for p in ('3','4','5')}
+    return {**MODE_INFO,'status':'OK','study':'V323B_EXIT_COUNTERFACTUAL_READ_ONLY','read_only':True,'strategy_rules_changed':False,'database_writes':False,'closed_records':len(closed),'scenarios_stop_pct':[3,4,5],'round_trip_cost_pct':.15,'summary':summary,'common_sample_summary':common_summary,'trades':evaluated,'limitations':['Historical replay of already inspected trades, not out-of-sample.','Exit prices for stops assumed exactly at threshold; gaps, spreads and slippage omitted.','One-minute candle lows approximate stop triggers; within-candle path is unknown.','Alternative exits do not model changes to future signal selection or capital overlap.','No 30-minute reentry strategy is simulated in this endpoint.','Missing or incomplete candle data excluded from completed summaries.','No actual orders or strategy modifications.']}
