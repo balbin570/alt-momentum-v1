@@ -25957,3 +25957,123 @@ async def v323b_stop_confirmation_comparison(limit: int = Query(default=100, ge=
                            'Requires consecutive available 1m candles; incomplete paths excluded.',
                            'No change to later signals, reentries, overlapping capital or existing strategies.',
                            'No real orders or database writes.']}
+
+
+# V32.3-B ATR STOP RESEARCH: READ ONLY, NO STRATEGY OR ORDER CHANGES.
+@app.get('/v323b-atr-stop-comparison')
+async def v323b_atr_stop_comparison(limit: int = Query(default=100, ge=1, le=300)):
+    def _load():
+        with v323b_db_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute('BEGIN READ ONLY')
+                cur.execute('SELECT payload FROM alt_v323b_paper_trades ORDER BY signal_utc DESC LIMIT %s', (limit,))
+                return [r[0] for r in cur.fetchall()]
+    try:
+        records = await asyncio.to_thread(_load)
+    except Exception as exc:
+        return {**MODE_INFO, 'status':'ERROR','stage':'database_read',
+                'error_type':type(exc).__name__,'message':str(exc)[:160]}
+    selected = sorted([r for r in records if r.get('status')=='CLOSED_SHADOW'
+                       and r.get('entry_utc') and r.get('entry_price')],
+                      key=lambda r:(r['entry_utc'],str(r.get('key',''))))
+    now_ms = int(datetime.now(timezone.utc).timestamp()*1000)
+    sem = asyncio.Semaphore(3)
+    methods = ('fixed_3pct','atr_1_5x','atr_2x','atr_3x')
+    async with httpx.AsyncClient(timeout=httpx.Timeout(40.0)) as client:
+        async def evaluate(t):
+            base = {'key':t.get('key'),'symbol':t.get('symbol'),
+                    'entry_utc':t.get('entry_utc'),'recorded_net_pct':t.get('net_pct')}
+            try:
+                entry = float(t['entry_price'])
+                start = int(datetime.fromisoformat(t['entry_utc']).timestamp()*1000)
+                if entry<=0 or start%60000:
+                    return {**base,'status':'INVALID_ENTRY_OR_ALIGNMENT'}
+                async with sem:
+                    raw_5m, raw_1m = await asyncio.gather(
+                        get_json(client,'/api/v3/klines',params={
+                            'symbol':t['symbol'],'interval':'5m',
+                            'endTime':start-1,'limit':20}),
+                        get_json(client,'/api/v3/klines',params={
+                            'symbol':t['symbol'],'interval':'1m','startTime':start,
+                            'endTime':start+120*60000-1,'limit':120}))
+                # Strictly pre-entry, completed 5m candles only.
+                pre = [k for k in raw_5m if int(k[6])<start]
+                if len(pre)<15:
+                    return {**base,'status':'INSUFFICIENT_PRE_ENTRY_ATR','pre_5m_candles':len(pre)}
+                pre=pre[-15:]
+                true_ranges=[]
+                for i in range(1,15):
+                    high=float(pre[i][2]); low=float(pre[i][3]); prev_close=float(pre[i-1][4])
+                    true_ranges.append(max(high-low,abs(high-prev_close),abs(low-prev_close)))
+                atr14=sum(true_ranges)/14
+                if atr14<=0:
+                    return {**base,'status':'INVALID_ATR'}
+                atr_pct=atr14/entry*100
+                candle_map={int(k[0]):k for k in raw_1m if int(k[6])<now_ms}
+                stops={'fixed_3pct':3.0,'atr_1_5x':1.5*atr_pct,
+                       'atr_2x':2.0*atr_pct,'atr_3x':3.0*atr_pct}
+                scenarios={}
+                for method, stop_pct in stops.items():
+                    stop_price=entry*(1-stop_pct/100)
+                    outcome=None
+                    for i in range(120):
+                        k=candle_map.get(start+i*60000)
+                        if k is None:
+                            outcome={'status':'INCOMPLETE_CANDLES','first_missing_minute':i+1}
+                            break
+                        o=float(k[1]); low=float(k[3])
+                        if low<=stop_price:
+                            # Exact stop fill is optimistic; open-gap proxy is also reported.
+                            fill_proxy=min(o,stop_price)
+                            outcome={'status':'COMPLETE','exit_reason':'STOP_LOW_TOUCH',
+                                     'exit_minute':i+1,'stop_price':round(stop_price,12),
+                                     'stop_distance_pct':round(stop_pct,4),
+                                     'open_below_stop':o<stop_price,
+                                     'exact_stop_net_pct':round(-stop_pct-.15,4),
+                                     'net_pct':round((fill_proxy/entry-1)*100-.15,4)}
+                            break
+                    if outcome is None:
+                        last=candle_map.get(start+119*60000)
+                        if last is None:
+                            outcome={'status':'INCOMPLETE_CANDLES'}
+                        else:
+                            exit_price=float(last[4])
+                            outcome={'status':'COMPLETE','exit_reason':'TIME120_CLOSE',
+                                     'exit_minute':120,'stop_price':round(stop_price,12),
+                                     'stop_distance_pct':round(stop_pct,4),
+                                     'net_pct':round((exit_price/entry-1)*100-.15,4)}
+                    scenarios[method]=outcome
+                return {**base,'status':'OK','atr14_5m':round(atr14,12),
+                        'atr_pct_of_entry':round(atr_pct,4),'scenarios':scenarios}
+            except Exception as exc:
+                return {**base,'status':'ERROR','error_type':type(exc).__name__,
+                        'message':str(exc)[:160]}
+        trades=await asyncio.gather(*(evaluate(t) for t in selected))
+    def stats(rows, method):
+        vals=[r['scenarios'][method]['net_pct'] for r in rows]
+        if not vals:
+            return {'n':0,'mean_net_pct':None,'win_rate_pct':None,'worst_net_pct':None,
+                    'sum_net_pct_unweighted':None,'stop_exit_count':0}
+        return {'n':len(vals),'mean_net_pct':round(sum(vals)/len(vals),4),
+                'win_rate_pct':round(100*sum(v>0 for v in vals)/len(vals),2),
+                'worst_net_pct':round(min(vals),4),
+                'sum_net_pct_unweighted':round(sum(vals),4),
+                'stop_exit_count':sum(r['scenarios'][method]['exit_reason']=='STOP_LOW_TOUCH' for r in rows)}
+    common=[r for r in trades if r.get('status')=='OK' and all(
+        r['scenarios'][m]['status']=='COMPLETE' for m in methods)]
+    return {**MODE_INFO,'status':'OK','study':'V323B_ATR_STOP_COUNTERFACTUAL',
+            'read_only':True,'database_writes':False,'strategy_rules_changed':False,
+            'closed_records':len(selected),'common_sample_n':len(common),
+            'atr_definition':'14-period SMA true range of last 14 completed 5m candles before entry',
+            'methods':{'fixed_3pct':'3% stop', 'atr_1_5x':'1.5 * ATR14(5m)',
+                       'atr_2x':'2 * ATR14(5m)','atr_3x':'3 * ATR14(5m)'},
+            'round_trip_cost_pct':.15,
+            'common_sample_summary':{m:stats(common,m) for m in methods},
+            'trades':trades,
+            'limitations':['Historical closed-trade counterfactual; not out-of-sample.',
+                           'ATR distances are NOT capped or floored; compare risk carefully.',
+                           'Stop exit uses min(stop level, candle open) proxy; not a guaranteed fill.',
+                           'Intraminute paths, spreads, market depth and slippage are unknown.',
+                           'No replay of later entries, reentries, portfolio overlaps or capacity.',
+                           'Only complete pre-entry ATR and 120m candle paths are compared.',
+                           'No strategy changes, database writes or real orders.']}
