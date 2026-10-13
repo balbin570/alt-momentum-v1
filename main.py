@@ -18598,6 +18598,45 @@ async def v89_scan_once():
           await alt_safe_send(f"ALT V89.3 PAPER CIKIS\nCoin: {p3['symbol']}\nNet: {p3['net_pct']}%\nCikis: {reason3}\nGERCEK EMIR YOK","V893_EXIT",p3["symbol"])
         V89_STATE["v893_open"]=v893_still
         V89_STATE["v893_closed"]=V89_STATE.get("v893_closed",[])[-1000:]
+        # V89.3-B independent shadow exits; same STOP3 / TIME120 as V89.3.
+        v893b_still=[]
+        for pb in V89_STATE.get("v893b_open",[]):
+          dueb=now>=int(pb["exit_due_ms"])
+          pb["last_stop_check_utc"]=utc_now()
+          try:
+            qb=await live_quote(client,pb["symbol"])
+          except Exception as exb:
+            qb=None
+            pb["last_quote_error"]=f"{type(exb).__name__}: {exb}"[:250]
+          xpb=float(qb["bid"]) if qb and qb.get("bid") is not None else None
+          if xpb is None:
+            pb["missing_quote_checks"]=int(pb.get("missing_quote_checks",0))+1
+            if not dueb:
+              v893b_still.append(pb);continue
+            cb=data.get(pb["symbol"],[])
+            xpb=float(cb[-1]["close"]) if cb else float(pb["entry_price"])
+          grossb=v74_pct(float(pb["entry_price"]),xpb)
+          pb["last_checked_bid"]=xpb
+          stoppedb=grossb<=-V89_STOP_PCT
+          if not stoppedb and not dueb:
+            v893b_still.append(pb);continue
+          reasonb="STOP3" if stoppedb else "TIME120"
+          pb.update(exit_price=xpb,exit_utc=utc_now(),exit_reason=reasonb,
+            gross_pct=round(grossb,4),cost_pct=0.15,net_pct=round(grossb-0.15,4),
+            status="CLOSED_SHADOW",stop_overshoot_pct=round(max(0.0,-V89_STOP_PCT-grossb),4))
+          V89_STATE.setdefault("v893b_closed",[]).append(pb)
+          V893B_RESEARCH["exit_events"].append({"symbol":pb["symbol"],"exit_utc":pb["exit_utc"],
+            "exit_price":xpb,"reason":reasonb,"net_pct":pb["net_pct"],"paper_only":True})
+          del V893B_RESEARCH["exit_events"][:-100]
+          v89_save()
+          await alt_safe_send(
+            f"ALT V89.3-B PAPER CIKIS\nCoin: {pb['symbol']}\n"
+            f"Giris: {pb['entry_price']}\nCikis: {pb['exit_price']}\n"
+            f"Net: {pb['net_pct']}%\nSebep: {reasonb}\n"
+            "BREAKOUT 0.30% | GERCEK EMIR YOK",
+            "V893B_EXIT",pb["symbol"])
+        V89_STATE["v893b_open"]=v893b_still
+        V89_STATE["v893b_closed"]=V89_STATE.get("v893b_closed",[])[-1000:]
         # Causal market context: all candles here are completed before live entry.
         b30=v74_pct(btc[-7]["close"],btc[-1]["close"])
         a30=[v74_pct(c[-7]["close"],c[-1]["close"]) for c in data.values() if len(c)>=7]
@@ -18630,6 +18669,32 @@ async def v89_scan_once():
           if ch<0.50 or vr<1.20:continue
           if not(c[i+1]["close"]>bo["close"] and c[i+2]["close"]>c[i+1]["close"]):continue
           candidates.append({"symbol":sym,"breakout_time":bo["open_time"],"breakout_change_pct":ch,"volume_ratio":vr,"breakout_close":bo["close"],"confirm2_close":c[i+2]["close"]})
+        # V89.3-B candidates use a 0.30% breakout, independently of frozen V89.3.
+        candidates_b=[]
+        funnel_b={"utc":scan_utc,"symbols":len(data),"insufficient_candles":0,
+          "breakout_below_0_30":0,"volume_below_1_20":0,
+          "first_rising_close_failed":0,"second_rising_close_failed":0,"eligible_candidates":0}
+        for sym,cb in data.items():
+          if len(cb)<25:
+            funnel_b["insufficient_candles"]+=1;continue
+          ib=len(cb)-3;bob=cb[ib]
+          chb=v74_pct(bob["open"],bob["close"])
+          avb=sum(x["volume"] for x in cb[ib-20:ib])/20
+          vrb=bob["volume"]/avb if avb>0 else 0
+          if chb<0.30: funnel_b["breakout_below_0_30"]+=1
+          elif vrb<1.20: funnel_b["volume_below_1_20"]+=1
+          elif not(cb[ib+1]["close"]>bob["close"]): funnel_b["first_rising_close_failed"]+=1
+          elif not(cb[ib+2]["close"]>cb[ib+1]["close"]): funnel_b["second_rising_close_failed"]+=1
+          else: funnel_b["eligible_candidates"]+=1
+          if chb<0.30 or vrb<1.20:continue
+          if not(cb[ib+1]["close"]>bob["close"] and cb[ib+2]["close"]>cb[ib+1]["close"]):continue
+          candidates_b.append({"symbol":sym,"breakout_time":bob["open_time"],
+            "breakout_change_pct":chb,"volume_ratio":vrb,"breakout_close":bob["close"],
+            "confirm2_close":cb[ib+2]["close"]})
+        candidates_b.sort(key=lambda x:(x["breakout_change_pct"],x["volume_ratio"]),reverse=True)
+        V893B_RESEARCH["last_funnel"]=funnel_b
+        V893B_RESEARCH["funnel_history"].append(funnel_b)
+        del V893B_RESEARCH["funnel_history"][:-120]
         V893_RESEARCH["last_funnel"]=funnel
         V893_RESEARCH["funnel_history"].append(funnel)
         del V893_RESEARCH["funnel_history"][:-120]
@@ -18737,6 +18802,48 @@ async def v89_scan_once():
                 v893_accepted=p3
                 v89_save()
                 await alt_safe_send(f"ALT V89.3 PAPER GIRIS\nCoin: {e3['symbol']}\nBreakout: {e3['breakout_change_pct']:.3f}% | Vol: {e3['volume_ratio']:.2f}x\nDisp30: {disp30:.3f}\nSTOP -3% / TIME120 | GERCEK EMIR YOK","V893_ENTRY",e3["symbol"])
+        # Independent V89.3-B Top1 paper entry. Never promote a lower-ranked candidate.
+        if candidates_b:
+          eb=candidates_b[0]
+          keyb=f'{eb["symbol"]}:{eb["breakout_time"]}'
+          seenb=set(V89_STATE.get("v893b_seen",[]))
+          if keyb not in seenb:
+            seenb.add(keyb)
+            V89_STATE["v893b_seen"]=list(seenb)[-2000:]
+            passesb=(float(eb["volume_ratio"])<V892_VOLUME_MAX
+              and float(eb["breakout_change_pct"])<V892_BREAKOUT_MAX
+              and not(V892_DISP_LOW<=disp30<=V892_DISP_HIGH))
+            alreadyb=any(pb["symbol"]==eb["symbol"] for pb in V89_STATE.get("v893b_open",[]))
+            if passesb and not alreadyb:
+              qb=await live_quote(client,eb["symbol"])
+              if qb and qb.get("ask") and qb.get("bid") and qb["spread_pct"]<=SPREAD_MAX_PCT:
+                epb=float(qb["ask"]);msb=alt_now_ms()
+                pb={**eb,"entry_price":epb,"entry_utc":utc_now(),"entry_ms":msb,
+                  "exit_due_ms":msb+120*60*1000,"status":"OPEN_SHADOW",
+                  "execution_version":"V89_3B_CONFIRM10_BREAKOUT030_STOP3_TIME120",
+                  "breakout_min_pct":0.30,"stop_loss_pct":V89_STOP_PCT,
+                  "stop_price":round(epb*(1-V89_STOP_PCT/100),12),
+                  "spread_pct":round(float(qb["spread_pct"]),4),
+                  "alt30_pct":round(alt30,6),"btc30_pct":round(b30,6),
+                  "disp30_pct":round(disp30,6),"entry_gate":True,
+                  "missing_quote_checks":0,"last_stop_check_utc":None,
+                  "v893_filters":{"volume_lt":V892_VOLUME_MAX,
+                    "breakout_lt_pct":V892_BREAKOUT_MAX,
+                    "disp30_excluded_pct":[V892_DISP_LOW,V892_DISP_HIGH]}}
+                V89_STATE.setdefault("v893b_open",[]).append(pb)
+                V893B_RESEARCH["entry_events"].append({"symbol":pb["symbol"],
+                  "entry_utc":pb["entry_utc"],"entry_price":epb,
+                  "stop_price":pb["stop_price"],"exit_due_ms":pb["exit_due_ms"],
+                  "breakout_change_pct":pb["breakout_change_pct"],
+                  "volume_ratio":pb["volume_ratio"],"paper_only":True})
+                del V893B_RESEARCH["entry_events"][:-100]
+                v89_save()
+                await alt_safe_send(
+                  f"ALT V89.3-B PAPER GIRIS\nCoin: {pb['symbol']}\n"
+                  f"Giris: {pb['entry_price']}\nStop: {pb['stop_price']}\n"
+                  f"Breakout: {pb['breakout_change_pct']:.3f}%\n"
+                  "TIME120 | BREAKOUT 0.30% | GERCEK EMIR YOK",
+                  "V893B_ENTRY",pb["symbol"])
         V89_STATE["last_scan"]={"utc":scan_utc,"symbols":len(data),"errors":len(errs),"confirm10_candidates":len(candidates),"accepted":accepted["symbol"] if accepted else None,"alt30_pct":round(alt30,4),"btc30_pct":round(b30,4),"disp30_pct":round(disp30,4)}
         V89_STATE["errors"]=errs[-20:];v89_save();return V89_STATE["last_scan"]
     except Exception as e:
@@ -19350,6 +19457,36 @@ V893_DIAG = {"scan_checks": 0, "no_candidate": 0, "top1_seen": 0,
              "quote_rejected": 0, "accepted": 0, "reasons": {}, "recent": []}
 # RAM-only supplementary diagnostics; original V89.3 paper ledger remains authoritative.
 V893_RESEARCH = {"last_funnel":None,"funnel_history":[],"entry_events":[],"exit_events":[]}
+
+V893B_RESEARCH={"last_funnel":None,"funnel_history":[],"entry_events":[],"exit_events":[]}
+
+@app.get("/v893b-research")
+async def v893b_research():
+    closed=V89_STATE.get("v893b_closed",[])
+    opened=V89_STATE.get("v893b_open",[])
+    return {**MODE_INFO,"status":"OK","paper_only":True,
+      "version":"V89_3B_CONFIRM10_BREAKOUT030_STOP3_TIME120",
+      "breakout_min_pct":0.30,"stop_loss_pct":3,"time_exit_minutes":120,
+      "round_trip_cost_pct":0.15,
+      "note":"Independent shadow book; RAM diagnostics reset on restart",
+      "funnel":V893B_RESEARCH["last_funnel"],
+      "funnel_history":V893B_RESEARCH["funnel_history"][-20:],
+      "recent_paper_entries":V893B_RESEARCH["entry_events"][-20:],
+      "recent_paper_exits":V893B_RESEARCH["exit_events"][-20:],
+      "paper_open_count":len(opened),"paper_closed_count":len(closed),
+      "paper_performance":v89_perf(closed),
+      "recent_paper_open":opened[-10:],"recent_paper_closed":closed[-10:],
+      "generated_utc":utc_now()}
+
+@app.get("/v893-compare")
+async def v893_compare():
+    a=V89_STATE.get("v893_closed",[])
+    b=V89_STATE.get("v893b_closed",[])
+    return {**MODE_INFO,"status":"OK","paper_only":True,
+      "v893_breakout050":{"closed":len(a),"open":len(V89_STATE.get("v893_open",[])),"performance":v89_perf(a)},
+      "v893b_breakout030":{"closed":len(b),"open":len(V89_STATE.get("v893b_open",[])),"performance":v89_perf(b)},
+      "note":"Different start dates and sample sizes; compare only contemporaneous cohorts",
+      "generated_utc":utc_now()}
 
 @app.get("/v893-research")
 async def v893_research():
