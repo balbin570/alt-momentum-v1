@@ -6218,7 +6218,7 @@ def prune_seen_keys(keys):
 
 
 async def alt_safe_send(msg, kind, symbol):
-    if kind not in {"V322_ENTRY", "V322_EXIT", "V893_ENTRY", "V893_EXIT"}:
+    if kind not in {"V322_ENTRY", "V322_EXIT", "V893_ENTRY", "V893_EXIT", "V893B_ENTRY", "V893B_EXIT"}:
         return {"type": kind, "symbol": symbol, "sent": False, "reason": "telegram_new_strategies_only"}
     try:
         res = await v22_telegram_send(msg)
