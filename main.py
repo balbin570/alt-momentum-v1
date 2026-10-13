@@ -6816,7 +6816,10 @@ async def v22_telegram_send(message: str):
             message.startswith("ALT V89.3 PAPER CIKIS") or
             message.startswith("ALT V32.3-B PAPER GIRIS") or
             message.startswith("ALT V32.3-B PAPER CIKIS") or
-            message.startswith("ALT V32.3-B TELEGRAM TEST\n")):
+            message.startswith("ALT V32.3-B TELEGRAM TEST\n") or
+            message.startswith("ALT V89.3-B PAPER GIRIS\n") or
+            message.startswith("ALT V89.3-B PAPER CIKIS\n") or
+            message.startswith("ALT V89.3-B TELEGRAM TEST\n")):
         return {"sent": False, "reason": "telegram_new_strategies_only"}
     if not V22_TG_TOKEN or not V22_TG_CHAT_ID:
         return {"sent": False, "reason": "telegram_not_configured"}
@@ -19399,6 +19402,39 @@ async def v323b_trades_history(limit: int = Query(default=50, ge=1, le=200)):
                 "trades": trades, "note": "Persistent paper valuation snapshots, no real fills"}
     except Exception as exc:
         return {**MODE_INFO, "status": "ERROR", "error": f"{type(exc).__name__}: {str(exc)[:180]}"}
+
+# V89.3-B: manual notification test, independent of research positions.
+# Public GET is limited to prevent repeated Telegram messages.
+V893B_TG_TEST_LAST_MONO = 0.0
+V893B_TG_TEST_COUNT = 0
+
+
+@app.get("/v893b-telegram-test")
+async def v893b_telegram_test():
+    global V893B_TG_TEST_LAST_MONO, V893B_TG_TEST_COUNT
+    now = time.monotonic()
+    if V893B_TG_TEST_COUNT >= 3 or (V893B_TG_TEST_LAST_MONO and now - V893B_TG_TEST_LAST_MONO < 60):
+        return {**MODE_INFO, "status": "RATE_LIMITED", "telegram": {"sent": False,
+                "reason": "max_3_per_restart_and_60_seconds_between_tests"},
+                "generated_utc": utc_now()}
+    V893B_TG_TEST_LAST_MONO = now
+    V893B_TG_TEST_COUNT += 1
+    try:
+        result = await v22_telegram_send(
+            "ALT V89.3-B TELEGRAM TEST\n"
+            "Breakout 0.30% | STOP3 | TIME120\n"
+            "Bu sadece bildirim testidir; sanal pozisyon acilmadi.\n"
+            "PAPER ONLY | GERCEK EMIR YOK"
+        )
+        print(f"V893B_TELEGRAM_TEST sent={bool(result.get('sent'))} reason={result.get('reason', '-')}", flush=True)
+        return {**MODE_INFO, "status": "OK" if result.get("sent") else "NOT_SENT",
+                "telegram": result, "generated_utc": utc_now()}
+    except Exception as exc:
+        print(f"V893B_TELEGRAM_TEST ERROR {type(exc).__name__}: {str(exc)[:150]}", flush=True)
+        return {**MODE_INFO, "status": "ERROR", "telegram": {"sent": False,
+                "error": f"{type(exc).__name__}: {str(exc)[:200]}"},
+                "generated_utc": utc_now()}
+
 
 @app.get("/v323b-telegram-test")
 async def v323b_telegram_test():
