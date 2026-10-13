@@ -25749,8 +25749,11 @@ async def v323b_exit_comparison(limit: int = Query(default=200, ge=1, le=500)):
                             outcome={'status':'COMPLETE','exit_reason':'STOP_CANDLE_LOW_PROXY','exit_minute':i+1,'gross_pct':-float(stop_pct),'net_pct':round(-float(stop_pct)-.15,4)}
                             break
                     if outcome is None:
+                        # A TIME120 exit requires every preceding 1m candle;
+                        # otherwise an unobserved stop may have occurred.
+                        complete_path = all((start+j*60000) in candles for j in range(120))
                         k=candles.get(start+119*60000)
-                        if k is not None:
+                        if complete_path and k is not None:
                             gross=(float(k[4])/entry-1)*100
                             outcome={'status':'COMPLETE','exit_reason':'TIME120','exit_minute':120,'gross_pct':round(gross,4),'net_pct':round(gross-.15,4)}
                         else:outcome={'status':'INCOMPLETE_CANDLES','available_minutes':len(candles)}
@@ -25767,3 +25770,77 @@ async def v323b_exit_comparison(limit: int = Query(default=200, ge=1, le=500)):
     common=[r for r in evaluated if r.get('status')=='OK' and all(r['scenarios'][p]['status']=='COMPLETE' for p in ('3','4','5'))]
     common_summary={p:{'n':len(common),'mean_net_pct':round(sum(r['scenarios'][p]['net_pct'] for r in common)/len(common),4) if common else None} for p in ('3','4','5')}
     return {**MODE_INFO,'status':'OK','study':'V323B_EXIT_COUNTERFACTUAL_READ_ONLY','read_only':True,'strategy_rules_changed':False,'database_writes':False,'closed_records':len(closed),'scenarios_stop_pct':[3,4,5],'round_trip_cost_pct':.15,'summary':summary,'common_sample_summary':common_summary,'trades':evaluated,'limitations':['Historical replay of already inspected trades, not out-of-sample.','Exit prices for stops assumed exactly at threshold; gaps, spreads and slippage omitted.','One-minute candle lows approximate stop triggers; within-candle path is unknown.','Alternative exits do not model changes to future signal selection or capital overlap.','No 30-minute reentry strategy is simulated in this endpoint.','Missing or incomplete candle data excluded from completed summaries.','No actual orders or strategy modifications.']}
+
+
+# V32.3-B stop execution audit. Purely read-only: no trades, DB writes, or rule changes.
+@app.get('/v323b-stop-execution-audit')
+async def v323b_stop_execution_audit(limit: int = Query(default=100, ge=1, le=300)):
+    def _load():
+        with v323b_db_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute('BEGIN READ ONLY')
+                cur.execute('SELECT payload FROM alt_v323b_paper_trades ORDER BY signal_utc DESC LIMIT %s', (limit,))
+                return [r[0] for r in cur.fetchall()]
+    try:
+        rows = await asyncio.to_thread(_load)
+    except Exception as exc:
+        return {**MODE_INFO, 'status':'ERROR', 'stage':'database_read',
+                'error_type':type(exc).__name__, 'message':str(exc)[:180]}
+    selected = [r for r in rows if r.get('exit_reason')=='STOP3_CANDLE_LOW_PROXY'
+                and r.get('entry_utc') and r.get('entry_price')]
+    now_ms=int(datetime.now(timezone.utc).timestamp()*1000)
+    sem=asyncio.Semaphore(3)
+    async with httpx.AsyncClient(timeout=httpx.Timeout(35.0)) as client:
+        async def audit(t):
+            result={'key':t.get('key'),'symbol':t.get('symbol'),
+                    'recorded_net_pct':t.get('net_pct'),'recorded_exit_utc':t.get('exit_utc')}
+            try:
+                start=int(datetime.fromisoformat(t['entry_utc']).timestamp()*1000)
+                entry=float(t['entry_price'])
+                if entry<=0:return {**result,'status':'INVALID_ENTRY'}
+                stop=entry*.97
+                async with sem:
+                    raw=await get_json(client,'/api/v3/klines',params={
+                        'symbol':t['symbol'],'interval':'1m','startTime':start,
+                        'endTime':start+120*60000-1,'limit':120})
+                candles={int(k[0]):k for k in raw if int(k[6])<now_ms}
+                previous_close=None
+                for i in range(120):
+                    k=candles.get(start+i*60000)
+                    if k is None:
+                        return {**result,'status':'INCOMPLETE_CANDLES',
+                                'first_missing_minute':i+1,'available_minutes':len(candles)}
+                    o,h,l,c=map(float,(k[1],k[2],k[3],k[4]))
+                    if l<=stop:
+                        open_below=o<stop
+                        # Open-below-stop is a gap-sensitive proxy, NOT a real fill.
+                        gap_proxy=o if open_below else stop
+                        proxy_gross=(gap_proxy/entry-1)*100
+                        return {**result,'status':'COMPLETE','stop_minute':i+1,
+                                'entry_price':entry,'stop_price':round(stop,12),
+                                'trigger_candle':{'open':o,'high':h,'low':l,'close':c},
+                                'previous_close':previous_close,
+                                'open_below_stop':open_below,
+                                'candle_low_below_stop_pct':round((l/stop-1)*100,4),
+                                'exact_stop_net_pct':-3.15,
+                                'gap_aware_open_proxy_net_pct':round(proxy_gross-.15,4),
+                                'gap_proxy_additional_loss_pct':round(max(0,(stop-gap_proxy)/entry*100),4),
+                                'note':'Gap-aware open is only a proxy; spread, intraminute path and actual fills unknown'}
+                    previous_close=c
+                return {**result,'status':'STOP_NOT_REPRODUCED_IN_120M'}
+            except Exception as exc:
+                return {**result,'status':'ERROR','error_type':type(exc).__name__,
+                        'message':str(exc)[:160]}
+        results=await asyncio.gather(*(audit(t) for t in selected))
+    complete=[r for r in results if r['status']=='COMPLETE']
+    gaps=[r for r in complete if r['open_below_stop']]
+    return {**MODE_INFO,'status':'OK','study':'V323B_STOP_EXECUTION_AUDIT',
+            'read_only':True,'database_writes':False,'strategy_rules_changed':False,
+            'stop_records':len(selected),'audited_complete':len(complete),
+            'open_below_stop_count':len(gaps),
+            'mean_exact_stop_net_pct':-3.15 if complete else None,
+            'mean_gap_aware_proxy_net_pct':round(sum(r['gap_aware_open_proxy_net_pct'] for r in complete)/len(complete),4) if complete else None,
+            'trades':results,
+            'limitations':['No real fills or order-book data','A 1m candle low only establishes stop touch, not fill price',
+                           'Opening gap proxy is not a guaranteed executable price',
+                           'Read-only; original V32.3-B exit rule remains unchanged']}
