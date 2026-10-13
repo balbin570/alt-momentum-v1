@@ -25844,3 +25844,116 @@ async def v323b_stop_execution_audit(limit: int = Query(default=100, ge=1, le=30
             'limitations':['No real fills or order-book data','A 1m candle low only establishes stop touch, not fill price',
                            'Opening gap proxy is not a guaranteed executable price',
                            'Read-only; original V32.3-B exit rule remains unchanged']}
+
+
+# V32.3-B stop confirmation counterfactual: no paper-trade or strategy changes.
+@app.get('/v323b-stop-confirmation-comparison')
+async def v323b_stop_confirmation_comparison(limit: int = Query(default=100, ge=1, le=300)):
+    def _load():
+        with v323b_db_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute('BEGIN READ ONLY')
+                cur.execute('SELECT payload FROM alt_v323b_paper_trades ORDER BY signal_utc DESC LIMIT %s', (limit,))
+                return [r[0] for r in cur.fetchall()]
+    try:
+        records=await asyncio.to_thread(_load)
+    except Exception as exc:
+        return {**MODE_INFO,'status':'ERROR','stage':'database_read',
+                'error_type':type(exc).__name__,'message':str(exc)[:160]}
+    selected=sorted([r for r in records if r.get('status')=='CLOSED_SHADOW'
+                     and r.get('entry_utc') and r.get('entry_price')],
+                    key=lambda r:(r['entry_utc'],str(r.get('key',''))))
+    now_ms=int(datetime.now(timezone.utc).timestamp()*1000)
+    sem=asyncio.Semaphore(3)
+    async with httpx.AsyncClient(timeout=httpx.Timeout(35.0)) as client:
+        async def evaluate(t):
+            base={'key':t.get('key'),'symbol':t.get('symbol'),
+                  'entry_utc':t.get('entry_utc'),'recorded_net_pct':t.get('net_pct')}
+            try:
+                entry=float(t['entry_price'])
+                start=int(datetime.fromisoformat(t['entry_utc']).timestamp()*1000)
+                if entry<=0 or start%60000:
+                    return {**base,'status':'INVALID_ENTRY_OR_ALIGNMENT'}
+                async with sem:
+                    raw=await get_json(client,'/api/v3/klines',params={
+                        'symbol':t['symbol'],'interval':'1m','startTime':start,
+                        'endTime':start+121*60000-1,'limit':121})
+                candles={int(k[0]):k for k in raw if int(k[6])<now_ms}
+                stop=entry*.97
+                scenarios={}
+                for method in ('low_touch','close_1m','close_2m'):
+                    below_count=0
+                    result=None
+                    for i in range(120):
+                        k=candles.get(start+i*60000)
+                        if k is None:
+                            result={'status':'INCOMPLETE_CANDLES','first_missing_minute':i+1}
+                            break
+                        o,low,close=float(k[1]),float(k[3]),float(k[4])
+                        if method=='low_touch' and low<=stop:
+                            # Exact-stop proxy as in existing paper book; gaps/slippage excluded.
+                            result={'status':'COMPLETE','exit_reason':'STOP_LOW_TOUCH_PROXY',
+                                    'exit_minute':i+1,'exit_price_proxy':round(stop,12),
+                                    'net_pct':-3.15}
+                            break
+                        if method!='low_touch':
+                            below_count=below_count+1 if close<=stop else 0
+                            threshold=1 if method=='close_1m' else 2
+                            if below_count>=threshold:
+                                next_k=candles.get(start+(i+1)*60000)
+                                if next_k is None:
+                                    result={'status':'INCOMPLETE_NEXT_OPEN',
+                                            'signal_minute':i+1}
+                                else:
+                                    exit_price=float(next_k[1])
+                                    result={'status':'COMPLETE',
+                                            'exit_reason':'NEXT_1M_OPEN_AFTER_CLOSE_CONFIRM',
+                                            'signal_minute':i+1,'exit_minute':i+2,
+                                            'exit_price_proxy':exit_price,
+                                            'net_pct':round((exit_price/entry-1)*100-.15,4)}
+                                break
+                    if result is None:
+                        last=candles.get(start+119*60000)
+                        if last is None:
+                            result={'status':'INCOMPLETE_CANDLES'}
+                        else:
+                            price=float(last[4])
+                            result={'status':'COMPLETE','exit_reason':'TIME120_CLOSE',
+                                    'exit_minute':120,'exit_price_proxy':price,
+                                    'net_pct':round((price/entry-1)*100-.15,4)}
+                    scenarios[method]=result
+                return {**base,'status':'OK','scenarios':scenarios}
+            except Exception as exc:
+                return {**base,'status':'ERROR','error_type':type(exc).__name__,
+                        'message':str(exc)[:160]}
+        trades=await asyncio.gather(*(evaluate(t) for t in selected))
+    methods=('low_touch','close_1m','close_2m')
+    def stats(rows,method):
+        vals=[r['scenarios'][method]['net_pct'] for r in rows]
+        if not vals:return {'n':0,'mean_net_pct':None,'win_rate_pct':None,'worst_net_pct':None,
+                            'sum_net_pct_unweighted':None}
+        return {'n':len(vals),'mean_net_pct':round(sum(vals)/len(vals),4),
+                'win_rate_pct':round(100*sum(v>0 for v in vals)/len(vals),2),
+                'worst_net_pct':round(min(vals),4),
+                'sum_net_pct_unweighted':round(sum(vals),4)}
+    common=[r for r in trades if r.get('status')=='OK' and all(
+        r['scenarios'][m]['status']=='COMPLETE' for m in methods)]
+    complete_by_method={m:[r for r in trades if r.get('status')=='OK' and
+                           r['scenarios'][m]['status']=='COMPLETE'] for m in methods}
+    return {**MODE_INFO,'status':'OK','study':'V323B_STOP_CONFIRMATION_COUNTERFACTUAL',
+            'read_only':True,'database_writes':False,'strategy_rules_changed':False,
+            'closed_records':len(selected),'common_sample_n':len(common),
+            'stop_pct':3,'round_trip_cost_pct':.15,
+            'methods':{'low_touch':'1m low touches -3%; exact stop proxy',
+                       'close_1m':'1 completed 1m close <= -3%; exit next 1m open',
+                       'close_2m':'2 consecutive completed 1m closes <= -3%; exit next 1m open'},
+            'summary_by_method':{m:stats(complete_by_method[m],m) for m in methods},
+            'common_sample_summary':{m:stats(common,m) for m in methods},
+            'trades':trades,
+            'limitations':['Historical counterfactual of already closed trades, not out-of-sample.',
+                           'Close-confirmation exits can lose substantially more than 3%.',
+                           'The low-touch exit assumes a perfect stop fill; gaps and slippage omitted.',
+                           'Next-minute open is a price proxy, not a guaranteed fill.',
+                           'Requires consecutive available 1m candles; incomplete paths excluded.',
+                           'No change to later signals, reentries, overlapping capital or existing strategies.',
+                           'No real orders or database writes.']}
