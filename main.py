@@ -19122,6 +19122,139 @@ async def v323b_history(limit: int = Query(default=50, ge=1, le=200)):
     except Exception as exc:
         return {**MODE_INFO, "status": "ERROR", "error": f"{type(exc).__name__}: {str(exc)[:180]}"}
 
+# V32.3-B durable paper valuations. Independent of all legacy strategy books.
+# Stores OPEN and CLOSED snapshots; no exchange orders and no strategy changes.
+V323B_TRADE_DB_TASK = None
+V323B_TRADE_DB_HEALTH = {"ready": False, "last_sync_utc": None,
+                         "last_error": None, "stored": 0, "closed": 0}
+
+def v323b_trade_db_init():
+    with v323b_db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""CREATE TABLE IF NOT EXISTS alt_v323b_paper_trades (
+                event_key TEXT PRIMARY KEY,
+                symbol TEXT NOT NULL,
+                signal_utc TIMESTAMPTZ NOT NULL,
+                trade_status TEXT NOT NULL,
+                payload JSONB NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )""")
+    V323B_TRADE_DB_HEALTH["ready"] = True
+
+def v323b_trade_db_existing():
+    with v323b_db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT event_key, trade_status FROM alt_v323b_paper_trades")
+            return {k: status for k, status in cur.fetchall()}
+
+def v323b_trade_db_save(trades):
+    with v323b_db_connect() as conn:
+        with conn.cursor() as cur:
+            for trade in trades:
+                key = trade.get("key")
+                if not key or not trade.get("signal_utc"):
+                    continue
+                cur.execute("""INSERT INTO alt_v323b_paper_trades
+                    (event_key, symbol, signal_utc, trade_status, payload)
+                    VALUES (%s, %s, %s, %s, %s::jsonb)
+                    ON CONFLICT (event_key) DO UPDATE SET
+                        trade_status = EXCLUDED.trade_status,
+                        payload = EXCLUDED.payload,
+                        updated_at = NOW()
+                    WHERE alt_v323b_paper_trades.trade_status <> 'CLOSED_SHADOW'""",
+                    (str(key), str(trade.get("symbol", "")), trade["signal_utc"],
+                     str(trade.get("status", "UNKNOWN")), json.dumps(trade, ensure_ascii=False)))
+            cur.execute("""SELECT COUNT(*), COUNT(*) FILTER
+                        (WHERE trade_status = 'CLOSED_SHADOW') FROM alt_v323b_paper_trades""")
+            return cur.fetchone()
+
+async def v323b_trade_db_cycle():
+    # Avoid revaluing closed trades. Limit data requests to new/recent candidates.
+    existing = await asyncio.to_thread(v323b_trade_db_existing)
+    now = datetime.now(timezone.utc)
+    pending = []
+    for row in V323_FOLLOWUP_EVENTS:
+        if not row.get("v323b_pass") or not row.get("key"):
+            continue
+        key = str(row["key"])
+        if existing.get(key) == "CLOSED_SHADOW":
+            continue
+        try:
+            age = (now - datetime.fromisoformat(row["utc"])).total_seconds()
+        except (ValueError, TypeError, KeyError):
+            continue
+        if 0 <= age <= 3 * 3600:
+            pending.append(row)
+    if pending:
+        # v323b_status values only the last 200 observations. Temporarily do not
+        # mutate the shared observation list: evaluate through the same candle model
+        # by selecting the matching returned trades, then persist them.
+        report = await v323b_status(limit=200)
+        keys = {str(r["key"]) for r in pending}
+        trades = [t for t in report.get("trades", []) if str(t.get("key")) in keys]
+        counts = await asyncio.to_thread(v323b_trade_db_save, trades)
+    else:
+        counts = await asyncio.to_thread(v323b_trade_db_save, [])
+    V323B_TRADE_DB_HEALTH.update(ready=True, stored=counts[0], closed=counts[1],
+                                last_sync_utc=utc_now(), last_error=None)
+
+async def v323b_trade_db_loop():
+    while True:
+        try:
+            await v323b_trade_db_cycle()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            V323B_TRADE_DB_HEALTH["last_error"] = f"{type(exc).__name__}: {str(exc)[:180]}"
+        await asyncio.sleep(90)
+
+@app.on_event("startup")
+async def v323b_trade_db_startup():
+    global V323B_TRADE_DB_TASK
+    try:
+        await asyncio.to_thread(v323b_trade_db_init)
+    except Exception as exc:
+        V323B_TRADE_DB_HEALTH["last_error"] = f"{type(exc).__name__}: {str(exc)[:180]}"
+    if V323B_TRADE_DB_TASK is None or V323B_TRADE_DB_TASK.done():
+        V323B_TRADE_DB_TASK = asyncio.create_task(v323b_trade_db_loop())
+
+@app.on_event("shutdown")
+async def v323b_trade_db_shutdown():
+    global V323B_TRADE_DB_TASK
+    if V323B_TRADE_DB_TASK is not None:
+        V323B_TRADE_DB_TASK.cancel()
+        try:
+            await V323B_TRADE_DB_TASK
+        except asyncio.CancelledError:
+            pass
+        V323B_TRADE_DB_TASK = None
+
+@app.get("/v323b-trades-db-status")
+async def v323b_trades_db_status():
+    return {**MODE_INFO, "status": "OK" if V323B_TRADE_DB_HEALTH["ready"]
+            and not V323B_TRADE_DB_HEALTH["last_error"] else "ERROR",
+            "db": dict(V323B_TRADE_DB_HEALTH),
+            "worker_running": bool(V323B_TRADE_DB_TASK and not V323B_TRADE_DB_TASK.done())}
+
+@app.get("/v323b-trades-history")
+async def v323b_trades_history(limit: int = Query(default=50, ge=1, le=200)):
+    try:
+        def load():
+            with v323b_db_connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""SELECT payload FROM alt_v323b_paper_trades
+                        ORDER BY signal_utc DESC LIMIT %s""", (limit,))
+                    return [r[0] for r in cur.fetchall()]
+        trades = await asyncio.to_thread(load)
+        closed = [t for t in trades if t.get("status") == "CLOSED_SHADOW"]
+        vals = [float(t["net_pct"]) for t in closed if t.get("net_pct") is not None]
+        return {**MODE_INFO, "status": "OK", "count": len(trades),
+                "closed_count": len(closed),
+                "mean_net_pct": round(mean(vals), 4) if vals else None,
+                "trades": trades, "note": "Persistent paper valuation snapshots, no real fills"}
+    except Exception as exc:
+        return {**MODE_INFO, "status": "ERROR", "error": f"{type(exc).__name__}: {str(exc)[:180]}"}
+
 @app.get("/v323b-telegram-test")
 async def v323b_telegram_test():
     """Explicit manual Telegram delivery check; no paper state or order changes."""
