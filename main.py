@@ -6125,9 +6125,9 @@ V55_TRAIL_DISTANCE_PCT = 1.5
 
 # V32.2-only fixed take-profit / stop-loss policy (gross price levels).
 # No time exit, no trailing exit, no other exit triggers.
-V322_TP_SL_VERSION = "V322_TP115_SL150_NO_TIME"
+V322_TP_SL_VERSION = "V322_IMMEDIATE_TP115_SL135_NO_TIME"
 V322_TAKE_PROFIT_PCT = 1.15
-V322_STOP_LOSS_PCT = 1.50
+V322_STOP_LOSS_PCT = 1.35
 
 def v322_tp_sl_reason(entry_price, bid_price):
     entry = float(entry_price)
@@ -6137,7 +6137,7 @@ def v322_tp_sl_reason(entry_price, bid_price):
     if bid >= entry * (1.0 + V322_TAKE_PROFIT_PCT / 100.0):
         return "TAKE_PROFIT_1_15"
     if bid <= entry * (1.0 - V322_STOP_LOSS_PCT / 100.0):
-        return "STOP_LOSS_1_50"
+        return "STOP_LOSS_1_35"
     return None
 
 async def apply_live_entry(client, pos, candle_open_price, hold_ms):
@@ -8644,6 +8644,37 @@ def v53_latest_checkpoint_row(candles, symbol):
     }
 
 
+def v322_immediate_signal_row(candles, symbol):
+    """V32.2 only: last COMPLETED 5m candle signal, current candle live entry.
+
+    No 60-minute post-signal wait and no +0.75% continuation requirement.
+    The rolling z-score uses completed candles only (no future information).
+    """
+    entry_idx = len(candles) - 1
+    signal_i = entry_idx - 1
+    if signal_i < 294:
+        return None
+    completed = candles[:entry_idx]
+    ret30, mus, sigmas = precompute_rolling_volatility_v12(completed, 288)
+    if signal_i >= len(ret30):
+        return None
+    mom30 = ret30[signal_i]
+    mu, sigma = mus[signal_i], sigmas[signal_i]
+    if mom30 is None or mom30 <= 0 or mu is None or sigma is None or sigma <= 0:
+        return None
+    z = (mom30 - mu) / sigma
+    return {
+        "symbol": symbol,
+        "signal_time_ms": candles[signal_i]["close_time"],
+        "entry_open_time": candles[entry_idx]["open_time"],
+        "momentum_30m_pct": mom30,
+        "relative_momentum_z": z,
+        "behavior": "IMMEDIATE_SIGNAL",
+        "wait_end_change_pct": None,
+        "checkpoint_open": candles[entry_idx]["open"],
+    }
+
+
 async def v32_scan_once():
     V322_DIAG["scan_checks"] += 1
     import time as _t
@@ -8656,7 +8687,7 @@ async def v32_scan_once():
         for sym, candles in good.items():
             if sym == "BTCUSDT":
                 continue
-            row = v53_latest_checkpoint_row(candles, sym)
+            row = v322_immediate_signal_row(candles, sym)
             if row:
                 raw.append(row)
 
@@ -8696,8 +8727,6 @@ async def v32_scan_once():
                 continue
             if e["cross_section_percentile"] < 0.80:
                 continue
-            if e["behavior"] != "CONTINUED_UP":
-                continue
             vals = snapshots.get(e["signal_time_ms"], [])
             if not vals:
                 continue
@@ -8717,7 +8746,6 @@ async def v32_scan_once():
             group = sorted(
                 group,
                 key=lambda x: (
-                    x.get("wait_end_change_pct", 0.0),
                     x.get("relative_momentum_z", 0.0),
                     x.get("cross_section_percentile", 0.0),
                 ),
@@ -8748,7 +8776,7 @@ async def v32_scan_once():
                     "symbol": e.get("symbol"), "entry_open_time": e.get("entry_open_time"),
                     "z": round(float(e.get("relative_momentum_z", 0.0)), 4),
                     "percentile": round(float(e.get("cross_section_percentile", 0.0)), 4),
-                    "continuation_60m_pct": round(float(e.get("wait_end_change_pct", 0.0)), 4),
+                    "continuation_60m_pct": None,
                     "stage": kind,
                 }
                 if reason: row["reason"] = reason
@@ -8803,7 +8831,7 @@ async def v32_scan_once():
                 "relative_momentum_z": round(e["relative_momentum_z"], 4),
                 "cross_section_percentile": round(e["cross_section_percentile"], 4),
                 "cohort_size": e.get("cohort_size"),
-                "continuation_60m_pct": round(e["wait_end_change_pct"], 4),
+                "continuation_60m_pct": None,
                 "alt_market_mean_30m_pct": round(e["alt_market_mean_30m_pct"], 4),
                 "status": "OPEN_PAPER", "execution_version": "V53_CAUSAL_CHECKPOINT_OPEN",
             }
@@ -8824,6 +8852,8 @@ async def v32_scan_once():
             V322_DIAG["filter_passed"] += 1
             entry_funnel["quote_or_entry_attempted"] += 1
             ok_entry, skip_reason = await apply_live_entry(client, pos, price, V32_HOLD_MS)
+            if ok_entry and not pos.get("live_entry"):
+                ok_entry, skip_reason = False, "V322_IMMEDIATE_REQUIRES_LIVE_ASK"
             pos["execution_version"] = V55_EXECUTION_VERSION
             pos.update(v61_entry_context(good.get(e["symbol"]), good.get("BTCUSDT"), int(e["entry_open_time"]), pos.get("entry_price") or price))
             # V94: observational V62-style filter, no effect on entry/exit.
@@ -19635,6 +19665,10 @@ async def v322_exit_policy():
             "round_trip_cost_pct": V32_COST_PCT,
             "time_exit": False, "trailing_exit": False,
             "applies_to_existing_open_v322": True,
+            "entry_mode": "FIRST_SCAN_AFTER_COMPLETED_5M_SIGNAL",
+            "post_signal_continuation_min_pct": None,
+            "post_signal_wait_minutes": 0,
+            "live_ask_required": True,
             "note": "Price checks use observed bid; no real exchange orders."}
 
 @app.get("/v322-status")
