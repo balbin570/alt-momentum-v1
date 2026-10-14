@@ -8857,7 +8857,7 @@ async def v32_scan_once():
             _v322_context = v61_entry_context(good.get(e["symbol"]), good.get("BTCUSDT"), int(e["entry_open_time"]), float(price))
             _v322_pre = {**_v322_context, "relative_momentum_z": e.get("relative_momentum_z"),
                          "entry_delay_seconds": max(0.0, (alt_now_ms()-int(e["entry_open_time"]))/1000.0)}
-            _v322_gate = v321_candidate_tag(_v322_pre)
+            _v322_gate = v322_candidate_tag_without_ret60(_v322_pre)
             v323_observe_candidate(key, e.get("symbol"), _v322_pre, _v322_gate)
             V322_DIAG["filter_checked"] += 1
             if not _v322_gate["v321_pass"]:
@@ -8879,7 +8879,7 @@ async def v32_scan_once():
             # V95: observational momentum/volume filter; never blocks the paper entry.
             pos.update(v95_momentum_volume_tag(pos))
             # V32.1: prospective matched-cohort research tag (no change to V32 entries).
-            pos.update(v321_candidate_tag(pos))
+            pos.update(v322_candidate_tag_without_ret60(pos))
             # V32.2 final gate uses the ACTUAL live entry delay, not a placeholder.
             if ok_entry and not pos.get("v321_pass", False):
                 ok_entry = False
@@ -23812,6 +23812,19 @@ def v321_candidate_tag(pos):
     except (TypeError, ValueError, OverflowError):
         result["v321_reason"] = "INVALID_ENTRY_FEATURE"
         return result
+
+def v322_candidate_tag_without_ret60(pos):
+    """V32.2 execution-only filter: remove 60m return minimum; keep other V32.1 checks.
+
+    V32.1 shadow/research filter remains unchanged. Do not require a 60m
+    return feature for V32.2; a synthetic passing value is only passed to
+    the legacy shared validator, without changing the actual position data.
+    """
+    proxy = dict(pos)
+    proxy["ctx_ret_60m_pct"] = 3.9
+    result = v321_candidate_tag(proxy)
+    result["v321_version"] = "V32_2_FILTER_NO_RET60_MIN"
+    return result
 
 def v321_summary(rows):
     values = [float(t["net_pct"]) for t in rows if t.get("net_pct") is not None]
