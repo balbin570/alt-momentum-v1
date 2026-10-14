@@ -6234,14 +6234,32 @@ def prune_seen_keys(keys):
     return keys
 
 
+ALT_TG_DELIVERY = {"attempts": 0, "sent": 0, "failed": 0, "recent": []}
+
+
 async def alt_safe_send(msg, kind, symbol):
+    """Paper strategy notification; diagnostic only, no trading logic changes."""
     if kind not in {"V322_ENTRY", "V322_EXIT", "V893_ENTRY", "V893_EXIT", "V893B_ENTRY", "V893B_EXIT"}:
-        return {"type": kind, "symbol": symbol, "sent": False, "reason": "telegram_new_strategies_only"}
-    try:
-        res = await v22_telegram_send(msg)
-        return {"type": kind, "symbol": symbol, **res}
-    except Exception as e:
-        return {"type": kind, "symbol": symbol, "sent": False, "error": str(e)}
+        result = {"type": kind, "symbol": symbol, "sent": False, "reason": "telegram_new_strategies_only"}
+    else:
+        try:
+            res = await v22_telegram_send(msg)
+            result = {"type": kind, "symbol": symbol, **res}
+        except Exception as e:
+            result = {"type": kind, "symbol": symbol, "sent": False, "reason": type(e).__name__, "error": str(e)[:300]}
+    ALT_TG_DELIVERY["attempts"] += 1
+    ALT_TG_DELIVERY["sent" if result.get("sent") else "failed"] += 1
+    item = {"utc": utc_now(), **result}
+    ALT_TG_DELIVERY["recent"].append(item)
+    del ALT_TG_DELIVERY["recent"][:-60]
+    print(f"ALT_TG_DELIVERY kind={kind} symbol={symbol} sent={result.get('sent')} reason={result.get('reason', '-')} error={result.get('error', '-')}", flush=True)
+    return result
+
+
+@app.get("/alt-telegram-diagnostics")
+async def alt_telegram_diagnostics():
+    return {"status": "OK", "mode": "RESEARCH_PAPER_ONLY", "paper_only": True,
+            "note": "RAM counters since last restart; no historical replay", **ALT_TG_DELIVERY}
 
 
 def alt_entry_text(title, p, extra_lines, open_count):
