@@ -23814,8 +23814,8 @@ def v321_candidate_tag(pos):
         return result
 
 def v322_candidate_tag_without_ret60(pos):
-    """V32.2 only: no ret60 minimum; Z < 3.0. V32.1 remains unchanged."""
-    result = {"v321_version": "V32_2_FILTER_NO_RET60_Z_LT_3",
+    """V32.2 only: no ret60 minimum; Z >= 1.0 with no upper limit; volume >= 0.7, no upper limit. V32.1 remains unchanged."""
+    result = {"v321_version": "V32_2_FILTER_NO_RET60_Z_GTE_1_NO_MAX_VOL_GTE_0_7",
               "v321_pass": False, "v321_reason": "MISSING_ENTRY_FEATURE",
               "v321_research_only": True}
     fields = ("ctx_vol_ratio_15m_vs_4h", "relative_momentum_z", "entry_delay_seconds")
@@ -23827,8 +23827,8 @@ def v322_candidate_tag_without_ret60(pos):
             result["v321_reason"] = "INVALID_ENTRY_FEATURE"
             return result
         failures = []
-        if not (0.9 <= volume < 3.0): failures.append("VOLUME_OUTSIDE_0_9_TO_3")
-        if z >= 3.0: failures.append("Z_GTE_3")
+        if volume < 0.7: failures.append("VOLUME_LT_0_7")
+        if z < 1.0: failures.append("Z_LT_1")
         if delay < 0 or delay >= 60: failures.append("DELAY_OUTSIDE_0_TO_60")
         result["v321_pass"] = not failures
         result["v321_reason"] = "PASS" if not failures else "|".join(failures)
