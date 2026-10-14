@@ -23814,17 +23814,28 @@ def v321_candidate_tag(pos):
         return result
 
 def v322_candidate_tag_without_ret60(pos):
-    """V32.2 execution-only filter: remove 60m return minimum; keep other V32.1 checks.
-
-    V32.1 shadow/research filter remains unchanged. Do not require a 60m
-    return feature for V32.2; a synthetic passing value is only passed to
-    the legacy shared validator, without changing the actual position data.
-    """
-    proxy = dict(pos)
-    proxy["ctx_ret_60m_pct"] = 3.9
-    result = v321_candidate_tag(proxy)
-    result["v321_version"] = "V32_2_FILTER_NO_RET60_MIN"
-    return result
+    """V32.2 only: no ret60 minimum; Z < 3.0. V32.1 remains unchanged."""
+    result = {"v321_version": "V32_2_FILTER_NO_RET60_Z_LT_3",
+              "v321_pass": False, "v321_reason": "MISSING_ENTRY_FEATURE",
+              "v321_research_only": True}
+    fields = ("ctx_vol_ratio_15m_vs_4h", "relative_momentum_z", "entry_delay_seconds")
+    try:
+        if any(pos.get(k) is None for k in fields):
+            return result
+        volume, z, delay = (float(pos[k]) for k in fields)
+        if not all(math.isfinite(v) for v in (volume, z, delay)):
+            result["v321_reason"] = "INVALID_ENTRY_FEATURE"
+            return result
+        failures = []
+        if not (0.9 <= volume < 3.0): failures.append("VOLUME_OUTSIDE_0_9_TO_3")
+        if z >= 3.0: failures.append("Z_GTE_3")
+        if delay < 0 or delay >= 60: failures.append("DELAY_OUTSIDE_0_TO_60")
+        result["v321_pass"] = not failures
+        result["v321_reason"] = "PASS" if not failures else "|".join(failures)
+        return result
+    except (TypeError, ValueError, OverflowError):
+        result["v321_reason"] = "INVALID_ENTRY_FEATURE"
+        return result
 
 def v321_summary(rows):
     values = [float(t["net_pct"]) for t in rows if t.get("net_pct") is not None]
