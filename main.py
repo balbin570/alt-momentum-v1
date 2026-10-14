@@ -6123,6 +6123,23 @@ V55_HARD_STOP_PCT = 3.0
 V55_TRAIL_ACTIVATE_PCT = 2.0
 V55_TRAIL_DISTANCE_PCT = 1.5
 
+# V32.2-only fixed take-profit / stop-loss policy (gross price levels).
+# No time exit, no trailing exit, no other exit triggers.
+V322_TP_SL_VERSION = "V322_TP115_SL150_NO_TIME"
+V322_TAKE_PROFIT_PCT = 1.15
+V322_STOP_LOSS_PCT = 1.50
+
+def v322_tp_sl_reason(entry_price, bid_price):
+    entry = float(entry_price)
+    bid = float(bid_price)
+    if entry <= 0 or bid <= 0:
+        return None
+    if bid >= entry * (1.0 + V322_TAKE_PROFIT_PCT / 100.0):
+        return "TAKE_PROFIT_1_15"
+    if bid <= entry * (1.0 - V322_STOP_LOSS_PCT / 100.0):
+        return "STOP_LOSS_1_50"
+    return None
+
 async def apply_live_entry(client, pos, candle_open_price, hold_ms):
     """
     Paper girisini gercekte alinabilecek fiyata cevirir.
@@ -8830,6 +8847,15 @@ async def v32_scan_once():
                 "trail_distance_pct": V55_TRAIL_DISTANCE_PCT,
                 "max_hold_minutes": 120,
             }
+            if pos.get("strategy_version") == "V32_2":
+                pos["risk_engine"] = {
+                    "version": V322_TP_SL_VERSION,
+                    "take_profit_pct": V322_TAKE_PROFIT_PCT,
+                    "stop_loss_pct": V322_STOP_LOSS_PCT,
+                    "max_hold_minutes": None,
+                    "trailing_enabled": False,
+                    "paper_only": True,
+                }
             pos["peak_bid"] = pos.get("live_bid") or pos.get("entry_price")
             pos["peak_gain_pct"] = round(pct_change(pos["entry_price"], pos["peak_bid"]), 4)
             pos["trailing_active"] = False
@@ -8857,6 +8883,33 @@ async def v32_scan_once():
 
         newly_closed = []
         for sym, pos in list(V32_STATE["open"].items()):
+            # V32.2 only: two fixed price exits, including positions opened
+            # before this deployment. Never apply legacy/time/trailing exits.
+            if pos.get("strategy_version") == "V32_2":
+                q = await live_quote(client, sym)
+                if V32_STATE["open"].get(sym) is not pos:
+                    continue  # fast monitor already closed it
+                if not q:
+                    continue  # do not invent a price or time-based fallback
+                bid = float(q["bid"])
+                reason = v322_tp_sl_reason(pos["entry_price"], bid)
+                if reason is None:
+                    continue
+                now_ms = alt_now_ms()
+                gross = pct_change(pos["entry_price"], bid)
+                closed = {
+                    **pos, "status": "CLOSED_PAPER", "exit_open_time": now_ms,
+                    "exit_price": bid, "gross_pct": round(gross, 4),
+                    "cost_pct": V32_COST_PCT, "net_pct": round(gross - V32_COST_PCT, 4),
+                    "exit_reason": reason, "exit_execution_version": V322_TP_SL_VERSION,
+                }
+                closed.update(v61_exit_diagnostics(closed, "SCAN"))
+                V32_STATE["closed"].append(closed)
+                del V32_STATE["open"][sym]
+                newly_closed.append(closed)
+                v59_register_counterfactual(closed)
+                continue
+
             candles_all = good.get(sym)
             is_v55 = pos.get("execution_version") == V55_EXECUTION_VERSION
 
@@ -12361,6 +12414,7 @@ async def v61_fast_stop_once(client):
     open_pos = {
         sym: p for sym, p in V32_STATE["open"].items()
         if p.get("execution_version") == V55_EXECUTION_VERSION
+        or p.get("strategy_version") == "V32_2"
     }
     V61_FAST["positions_watched"] = len(open_pos)
     if not open_pos:
@@ -12417,6 +12471,23 @@ async def v61_fast_stop_once(client):
         if bid <= 0:
             continue
         entry = float(pos["entry_price"])
+        if pos.get("strategy_version") == "V32_2":
+            reason = v322_tp_sl_reason(entry, bid)
+            if reason is None:
+                continue
+            gross = pct_change(entry, bid)
+            closed = {
+                **pos, "status": "CLOSED_PAPER", "exit_open_time": now_ms,
+                "exit_price": bid, "gross_pct": round(gross, 4),
+                "cost_pct": V32_COST_PCT, "net_pct": round(gross - V32_COST_PCT, 4),
+                "exit_reason": reason, "exit_execution_version": V322_TP_SL_VERSION,
+            }
+            closed.update(v61_exit_diagnostics(closed, "FAST_3S"))
+            v59_register_counterfactual(closed)
+            V32_STATE["closed"].append(closed)
+            del V32_STATE["open"][sym]
+            closed_now.append(closed)
+            continue
         peak = max(float(pos.get("peak_bid") or entry), bid)
         pos["peak_bid"] = peak
         pos["peak_gain_pct"] = round(pct_change(entry, peak), 4)
@@ -19554,6 +19625,17 @@ async def v322_diagnostics():
 async def v893_diagnostics():
     return {**MODE_INFO, "status": "OK", "paper_only": True,
             "diagnostics": V893_DIAG, "note": "RAM counters since last restart; read-only"}
+
+@app.get("/v322-exit-policy")
+async def v322_exit_policy():
+    return {**MODE_INFO, "status": "OK", "strategy": "V32_2",
+            "paper_only": True, "version": V322_TP_SL_VERSION,
+            "take_profit_gross_pct": V322_TAKE_PROFIT_PCT,
+            "stop_loss_gross_pct": V322_STOP_LOSS_PCT,
+            "round_trip_cost_pct": V32_COST_PCT,
+            "time_exit": False, "trailing_exit": False,
+            "applies_to_existing_open_v322": True,
+            "note": "Price checks use observed bid; no real exchange orders."}
 
 @app.get("/v322-status")
 async def v322_status():
