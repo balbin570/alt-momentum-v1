@@ -4,7 +4,7 @@ import statistics
 import inspect
 import psycopg
 # ============================================================
-# V61.2 SAFE EVENT-STUDY PATCH
+# V61.2 SAFE EVENT-STUDY PATCH   
 # ------------------------------------------------------------
 # V61.1 strategy / entry / risk / FAST_3S behavior is unchanged.
 # This patch adds a persistent, low-load event-study job registry
