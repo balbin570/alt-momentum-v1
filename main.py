@@ -1,3 +1,4 @@
+# DEPLOY CHECK 2026-10-14: comment-only change; no strategy or runtime behavior modified.
 from datetime import timedelta
 import bisect
 import statistics
