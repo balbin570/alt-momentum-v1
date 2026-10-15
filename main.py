@@ -1,3 +1,7 @@
+# BACKGROUND MEMORY FIX 2026-10-15
+# Only V32 (includes V32.2) and V89 (includes V89.3) auto-scanners start.
+# Other historical research startup workers are disabled; manual endpoints retained.
+# No real orders. Previous open trade state is not deleted.
 # DEPLOY CHECK 2026-10-14: comment-only change; no strategy or runtime behavior modified.
 from datetime import timedelta
 import bisect
@@ -6834,7 +6838,8 @@ async def v21_auto_loop():
         await asyncio.sleep(V21_SCAN_INTERVAL_SECONDS)
 
 
-@app.on_event("startup")
+# DISABLED_BACKGROUND_STARTUP_MEMORY_FIX: v21_startup
+# @app.on_event("startup")
 async def v21_startup():
     global V21_AUTO_TASK
     try:
@@ -6997,7 +7002,8 @@ async def v22_auto_loop():
 
 
 # Replace the V21 startup task with the V22 notification-aware loop.
-@app.on_event("startup")
+# DISABLED_BACKGROUND_STARTUP_MEMORY_FIX: v22_startup
+# @app.on_event("startup")
 async def v22_startup():
     global V21_AUTO_TASK
     # V21 startup may already have created its loop. Cancel it so there is
@@ -9931,7 +9937,8 @@ async def v35_watch_loop():
         await asyncio.sleep(1.0)
 
 
-@app.on_event("startup")
+# DISABLED_BACKGROUND_STARTUP_MEMORY_FIX: v35_startup
+# @app.on_event("startup")
 async def v35_startup():
     global V35_TASK
     V35_TASK = asyncio.create_task(v35_watch_loop())
@@ -10504,7 +10511,8 @@ async def v37_loop():
         await asyncio.sleep(V37_SCAN_INTERVAL_SECONDS)
 
 
-@app.on_event("startup")
+# DISABLED_BACKGROUND_STARTUP_MEMORY_FIX: v37_startup
+# @app.on_event("startup")
 async def v37_startup():
     global V37_TASK
     V37_TASK = asyncio.create_task(v37_loop())
@@ -11302,7 +11310,8 @@ async def alt_daily_summary_loop():
         await asyncio.sleep(300)
 
 
-@app.on_event("startup")
+# DISABLED_BACKGROUND_STARTUP_MEMORY_FIX: alt_daily_summary_startup
+# @app.on_event("startup")
 async def alt_daily_summary_startup():
     asyncio.create_task(alt_daily_summary_loop())
 
@@ -12693,7 +12702,8 @@ async def v61_fast_loop():
             await asyncio.sleep(5)
 
 
-@app.on_event("startup")
+# DISABLED_BACKGROUND_STARTUP_MEMORY_FIX: v61_startup
+# @app.on_event("startup")
 async def v61_startup():
     global V61_FAST_TASK
     if V61_FAST_ENABLED and V61_FAST_TASK is None:
@@ -13544,7 +13554,8 @@ async def _v612_run_existing_study(params):
         V612_JOB["finished_utc"] = _v612_now()
         v612_save()
 
-@app.on_event("startup")
+# DISABLED_BACKGROUND_STARTUP_MEMORY_FIX: v612_startup
+# @app.on_event("startup")
 async def v612_startup():
     try:
         v612_db_init()
@@ -15258,7 +15269,8 @@ async def v74_loop():
       except Exception:pass
       await asyncio.sleep(V74_SCAN_SECONDS)
 
-@app.on_event("startup")
+# DISABLED_BACKGROUND_STARTUP_MEMORY_FIX: v74_startup
+# @app.on_event("startup")
 async def v74_startup():
     global V74_TASK
     try:v74_load()
@@ -16398,7 +16410,8 @@ async def v794_autoresume():
     except Exception:
       pass
 
-@app.on_event("startup")
+# DISABLED_BACKGROUND_STARTUP_MEMORY_FIX: v794_startup_resume
+# @app.on_event("startup")
 async def v794_startup_resume():
     asyncio.create_task(v794_autoresume())
 
@@ -17285,7 +17298,8 @@ async def v82_status():
       "v61_unchanged":True,"v74_unchanged":True,
       "study":job,"generated_utc":utc_now()}
 
-@app.on_event("startup")
+# DISABLED_BACKGROUND_STARTUP_MEMORY_FIX: v82_autoresume_startup
+# @app.on_event("startup")
 async def v82_autoresume_startup():
     global V82_TASK
     try:
@@ -17773,7 +17787,8 @@ async def v831_status():
         "generated_utc":utc_now()
     }
 
-@app.on_event("startup")
+# DISABLED_BACKGROUND_STARTUP_MEMORY_FIX: v831_resume
+# @app.on_event("startup")
 async def v831_resume():
     global V831_TASK
     try:
@@ -18017,7 +18032,8 @@ async def v84_status():
             "trading":False,"orders":False,"active_strategy_changed":False,
             "v61_unchanged":True,"v74_unchanged":True,"study":s,"generated_utc":utc_now()}
 
-@app.on_event("startup")
+# DISABLED_BACKGROUND_STARTUP_MEMORY_FIX: v84_resume
+# @app.on_event("startup")
 async def v84_resume():
     global V84_TASK
     try:
@@ -18273,7 +18289,8 @@ async def v85_telegram():
     res=await v22_telegram_send(v85_tg_text(s["result"]))
     return {"status":"OK","telegram":res,"trading":False,"orders":False}
 
-@app.on_event("startup")
+# DISABLED_BACKGROUND_STARTUP_MEMORY_FIX: v85_resume
+# @app.on_event("startup")
 async def v85_resume():
     global V85_TASK
     try:
@@ -18463,7 +18480,8 @@ async def v86_telegram():
     x=await v22_telegram_send(v86_tg_text(s["result"]))
     return {"status":"OK","telegram":x,"trading":False,"orders":False}
 
-@app.on_event("startup")
+# DISABLED_BACKGROUND_STARTUP_MEMORY_FIX: v86_resume
+# @app.on_event("startup")
 async def v86_resume():
     global V86_TASK
     try:
@@ -19354,7 +19372,8 @@ async def v323b_telegram_loop():
             print("V323B_TELEGRAM_ERROR", V323B_TG_LAST["last_error"], flush=True)
         await asyncio.sleep(45)
 
-@app.on_event("startup")
+# DISABLED_BACKGROUND_STARTUP_MEMORY_FIX: v323b_telegram_startup
+# @app.on_event("startup")
 async def v323b_telegram_startup():
     # ROLLBACK: disable V32.3-B background worker without changing legacy strategies.
     return
@@ -19420,7 +19439,8 @@ async def v323b_db_loop():
             V323B_DB_HEALTH["last_error"] = f"{type(exc).__name__}: {str(exc)[:180]}"
         await asyncio.sleep(15)
 
-@app.on_event("startup")
+# DISABLED_BACKGROUND_STARTUP_MEMORY_FIX: v323b_db_startup
+# @app.on_event("startup")
 async def v323b_db_startup():
     # ROLLBACK: disable V32.3-B background worker without changing legacy strategies.
     return
@@ -19551,7 +19571,8 @@ async def v323b_trade_db_loop():
             V323B_TRADE_DB_HEALTH["last_error"] = f"{type(exc).__name__}: {str(exc)[:180]}"
         await asyncio.sleep(90)
 
-@app.on_event("startup")
+# DISABLED_BACKGROUND_STARTUP_MEMORY_FIX: v323b_trade_db_startup
+# @app.on_event("startup")
 async def v323b_trade_db_startup():
     # ROLLBACK: disable V32.3-B background worker without changing legacy strategies.
     return
@@ -20062,7 +20083,8 @@ async def v91_loop():
         await asyncio.sleep(V91_POLL_SECONDS)
 
 
-@app.on_event("startup")
+# DISABLED_BACKGROUND_STARTUP_MEMORY_FIX: v91_startup
+# @app.on_event("startup")
 async def v91_startup():
     global V91_TASK
     try:v91_load()
@@ -20214,7 +20236,8 @@ def v93_init():
     except Exception as exc:
         V93_ACTIVATION_ERROR = f"{type(exc).__name__}: {str(exc)[:200]}"
 
-@app.on_event("startup")
+# DISABLED_BACKGROUND_STARTUP_MEMORY_FIX: v93_startup
+# @app.on_event("startup")
 async def v93_startup():
     v93_init()
 
@@ -24197,7 +24220,8 @@ async def v321_independent_exit_loop():
             V321_SHADOW["last_error"]="exit loop: "+str(exc)
         await asyncio.sleep(3)
 
-@app.on_event("startup")
+# DISABLED_BACKGROUND_STARTUP_MEMORY_FIX: v321_independent_startup
+# @app.on_event("startup")
 async def v321_independent_startup():
     global V321_SHADOW_TASK
     try:
@@ -25914,7 +25938,8 @@ async def v134_poll_loop():
             print('V134 independent prospective poll error:',type(exc).__name__,str(exc)[:180],flush=True)
         await asyncio.sleep(300)
 
-@app.on_event('startup')
+# DISABLED_BACKGROUND_STARTUP_MEMORY_FIX: v134_startup
+# @app.on_event('startup')
 async def v134_startup():
     global V134_POLL_TASK
     if os.getenv('DATABASE_URL','').strip() and V134_POLL_TASK is None:
