@@ -6128,12 +6128,13 @@ V55_TRAIL_DISTANCE_PCT = 1.5
 # Existing 0.15% round-trip cost is subtracted ONCE at closure.
 # A new attempt begins only after a 0.40 percentage-point pullback
 # from the highest observed bid of the preceding attempt.
-# Existing -1.35% gross stop stays active at every stage.
-V322_TP_SL_VERSION = "V322_THREE_ATTEMPT_NET3_2_1_SL135"
+# Two-cycle stop: first -1.00%, or -0.50% after recovery to entry.
+V322_TP_SL_VERSION = "V322_NET3_2_1_TWO_CYCLE_STOP100_050"
 V322_TAKE_PROFIT_PCT = 3.15
 V322_SECOND_TAKE_PROFIT_PCT = 2.15
 V322_THIRD_TAKE_PROFIT_PCT = 1.15
-V322_STOP_LOSS_PCT = 1.35
+V322_STOP_LOSS_PCT = 1.0
+V322_SECOND_CYCLE_STOP_PCT = 0.50
 V322_PULLBACK_PCT_POINTS = 0.40
 
 
@@ -6145,15 +6146,28 @@ def v322_tp_sl_reason(pos, bid_price):
     attempt 2: seek +2.15% gross on a fresh upward crossing.
     If that attempt also retraces >=0.40 points before hitting its target,
     attempt 3: seek +1.15% gross on a fresh upward crossing.
-    Stops always have priority. No time exit or live orders.
+    Two-cycle stops always have priority. No time exit or live orders.
     """
     entry = float(pos.get("entry_price") or 0)
     bid = float(bid_price or 0)
     if entry <= 0 or bid <= 0:
         return None
     gain = pct_change(entry, bid)
-    if bid <= entry * (1.0 - V322_STOP_LOSS_PCT / 100.0):
-        return "STOP_LOSS_1_35"
+    # Stop cycle: first touch -0.50% arms the first dip; -1.00% exits.
+    # Only a return to entry (gross breakeven) after that dip enables
+    # the second cycle, whose next -0.50% touch exits.
+    # This state is persisted on the paper position across scan calls.
+    if bool(pos.get("v322_stop_second_cycle", False)):
+        if gain <= -V322_SECOND_CYCLE_STOP_PCT:
+            return "STOP_LOSS_CYCLE2_0_50"
+    else:
+        if gain <= -V322_STOP_LOSS_PCT:
+            return "STOP_LOSS_CYCLE1_1_00"
+        if gain <= -V322_SECOND_CYCLE_STOP_PCT:
+            pos["v322_stop_first_dip_seen"] = True
+        elif gain >= 0.0 and bool(pos.get("v322_stop_first_dip_seen", False)):
+            pos["v322_stop_second_cycle"] = True
+            pos["v322_stop_second_cycle_utc"] = utc_now()
 
     stage = max(1, min(3, int(pos.get("v322_attempt", 1))))
     peak = max(float(pos.get("v322_attempt_peak_gain_pct", gain)), gain)
@@ -8957,6 +8971,7 @@ async def v32_scan_once():
                     "third_take_profit_pct": V322_THIRD_TAKE_PROFIT_PCT,
                     "pullback_pct_points": V322_PULLBACK_PCT_POINTS,
                     "stop_loss_pct": V322_STOP_LOSS_PCT,
+                    "second_cycle_stop_pct": V322_SECOND_CYCLE_STOP_PCT,
                     "max_hold_minutes": None,
                     "trailing_enabled": False,
                     "paper_only": True,
@@ -18680,7 +18695,7 @@ async def v89_scan_once():
     try:
       async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
         uni=await build_universe(client);syms=[u["symbol"] for u in uni if u["symbol"]!="BTCUSDT"][:40]
-        sem=asyncio.Semaphore(12)
+        sem=asyncio.Semaphore(4)
         async def one(sym):
           async with sem:
             try:return sym,await asyncio.wait_for(v74_candles(client,sym,90),25),None
@@ -18988,7 +19003,7 @@ async def v89_scan_once():
                 v89_save()
                 await alt_safe_send(f"ALT V89.3 PAPER GIRIS\nCoin: {e3['symbol']}\nBreakout: {e3['breakout_change_pct']:.3f}% | Vol: {e3['volume_ratio']:.2f}x\nDisp30: {disp30:.3f}\nSTOP -3% / TIME120 | GERCEK EMIR YOK","V893_ENTRY",e3["symbol"])
         # Independent V89.3-B Top1 paper entry. Never promote a lower-ranked candidate.
-        if candidates_b:
+        if False and candidates_b:  # V89.3-B new entries disabled; existing exits/history retained.
           eb=candidates_b[0]
           keyb=f'{eb["symbol"]}:{eb["breakout_time"]}'
           seenb=set(V89_STATE.get("v893b_seen",[]))
@@ -19746,6 +19761,9 @@ async def v322_exit_policy():
             "third_take_profit_gross_pct": V322_THIRD_TAKE_PROFIT_PCT,
             "pullback_pct_points": V322_PULLBACK_PCT_POINTS,
             "stop_loss_gross_pct": V322_STOP_LOSS_PCT,
+            "second_cycle_stop_gross_pct": V322_SECOND_CYCLE_STOP_PCT,
+            "second_cycle_requires_first_dip_pct": -0.50,
+            "second_cycle_requires_recovery_to_entry": True,
             "round_trip_cost_pct": V32_COST_PCT,
             "time_exit": False, "trailing_exit": False,
             "applies_to_existing_open_v322": True,
@@ -19753,7 +19771,7 @@ async def v322_exit_policy():
             "post_signal_continuation_min_pct": None,
             "post_signal_wait_minutes": 0,
             "live_ask_required": True,
-            "note": "Three-attempt paper exit ladder; bid checks; existing cost applied once; no real orders."}
+            "note": "Three-stage profit ladder plus two-cycle gross stop; bid checks; cost applied once; no real orders."}
 
 @app.get("/v322-status")
 async def v322_status():
