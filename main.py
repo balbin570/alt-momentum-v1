@@ -26101,3 +26101,78 @@ async def prospective_audit_v135():
     except Exception as exc:
         return {**MODE_INFO,'status':'UNAVAILABLE','error_type':type(exc).__name__,
                 'message':'V134 tables may not be initialized or database is unavailable'}
+
+
+# Lightweight, read-only RAM diagnostics. No background worker or network calls.
+@app.get("/memory")
+def memory_diagnostics():
+    import os
+    import resource
+
+    def _read_int(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                value = f.read().strip()
+            return int(value) if value != "max" else None
+        except (OSError, ValueError):
+            return None
+
+    def _mb(value):
+        return round(value / (1024 * 1024), 2) if value is not None else None
+
+    # Linux process resident set size (current).
+    rss_pages = None
+    try:
+        with open("/proc/self/statm", "r", encoding="utf-8") as f:
+            rss_pages = int(f.read().split()[1])
+        process_rss = rss_pages * os.sysconf("SC_PAGE_SIZE")
+    except (OSError, ValueError, IndexError):
+        process_rss = None
+
+    # Linux ru_maxrss is reported in KiB: process high-water mark.
+    try:
+        process_peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
+    except (OSError, ValueError):
+        process_peak = None
+
+    # cgroup v2 includes memory charged to the whole container.
+    cgroup_current = _read_int("/sys/fs/cgroup/memory.current")
+    cgroup_peak = _read_int("/sys/fs/cgroup/memory.peak")
+    cgroup_limit = _read_int("/sys/fs/cgroup/memory.max")
+
+    # cgroup v1 fallback.
+    if cgroup_current is None:
+        cgroup_current = _read_int("/sys/fs/cgroup/memory/memory.usage_in_bytes")
+        cgroup_peak = _read_int("/sys/fs/cgroup/memory/memory.max_usage_in_bytes")
+        cgroup_limit = _read_int("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+
+    # A huge value may be a v1 'unlimited' sentinel.
+    if cgroup_limit is not None and cgroup_limit > 1 << 50:
+        cgroup_limit = None
+
+    configured_limit = 512 * 1024 * 1024
+    effective_limit = cgroup_limit if cgroup_limit is not None else configured_limit
+    observed = cgroup_current if cgroup_current is not None else process_rss
+    usage_pct = round(observed / effective_limit * 100, 2) if observed is not None else None
+    if usage_pct is None:
+        level = "UNKNOWN"
+    elif usage_pct >= 90:
+        level = "CRITICAL"
+    elif usage_pct >= 80:
+        level = "WARNING"
+    else:
+        level = "OK"
+
+    return {
+        "status": level,
+        "paper_only": True,
+        "memory_source": "cgroup" if cgroup_current is not None else "process_rss",
+        "container_current_mb": _mb(cgroup_current),
+        "container_peak_mb": _mb(cgroup_peak),
+        "container_limit_mb": _mb(cgroup_limit),
+        "render_free_reference_limit_mb": 512,
+        "process_current_mb": _mb(process_rss),
+        "process_peak_mb": _mb(process_peak),
+        "usage_pct_of_limit": usage_pct,
+        "note": "Container peak is available only when exposed by Linux cgroups; peak resets on instance restart. Endpoint does not start any background work."
+    }
