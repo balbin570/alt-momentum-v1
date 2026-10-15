@@ -6133,11 +6133,12 @@ V55_TRAIL_DISTANCE_PCT = 1.5
 # A new attempt begins only after a 0.40 percentage-point pullback
 # from the highest observed bid of the preceding attempt.
 # Two-cycle stop: first -1.00%, or -0.50% after recovery to entry.
-V322_TP_SL_VERSION = "V322_NET3_2_1_TWO_CYCLE_STOP100_050"
+V322_TP_SL_VERSION = "V322_NET3_2_1_TWO_CYCLE_STOP085_050_TIME90"
 V322_TAKE_PROFIT_PCT = 3.15
 V322_SECOND_TAKE_PROFIT_PCT = 2.15
 V322_THIRD_TAKE_PROFIT_PCT = 1.15
-V322_STOP_LOSS_PCT = 1.0
+V322_STOP_LOSS_PCT = 0.85  # gross -0.85%; net about -1.00% after 0.15% cost
+V322_TIME_EXIT_MS = 90 * 60 * 1000
 V322_SECOND_CYCLE_STOP_PCT = 0.50
 V322_PULLBACK_PCT_POINTS = 0.40
 
@@ -6150,7 +6151,7 @@ def v322_tp_sl_reason(pos, bid_price):
     attempt 2: seek +2.15% gross on a fresh upward crossing.
     If that attempt also retraces >=0.40 points before hitting its target,
     attempt 3: seek +1.15% gross on a fresh upward crossing.
-    Two-cycle stops always have priority. No time exit or live orders.
+    Two-cycle stops always have priority. Time90 applies only if first dip was never seen. No live orders.
     """
     entry = float(pos.get("entry_price") or 0)
     bid = float(bid_price or 0)
@@ -6166,12 +6167,20 @@ def v322_tp_sl_reason(pos, bid_price):
             return "STOP_LOSS_CYCLE2_0_50"
     else:
         if gain <= -V322_STOP_LOSS_PCT:
-            return "STOP_LOSS_CYCLE1_1_00"
+            return "STOP_LOSS_CYCLE1_NET1_00"
         if gain <= -V322_SECOND_CYCLE_STOP_PCT:
             pos["v322_stop_first_dip_seen"] = True
         elif gain >= 0.0 and bool(pos.get("v322_stop_first_dip_seen", False)):
             pos["v322_stop_second_cycle"] = True
             pos["v322_stop_second_cycle_utc"] = utc_now()
+
+    # A position without any observed -0.50% first dip is closed at the
+    # current live BID after 90 minutes, regardless of its current P/L.
+    # Use the actual entry execution timestamp when available.
+    entry_ms = int(pos.get("entry_live_ms") or pos.get("entry_open_time") or 0)
+    if (entry_ms > 0 and alt_now_ms() - entry_ms >= V322_TIME_EXIT_MS
+            and not bool(pos.get("v322_stop_first_dip_seen", False))):
+        return "TIME90_NO_FIRST_DIP"
 
     stage = max(1, min(3, int(pos.get("v322_attempt", 1))))
     peak = max(float(pos.get("v322_attempt_peak_gain_pct", gain)), gain)
@@ -8978,12 +8987,15 @@ async def v32_scan_once():
                     "pullback_pct_points": V322_PULLBACK_PCT_POINTS,
                     "stop_loss_pct": V322_STOP_LOSS_PCT,
                     "second_cycle_stop_pct": V322_SECOND_CYCLE_STOP_PCT,
-                    "max_hold_minutes": None,
+                    "max_hold_minutes": 120,
+                    "time_exit_condition": "ONLY_IF_NO_FIRST_DIP_0_50",
                     "trailing_enabled": False,
                     "paper_only": True,
                 }
             if pos.get("strategy_version") == "V32_2":
                 pos["v322_attempt"] = 1
+                pos["v322_stop_first_dip_seen"] = False
+                pos["v322_stop_second_cycle"] = False
                 pos["v322_attempt_peak_gain_pct"] = 0.0
                 pos["v322_peak_gain_all_pct"] = 0.0
                 pos["v322_rebound_ready"] = False
@@ -19786,21 +19798,28 @@ async def v322_exit_policy():
             "second_cycle_requires_first_dip_pct": -0.50,
             "second_cycle_requires_recovery_to_entry": True,
             "round_trip_cost_pct": V32_COST_PCT,
-            "time_exit": False, "trailing_exit": False,
+            "time_exit": True, "time_exit_minutes": 90, "time_exit_condition": "NO_FIRST_DIP_0_50", "trailing_exit": False,
             "applies_to_existing_open_v322": True,
             "entry_mode": "FIRST_SCAN_AFTER_COMPLETED_5M_SIGNAL",
             "post_signal_continuation_min_pct": None,
             "post_signal_wait_minutes": 0,
             "live_ask_required": True,
-            "note": "Three-stage profit ladder plus two-cycle gross stop; bid checks; cost applied once; no real orders."}
+            "note": "Three-stage profit ladder; cycle1 gross -0.85% (net about -1%); cycle2 gross -0.5% after recovery; TIME90 only without first dip; paper only."}
 
 @app.get("/v322-status")
 async def v322_status():
     cl=[p for p in V32_STATE.get("closed",[]) if p.get("strategy_version")=="V32_2"]
     op=[p for p in V32_STATE.get("open",{}).values() if p.get("strategy_version")=="V32_2"]
+    visible_open=[]
+    for p in op[-10:]:
+        first=bool(p.get("v322_stop_first_dip_seen",False))
+        second=bool(p.get("v322_stop_second_cycle",False))
+        state="CYCLE2_ACTIVE" if second else ("FIRST_DIP_SEEN_WAITING_FOR_RECOVERY" if first else "CYCLE1_WAITING_FOR_FIRST_DIP")
+        visible_open.append({**p,"v322_stop_first_dip_seen":first,
+                             "v322_stop_second_cycle":second,"v322_stop_cycle_state":state})
     return {**MODE_INFO,"status":"OK","version":"V32_2","paper_only":True,
             "open_count":len(op),"closed_count":len(cl),"performance":v321_summary(cl),
-            "open":op[-10:],"recent_closed":cl[-20:],"generated_utc":utc_now()}
+            "open":visible_open,"recent_closed":cl[-20:],"generated_utc":utc_now()}
 
 @app.get("/v893-status")
 async def v893_status():
