@@ -8776,6 +8776,23 @@ def v322_immediate_signal_row(candles, symbol):
     }
 
 
+# V32.2 only: explicit base-asset exclusion; do not match substrings such as "USD".
+# USDT is the quote currency for this scan. U and USDS are stablecoin bases.
+V322_EXCLUDED_STABLE_BASES = frozenset({
+    "U", "USDS", "USDC", "USDT", "FDUSD", "TUSD", "USDD", "USDE",
+    "USD1", "USDY", "PYUSD", "DAI", "FRAX", "LUSD", "RLUSD",
+    "EURC", "EURCV", "EURI", "AEUR", "EUR", "EURS", "BRL", "TRY",
+    "BUSD", "USTC", "UST", "GUSD", "PAX", "SUSD", "USDP", "USDN",
+})
+
+
+def v322_is_excluded_stable_pair(symbol):
+    symbol = str(symbol or "").upper().strip()
+    if not symbol.endswith("USDT"):
+        return False
+    return symbol[:-4] in V322_EXCLUDED_STABLE_BASES
+
+
 async def v32_scan_once():
     V322_DIAG["scan_checks"] += 1
     import time as _t
@@ -8786,7 +8803,7 @@ async def v32_scan_once():
 
         raw = []
         for sym, candles in good.items():
-            if sym == "BTCUSDT":
+            if sym == "BTCUSDT" or v322_is_excluded_stable_pair(sym):
                 continue
             row = v322_immediate_signal_row(candles, sym)
             if row:
@@ -8812,7 +8829,7 @@ async def v32_scan_once():
         # Frozen selected-alt 30m mean at the ORIGINAL signal timestamp.
         snapshots = {}
         for sym, candles in good.items():
-            if sym == "BTCUSDT":
+            if sym == "BTCUSDT" or v322_is_excluded_stable_pair(sym):
                 continue
             # Exclude the current/in-progress candle from market-history calculations.
             completed = candles[:-1]
