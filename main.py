@@ -6248,7 +6248,7 @@ ALT_TG_DELIVERY = {"attempts": 0, "sent": 0, "failed": 0, "recent": []}
 
 async def alt_safe_send(msg, kind, symbol):
     """Paper strategy notification; diagnostic only, no trading logic changes."""
-    if kind not in {"V322_ENTRY", "V322_EXIT", "V893_ENTRY", "V893_EXIT", "V894_ENTRY", "V894_EXIT", "V895_ENTRY", "V895_EXIT", "V896_ENTRY", "V896_EXIT"}:
+    if kind not in {"V322_ENTRY", "V322_EXIT", "V893_ENTRY", "V893_EXIT", "V894_ENTRY", "V894_EXIT", "V895_ENTRY", "V895_EXIT", "V896_ENTRY", "V896_EXIT", "V897_ENTRY", "V897_EXIT", "V897_DAILY"}:
         result = {"type": kind, "symbol": symbol, "sent": False, "reason": "telegram_new_strategies_only"}
     else:
         try:
@@ -6868,7 +6868,10 @@ async def v22_telegram_send(message: str):
             message.startswith("ALT V895 PAPER GIRIS\n") or
             message.startswith("ALT V895 PAPER CIKIS\n") or
             message.startswith("ALT V896 PAPER GIRIS\n") or
-            message.startswith("ALT V896 PAPER CIKIS\n")):
+            message.startswith("ALT V896 PAPER CIKIS\n") or
+            message.startswith("ALT V897 PAPER GIRIS\n") or
+            message.startswith("ALT V897 PAPER CIKIS\n") or
+            message.startswith("ALT V897 GUNLUK OZET\n")):
         return {"sent": False, "reason": "telegram_new_strategies_only"}
     if not V22_TG_TOKEN or not V22_TG_CHAT_ID:
         return {"sent": False, "reason": "telegram_not_configured"}
@@ -18799,6 +18802,57 @@ async def v89_scan_once():
             await alt_safe_send(f"ALT {tag} PAPER CIKIS\nCoin: {pv['symbol']}\nNet: {pv['net_pct']}%\nCikis: {reasonv}\nGERCEK EMIR YOK",tag+"_EXIT",pv["symbol"])
           V89_STATE[variant+"_open"]=still_variant
           V89_STATE[variant+"_closed"]=V89_STATE.get(variant+"_closed",[])[-1000:]
+        # V89.7 independent challenger exits; paper only.
+        v897_still=[]
+        for pv in V89_STATE.get("v897_open", []):
+          duev=now>=int(pv["exit_due_ms"])
+          pv["last_stop_check_utc"]=utc_now()
+          try:qv=await live_quote(client,pv["symbol"])
+          except Exception as excv:
+            qv=None
+            pv["last_quote_error"]=f"{type(excv).__name__}: {excv}"[:250]
+          xpv=float(qv["bid"]) if qv and qv.get("bid") is not None else None
+          if xpv is None:
+            pv["missing_quote_checks"]=int(pv.get("missing_quote_checks",0))+1
+            if not duev:
+              v897_still.append(pv);continue
+            cv=data.get(pv["symbol"],[])
+            xpv=float(cv[-1]["close"]) if cv else float(pv["entry_price"])
+          grossv=v74_pct(float(pv["entry_price"]),xpv)
+          pv["last_checked_bid"]=xpv
+          stopv=grossv<=-V89_STOP_PCT
+          if not stopv and not duev:
+            v897_still.append(pv);continue
+          reasonv="STOP3" if stopv else "TIME120"
+          pv.update(exit_price=xpv,exit_utc=utc_now(),exit_reason=reasonv,
+            gross_pct=round(grossv,4),cost_pct=0.15,net_pct=round(grossv-0.15,4),
+            status="CLOSED_SHADOW",stop_overshoot_pct=round(max(0.0,-V89_STOP_PCT-grossv),4))
+          V89_STATE.setdefault("v897_closed",[]).append(pv)
+          v89_save()
+          await alt_safe_send(
+            f"ALT V897 PAPER CIKIS\nCoin: {pv['symbol']}\nGiris: {pv['entry_price']}\n"
+            f"Cikis: {xpv}\nNet: {pv['net_pct']}%\nNeden: {reasonv}\n"
+            f"Sure: {round((now-int(pv['entry_ms']))/60000,1)} dakika\nGERCEK EMIR YOK",
+            "V897_EXIT",pv["symbol"])
+        V89_STATE["v897_open"]=v897_still
+        V89_STATE["v897_closed"]=V89_STATE.get("v897_closed",[])[-1000:]
+        # Send previous UTC day's summary once, persisted with state.
+        today897=scan_utc[:10]
+        last897=V89_STATE.get("v897_daily_date")
+        if last897 is None:
+          V89_STATE["v897_daily_date"]=today897
+          v89_save()
+        elif last897!=today897:
+          daily897=[x for x in V89_STATE.get("v897_closed",[])
+            if str(x.get("exit_utc", ""))[:10]==last897]
+          perf897=v89_perf(daily897)
+          V89_STATE["v897_daily_date"]=today897
+          v89_save()
+          await alt_safe_send(
+            f"ALT V897 GUNLUK OZET\nUTC gun: {last897}\nIslem: {perf897['n']}\n"
+            f"Kazanma: {perf897['win_rate_pct']}%\nOrtalama net: {perf897['mean_net_pct']}%\n"
+            f"Profit Factor: {perf897['profit_factor']}\nPAPER - GERCEK EMIR YOK",
+            "V897_DAILY","V897")
         # V89.4 exits honor each trade's stored due_ms (old TIME120, new TIME60).
         v894_still=[]
         for pb in V89_STATE.get("v894_open",[]):
@@ -19042,6 +19096,44 @@ async def v89_scan_once():
               f"Breakout: {pv['breakout_change_pct']:.3f}% | Esik: {threshold:.2f}%\n"
               f"Hacim: {pv['volume_ratio']:.2f}x\nSTOP -3% / TIME120 | GERCEK EMIR YOK",
               tag+"_ENTRY",pv["symbol"])
+        # V89.7: independent Top3 ranking of candidates, max 5 positions.
+        # All entry features are from the already-confirmed V89.3 10m candidate set.
+        for ev in candidates:
+          if len(V89_STATE.get("v897_open",[]))>=5:break
+          breakout897=float(ev["breakout_change_pct"])
+          volume897=float(ev["volume_ratio"])
+          if not (1.0<=breakout897<2.0 and 1.0<=volume897<2.0
+              and b30<=0.3 and not(V892_DISP_LOW<=disp30<=V892_DISP_HIGH)):
+            continue
+          key897=f'{ev["symbol"]}:{ev["breakout_time"]}'
+          seen897=set(V89_STATE.get("v897_seen",[]))
+          if key897 in seen897:continue
+          seen897.add(key897)
+          V89_STATE["v897_seen"]=list(seen897)[-2000:]
+          if any(pv["symbol"]==ev["symbol"] for pv in V89_STATE.get("v897_open",[])):
+            continue
+          try:q897=await live_quote(client,ev["symbol"])
+          except Exception:q897=None
+          if not(q897 and q897.get("ask") and q897.get("bid")
+              and q897["spread_pct"]<=SPREAD_MAX_PCT):continue
+          ep897=float(q897["ask"]);ms897=alt_now_ms()
+          pv={**ev,"entry_price":ep897,"entry_utc":utc_now(),"entry_ms":ms897,
+            "exit_due_ms":ms897+120*60*1000,"status":"OPEN_SHADOW",
+            "execution_version":"V89_7_BREAKOUT1_VOLUME1TO2_BTC30MAX030_CONFIRM10_STOP3_TIME120",
+            "stop_loss_pct":V89_STOP_PCT,
+            "stop_price":round(ep897*(1-V89_STOP_PCT/100),12),
+            "spread_pct":round(float(q897["spread_pct"]),4),
+            "alt30_pct":round(alt30,6),"btc30_pct":round(b30,6),
+            "disp30_pct":round(disp30,6),"entry_gate":True,
+            "missing_quote_checks":0,"last_stop_check_utc":None}
+          V89_STATE.setdefault("v897_open",[]).append(pv)
+          v89_save()
+          await alt_safe_send(
+            f"ALT V897 PAPER GIRIS\nCoin: {pv['symbol']}\nGiris: {ep897}\n"
+            f"Stop: {pv['stop_price']}\nBreakout: {breakout897:.3f}%\n"
+            f"Hacim: {volume897:.2f}x\nBTC30: {b30:.3f}%\n"
+            "CONFIRM10 / STOP -3% / TIME120\nGERCEK EMIR YOK",
+            "V897_ENTRY",pv["symbol"])
         # V89.4: independently consider Top 3; up to 5 simultaneous paper positions.
         for eb in candidates_b[:3]:
           if len(V89_STATE.get("v894_open", [])) >= 5:
@@ -26234,6 +26326,7 @@ async def research_all_closed_trades():
         'V89_4': V89_STATE.get('v894_closed', []),
         'V89_5': V89_STATE.get('v895_closed', []),
         'V89_6': V89_STATE.get('v896_closed', []),
+        'V89_7': V89_STATE.get('v897_closed', []),
     }
     # Preserve original fields, including version, entry context and exit reason.
     # Deduplicate only exact identical records within the same book.
@@ -26275,3 +26368,16 @@ async def v896_status():
       "closed_count":len(V89_STATE.get("v896_closed",[])),
       "performance":v89_perf(V89_STATE.get("v896_closed",[])),
       "recent_closed":V89_STATE.get("v896_closed",[])[-20:]}
+
+
+@app.get("/v897-status")
+async def v897_status():
+    return {**MODE_INFO,"status":"OK","paper_only":True,"trading":False,"orders":False,
+      "strategy":"V89.7","version":"V89_7_BREAKOUT1_VOLUME1TO2_BTC30MAX030_CONFIRM10_STOP3_TIME120",
+      "filters":{"breakout_min_pct":1.0,"breakout_max_exclusive_pct":2.0,
+        "volume_min":1.0,"volume_max_exclusive":2.0,"btc30_max_pct":0.3,
+        "disp30_excluded_pct":[V892_DISP_LOW,V892_DISP_HIGH]},
+      "open":V89_STATE.get("v897_open",[]),
+      "closed_count":len(V89_STATE.get("v897_closed",[])),
+      "performance":v89_perf(V89_STATE.get("v897_closed",[])),
+      "recent_closed":V89_STATE.get("v897_closed",[])[-20:]}
