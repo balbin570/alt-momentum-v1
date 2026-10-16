@@ -8846,7 +8846,9 @@ async def v32_scan_once():
                 pass  # Do not interrupt the original V32 scan.
 
         new_entries = []
-        for e in top1_rows:
+        # V32.2 FROZEN: do not open new paper positions; preserve exit monitoring below.
+        entry_funnel["v322_entries_frozen"] = True
+        for e in []:  # previously: top1_rows
             if now_ms_for_freshness - e["entry_open_time"] > freshness_ms:
                 _v46_reject("rejected_not_fresh", e, "older than 10m freshness window")
                 continue
@@ -18761,7 +18763,7 @@ async def v89_scan_once():
           await alt_safe_send(f"ALT V89.3 PAPER CIKIS\nCoin: {p3['symbol']}\nNet: {p3['net_pct']}%\nCikis: {reason3}\nGERCEK EMIR YOK","V893_EXIT",p3["symbol"])
         V89_STATE["v893_open"]=v893_still
         V89_STATE["v893_closed"]=V89_STATE.get("v893_closed",[])[-1000:]
-        # V89.4 independent shadow exits; same STOP3 / TIME120 as V89.3.
+        # V89.4 exits honor each trade's stored due_ms (old TIME120, new TIME60).
         v894_still=[]
         for pb in V89_STATE.get("v894_open",[]):
           dueb=now>=int(pb["exit_due_ms"])
@@ -18783,7 +18785,7 @@ async def v89_scan_once():
           stoppedb=grossb<=-V89_STOP_PCT
           if not stoppedb and not dueb:
             v894_still.append(pb);continue
-          reasonb="STOP3" if stoppedb else "TIME120"
+          reasonb="STOP3" if stoppedb else ("TIME60" if "TIME60" in pb.get("execution_version", "") else "TIME120")
           pb.update(exit_price=xpb,exit_utc=utc_now(),exit_reason=reasonb,
             gross_pct=round(grossb,4),cost_pct=0.15,net_pct=round(grossb-0.15,4),
             status="CLOSED_SHADOW",stop_overshoot_pct=round(max(0.0,-V89_STOP_PCT-grossb),4))
@@ -18796,7 +18798,7 @@ async def v89_scan_once():
             f"ALT V89.4 PAPER CIKIS\nCoin: {pb['symbol']}\n"
             f"Giris: {pb['entry_price']}\nCikis: {pb['exit_price']}\n"
             f"Net: {pb['net_pct']}%\nSebep: {reasonb}\n"
-            "BREAKOUT 0.30% | GERCEK EMIR YOK",
+            "BREAKOUT 0.20% | GERCEK EMIR YOK",
             "V894_EXIT",pb["symbol"])
         V89_STATE["v894_open"]=v894_still
         V89_STATE["v894_closed"]=V89_STATE.get("v894_closed",[])[-1000:]
@@ -18832,28 +18834,29 @@ async def v89_scan_once():
           if ch<0.50 or vr<1.20:continue
           if not(c[i+1]["close"]>bo["close"] and c[i+2]["close"]>c[i+1]["close"]):continue
           candidates.append({"symbol":sym,"breakout_time":bo["open_time"],"breakout_change_pct":ch,"volume_ratio":vr,"breakout_close":bo["close"],"confirm2_close":c[i+2]["close"]})
-        # V89.4 candidates use a 0.30% breakout, independently of frozen V89.3.
+        # V89.4: breakout candle + ONE completed rising 5m close.
+        # Use the penultimate completed candle as breakout; last completed candle
+        # as confirmation. V89.3 above remains unchanged.
         candidates_b=[]
         funnel_b={"utc":scan_utc,"symbols":len(data),"insufficient_candles":0,
-          "breakout_below_0_30":0,"volume_below_1_20":0,
-          "first_rising_close_failed":0,"second_rising_close_failed":0,"eligible_candidates":0}
+          "breakout_below_0_20":0,"volume_below_1_20":0,
+          "first_rising_close_failed":0,"eligible_candidates":0}
         for sym,cb in data.items():
           if len(cb)<25:
             funnel_b["insufficient_candles"]+=1;continue
-          ib=len(cb)-3;bob=cb[ib]
+          ib=len(cb)-2;bob=cb[ib]
           chb=v74_pct(bob["open"],bob["close"])
           avb=sum(x["volume"] for x in cb[ib-20:ib])/20
           vrb=bob["volume"]/avb if avb>0 else 0
-          if chb<0.30: funnel_b["breakout_below_0_30"]+=1
+          if chb<0.20: funnel_b["breakout_below_0_20"]+=1
           elif vrb<1.20: funnel_b["volume_below_1_20"]+=1
           elif not(cb[ib+1]["close"]>bob["close"]): funnel_b["first_rising_close_failed"]+=1
-          elif not(cb[ib+2]["close"]>cb[ib+1]["close"]): funnel_b["second_rising_close_failed"]+=1
           else: funnel_b["eligible_candidates"]+=1
-          if chb<0.30 or vrb<1.20:continue
-          if not(cb[ib+1]["close"]>bob["close"] and cb[ib+2]["close"]>cb[ib+1]["close"]):continue
+          if chb<0.20 or vrb<1.20:continue
+          if not(cb[ib+1]["close"]>bob["close"]):continue
           candidates_b.append({"symbol":sym,"breakout_time":bob["open_time"],
             "breakout_change_pct":chb,"volume_ratio":vrb,"breakout_close":bob["close"],
-            "confirm2_close":cb[ib+2]["close"]})
+            "confirm1_close":cb[ib+1]["close"]})
         candidates_b.sort(key=lambda x:(x["breakout_change_pct"],x["volume_ratio"]),reverse=True)
         V894_RESEARCH["last_funnel"]=funnel_b
         V894_RESEARCH["funnel_history"].append(funnel_b)
@@ -18983,9 +18986,9 @@ async def v89_scan_once():
               if qb and qb.get("ask") and qb.get("bid") and qb["spread_pct"]<=SPREAD_MAX_PCT:
                 epb=float(qb["ask"]);msb=alt_now_ms()
                 pb={**eb,"entry_price":epb,"entry_utc":utc_now(),"entry_ms":msb,
-                  "exit_due_ms":msb+120*60*1000,"status":"OPEN_SHADOW",
-                  "execution_version":"V89_4_CONFIRM10_BREAKOUT030_STOP3_TIME120",
-                  "breakout_min_pct":0.30,"stop_loss_pct":V89_STOP_PCT,
+                  "exit_due_ms":msb+60*60*1000,"status":"OPEN_SHADOW",
+                  "execution_version":"V89_4_CONFIRM5_BREAKOUT020_STOP3_TIME60",
+                  "breakout_min_pct":0.20,"stop_loss_pct":V89_STOP_PCT,
                   "stop_price":round(epb*(1-V89_STOP_PCT/100),12),
                   "spread_pct":round(float(qb["spread_pct"]),4),
                   "alt30_pct":round(alt30,6),"btc30_pct":round(b30,6),
@@ -19006,7 +19009,7 @@ async def v89_scan_once():
                   f"ALT V89.4 PAPER GIRIS\nCoin: {pb['symbol']}\n"
                   f"Giris: {pb['entry_price']}\nStop: {pb['stop_price']}\n"
                   f"Breakout: {pb['breakout_change_pct']:.3f}%\n"
-                  "TIME120 | BREAKOUT 0.30% | GERCEK EMIR YOK",
+                  "TIME60 | CONFIRM5 | BREAKOUT 0.20% | GERCEK EMIR YOK",
                   "V894_ENTRY",pb["symbol"])
         V89_STATE["last_scan"]={"utc":scan_utc,"symbols":len(data),"errors":len(errs),"confirm10_candidates":len(candidates),"accepted":accepted["symbol"] if accepted else None,"alt30_pct":round(alt30,4),"btc30_pct":round(b30,4),"disp30_pct":round(disp30,4)}
         V89_STATE["errors"]=errs[-20:];v89_save();return V89_STATE["last_scan"]
@@ -19665,8 +19668,8 @@ async def v894_research():
     closed=V89_STATE.get("v894_closed",[])
     opened=V89_STATE.get("v894_open",[])
     return {**MODE_INFO,"status":"OK","paper_only":True,
-      "version":"V89_4_CONFIRM10_BREAKOUT030_STOP3_TIME120",
-      "breakout_min_pct":0.30,"stop_loss_pct":3,"time_exit_minutes":120,
+      "version":"V89_4_CONFIRM5_BREAKOUT020_STOP3_TIME60",
+      "breakout_min_pct":0.20,"stop_loss_pct":3,"time_exit_minutes":60,"confirmation_candles":1,
       "round_trip_cost_pct":0.15,
       "note":"Independent shadow book; RAM diagnostics reset on restart",
       "funnel":V894_RESEARCH["last_funnel"],
@@ -19683,9 +19686,9 @@ async def v894_status():
     closed=V89_STATE.get("v894_closed",[])
     opened=V89_STATE.get("v894_open",[])
     return {**MODE_INFO,"status":"OK","paper_only":True,
-      "version":"V89_4_CONFIRM10_BREAKOUT030_STOP3_TIME120",
-      "breakout_min_pct":0.30,"volume_min_ratio":1.20,
-      "stop_loss_pct":3,"time_exit_minutes":120,
+      "version":"V89_4_CONFIRM5_BREAKOUT020_STOP3_TIME60",
+      "breakout_min_pct":0.20,"volume_min_ratio":1.20,
+      "stop_loss_pct":3,"time_exit_minutes":60,"confirmation_candles":1,
       "open_count":len(opened),"closed_count":len(closed),
       "performance":v89_perf(closed),"open":opened[-10:],
       "recent_closed":closed[-20:],"generated_utc":utc_now()}
@@ -19696,7 +19699,7 @@ async def v893_compare():
     b=V89_STATE.get("v894_closed",[])
     return {**MODE_INFO,"status":"OK","paper_only":True,
       "v893_breakout050":{"closed":len(a),"open":len(V89_STATE.get("v893_open",[])),"performance":v89_perf(a)},
-      "v894_breakout030":{"closed":len(b),"open":len(V89_STATE.get("v894_open",[])),"performance":v89_perf(b)},
+      "v894_breakout020_confirm5_time60":{"closed":len(b),"open":len(V89_STATE.get("v894_open",[])),"performance":v89_perf(b)},
       "note":"Different start dates and sample sizes; compare only contemporaneous cohorts",
       "generated_utc":utc_now()}
 
@@ -19724,7 +19727,7 @@ def _research_diag_mark(book, reason, symbol=None):
 @app.get("/v322-diagnostics")
 async def v322_diagnostics():
     return {**MODE_INFO, "status": "OK", "paper_only": True,
-            "diagnostics": V322_DIAG, "note": "RAM counters since last restart; read-only"}
+            "new_entries_frozen": True, "diagnostics": V322_DIAG, "note": "RAM counters since last restart; read-only"}
 
 @app.get("/v893-diagnostics")
 async def v893_diagnostics():
