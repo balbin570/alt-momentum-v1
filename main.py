@@ -6864,7 +6864,11 @@ async def v22_telegram_send(message: str):
             message.startswith("ALT V32.3-B TELEGRAM TEST\n") or
             message.startswith("ALT V89.4 PAPER GIRIS\n") or
             message.startswith("ALT V89.4 PAPER CIKIS\n") or
-            message.startswith("ALT V89.4 TELEGRAM TEST\n")):
+            message.startswith("ALT V89.4 TELEGRAM TEST\n") or
+            message.startswith("ALT V895 PAPER GIRIS\n") or
+            message.startswith("ALT V895 PAPER CIKIS\n") or
+            message.startswith("ALT V896 PAPER GIRIS\n") or
+            message.startswith("ALT V896 PAPER CIKIS\n")):
         return {"sent": False, "reason": "telegram_new_strategies_only"}
     if not V22_TG_TOKEN or not V22_TG_CHAT_ID:
         return {"sent": False, "reason": "telegram_not_configured"}
