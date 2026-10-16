@@ -18910,14 +18910,15 @@ async def v89_scan_once():
                 v892_accepted=p2
                 v89_save()
                 await alt_safe_send(f"ALT V89.2 FILTRELI SHADOW GIRIS\nCoin: {e2['symbol']}\nBreakout: {e2['breakout_change_pct']:.3f}% | Vol: {e2['volume_ratio']:.2f}x\nDisp30: {disp30:.3f}\nSTOP -3% / TIME120 | PAPER - GERCEK EMIR YOK","V892_ENTRY",e2["symbol"])
-        # V89.3: frozen CONFIRM10 Top1 + V89.2 gates, independent paper book.
+        # V89.3: CONFIRM10 Top3 (max 5 open) + V89.2 gates, independent paper book.
         V893_DIAG["scan_checks"] += 1
         if not candidates:
           V893_DIAG["no_candidate"] += 1
         v893_accepted=None
-        if candidates:
+        for e3 in candidates[:3]:
+          if len(V89_STATE.get("v893_open", [])) >= 5:
+            break
           V893_DIAG["top1_seen"] += 1
-          e3=candidates[0]
           key3=f'{e3["symbol"]}:{e3["breakout_time"]}'
           seen3=set(V89_STATE.get("v893_seen",[]))
           if key3 in seen3:
@@ -19762,6 +19763,14 @@ async def v322_status():
     return {**MODE_INFO,"status":"OK","version":"V32_2","paper_only":True,
             "open_count":len(op),"closed_count":len(cl),"performance":v321_summary(cl),
             "open":visible_open,"recent_closed":cl[-20:],"generated_utc":utc_now()}
+
+@app.get("/v89-entry-policy")
+async def v89_entry_policy():
+    return {**MODE_INFO, "status":"OK", "paper_only":True,
+      "v893":{"top_candidates_per_scan":3,"max_open_positions":5,"confirmation_candles":2,"time_exit_minutes":120},
+      "v894":{"top_candidates_per_scan":3,"max_open_positions":5,"confirmation_candles":1,"time_exit_minutes":60},
+      "scan_interval_seconds":V89_SCAN_SECONDS,
+      "note":"Both books independent; free slots can fill on the next scan, not instantly between scans."}
 
 @app.get("/v893-status")
 async def v893_status():
