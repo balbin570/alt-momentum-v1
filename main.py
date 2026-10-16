@@ -6248,7 +6248,7 @@ ALT_TG_DELIVERY = {"attempts": 0, "sent": 0, "failed": 0, "recent": []}
 
 async def alt_safe_send(msg, kind, symbol):
     """Paper strategy notification; diagnostic only, no trading logic changes."""
-    if kind not in {"V322_ENTRY", "V322_EXIT", "V893_ENTRY", "V893_EXIT", "V894_ENTRY", "V894_EXIT"}:
+    if kind not in {"V322_ENTRY", "V322_EXIT", "V893_ENTRY", "V893_EXIT", "V894_ENTRY", "V894_EXIT", "V895_ENTRY", "V895_EXIT", "V896_ENTRY", "V896_EXIT"}:
         result = {"type": kind, "symbol": symbol, "sent": False, "reason": "telegram_new_strategies_only"}
     else:
         try:
@@ -18763,6 +18763,38 @@ async def v89_scan_once():
           await alt_safe_send(f"ALT V89.3 PAPER CIKIS\nCoin: {p3['symbol']}\nNet: {p3['net_pct']}%\nCikis: {reason3}\nGERCEK EMIR YOK","V893_EXIT",p3["symbol"])
         V89_STATE["v893_open"]=v893_still
         V89_STATE["v893_closed"]=V89_STATE.get("v893_closed",[])[-1000:]
+        # V89.5 / V89.6 independent paper exits (same stop/time as V89.3).
+        for variant in ("v895", "v896"):
+          still_variant=[]
+          for pv in V89_STATE.get(variant+"_open", []):
+            duev=now>=int(pv["exit_due_ms"])
+            try:
+              qv=await live_quote(client,pv["symbol"])
+            except Exception as excv:
+              qv=None
+              pv["last_quote_error"]=f"{type(excv).__name__}: {excv}"[:250]
+            xpv=float(qv["bid"]) if qv and qv.get("bid") is not None else None
+            if xpv is None:
+              pv["missing_quote_checks"]=int(pv.get("missing_quote_checks",0))+1
+              if not duev:
+                still_variant.append(pv);continue
+              cv=data.get(pv["symbol"],[])
+              xpv=float(cv[-1]["close"]) if cv else float(pv["entry_price"])
+            grossv=v74_pct(float(pv["entry_price"]),xpv)
+            pv["last_checked_bid"]=xpv
+            stopv=grossv<=-V89_STOP_PCT
+            if not stopv and not duev:
+              still_variant.append(pv);continue
+            reasonv="STOP3" if stopv else "TIME120"
+            pv.update(exit_price=xpv,exit_utc=utc_now(),exit_reason=reasonv,
+              gross_pct=round(grossv,4),cost_pct=0.15,net_pct=round(grossv-0.15,4),
+              status="CLOSED_SHADOW",stop_overshoot_pct=round(max(0.0,-V89_STOP_PCT-grossv),4))
+            V89_STATE.setdefault(variant+"_closed",[]).append(pv)
+            v89_save()
+            tag="V895" if variant=="v895" else "V896"
+            await alt_safe_send(f"ALT {tag} PAPER CIKIS\nCoin: {pv['symbol']}\nNet: {pv['net_pct']}%\nCikis: {reasonv}\nGERCEK EMIR YOK",tag+"_EXIT",pv["symbol"])
+          V89_STATE[variant+"_open"]=still_variant
+          V89_STATE[variant+"_closed"]=V89_STATE.get(variant+"_closed",[])[-1000:]
         # V89.4 exits honor each trade's stored due_ms (old TIME120, new TIME60).
         v894_still=[]
         for pb in V89_STATE.get("v894_open",[]):
@@ -18969,6 +19001,43 @@ async def v89_scan_once():
                 v893_accepted=p3
                 v89_save()
                 await alt_safe_send(f"ALT V89.3 PAPER GIRIS\nCoin: {e3['symbol']}\nBreakout: {e3['breakout_change_pct']:.3f}% | Vol: {e3['volume_ratio']:.2f}x\nDisp30: {disp30:.3f}\nSTOP -3% / TIME120 | GERCEK EMIR YOK","V893_ENTRY",e3["symbol"])
+        # V89.5 and V89.6: same completed-candle confirmation and risk as V89.3,
+        # but independent candidate rankings after breakout threshold filtering.
+        for variant, threshold, tag in (("v895",1.00,"V895"),("v896",1.25,"V896")):
+          eligible=[ev for ev in candidates if float(ev["breakout_change_pct"])>=threshold]
+          for ev in eligible[:3]:
+            if len(V89_STATE.get(variant+"_open",[]))>=5:break
+            keyv=f'{ev["symbol"]}:{ev["breakout_time"]}'
+            seenv=set(V89_STATE.get(variant+"_seen",[]))
+            if keyv in seenv:continue
+            seenv.add(keyv)
+            V89_STATE[variant+"_seen"]=list(seenv)[-2000:]
+            passesv=(float(ev["volume_ratio"])<V892_VOLUME_MAX
+              and float(ev["breakout_change_pct"])<V892_BREAKOUT_MAX
+              and not(V892_DISP_LOW<=disp30<=V892_DISP_HIGH))
+            if not passesv or any(pv["symbol"]==ev["symbol"] for pv in V89_STATE.get(variant+"_open",[])):
+              continue
+            try:qv=await live_quote(client,ev["symbol"])
+            except Exception:qv=None
+            if not(qv and qv.get("ask") and qv.get("bid") and qv["spread_pct"]<=SPREAD_MAX_PCT):continue
+            epv=float(qv["ask"]);msv=alt_now_ms()
+            pv={**ev,"entry_price":epv,"entry_utc":utc_now(),"entry_ms":msv,
+              "exit_due_ms":msv+120*60*1000,"status":"OPEN_SHADOW",
+              "execution_version":f"{tag}_BREAKOUT_{threshold:.2f}_CONFIRM10_STOP3_TIME120",
+              "stop_loss_pct":V89_STOP_PCT,
+              "stop_price":round(epv*(1-V89_STOP_PCT/100),12),
+              "spread_pct":round(float(qv["spread_pct"]),4),
+              "alt30_pct":round(alt30,6),"btc30_pct":round(b30,6),
+              "disp30_pct":round(disp30,6),"entry_gate":True,
+              "missing_quote_checks":0,"last_stop_check_utc":None,
+              "breakout_threshold_pct":threshold}
+            V89_STATE.setdefault(variant+"_open",[]).append(pv)
+            v89_save()
+            await alt_safe_send(
+              f"ALT {tag} PAPER GIRIS\nCoin: {pv['symbol']}\nGiris: {epv}\nStop: {pv['stop_price']}\n"
+              f"Breakout: {pv['breakout_change_pct']:.3f}% | Esik: {threshold:.2f}%\n"
+              f"Hacim: {pv['volume_ratio']:.2f}x\nSTOP -3% / TIME120 | GERCEK EMIR YOK",
+              tag+"_ENTRY",pv["symbol"])
         # V89.4: independently consider Top 3; up to 5 simultaneous paper positions.
         for eb in candidates_b[:3]:
           if len(V89_STATE.get("v894_open", [])) >= 5:
@@ -26159,6 +26228,8 @@ async def research_all_closed_trades():
         'V89_2': V89_STATE.get('v892_closed', []),
         'V89_3': V89_STATE.get('v893_closed', []),
         'V89_4': V89_STATE.get('v894_closed', []),
+        'V89_5': V89_STATE.get('v895_closed', []),
+        'V89_6': V89_STATE.get('v896_closed', []),
     }
     # Preserve original fields, including version, entry context and exit reason.
     # Deduplicate only exact identical records within the same book.
@@ -26182,3 +26253,21 @@ async def research_all_closed_trades():
         'total_book_records': sum(v['count'] for v in result.values()),
         'note': 'Books may contain overlapping economic events. Historical backtests not stored in these paper ledgers are not included.'
     }
+
+
+# V89.5 / V89.6 paper-only research summaries.
+@app.get("/v895-status")
+async def v895_status():
+    return {**MODE_INFO,"status":"OK","paper_only":True,"strategy":"V89.5",
+      "breakout_threshold_pct":1.0,"open":V89_STATE.get("v895_open",[]),
+      "closed_count":len(V89_STATE.get("v895_closed",[])),
+      "performance":v89_perf(V89_STATE.get("v895_closed",[])),
+      "recent_closed":V89_STATE.get("v895_closed",[])[-20:]}
+
+@app.get("/v896-status")
+async def v896_status():
+    return {**MODE_INFO,"status":"OK","paper_only":True,"strategy":"V89.6",
+      "breakout_threshold_pct":1.25,"open":V89_STATE.get("v896_open",[]),
+      "closed_count":len(V89_STATE.get("v896_closed",[])),
+      "performance":v89_perf(V89_STATE.get("v896_closed",[])),
+      "recent_closed":V89_STATE.get("v896_closed",[])[-20:]}
