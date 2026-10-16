@@ -26146,3 +26146,39 @@ def memory_diagnostics():
         "usage_pct_of_limit": usage_pct,
         "note": "Container peak is available only when exposed by Linux cgroups; peak resets on instance restart. Endpoint does not start any background work."
     }
+
+# ============================================================
+# READ-ONLY ALL-VERSION CLOSED PAPER TRADE EXPORT (2026-10-16)
+# Does not change scanners, orders, positions, exits or persistence.
+# ============================================================
+@app.get('/research/all-closed-trades')
+async def research_all_closed_trades():
+    books = {
+        'V32_FAMILY': V32_STATE.get('closed', []),
+        'V89_LEGACY': V89_STATE.get('closed', []),
+        'V89_2': V89_STATE.get('v892_closed', []),
+        'V89_3': V89_STATE.get('v893_closed', []),
+        'V89_4': V89_STATE.get('v894_closed', []),
+    }
+    # Preserve original fields, including version, entry context and exit reason.
+    # Deduplicate only exact identical records within the same book.
+    result = {}
+    for name, rows in books.items():
+        clean = []
+        seen = set()
+        for item in rows:
+            if not isinstance(item, dict):
+                continue
+            key = json.dumps(item, sort_keys=True, default=str, ensure_ascii=False)
+            if key in seen:
+                continue
+            seen.add(key)
+            clean.append(item)
+        result[name] = {'count': len(clean), 'trades': clean}
+    return {
+        **MODE_INFO, 'status': 'OK', 'paper_only': True,
+        'read_only': True, 'generated_utc': utc_now(),
+        'books': result,
+        'total_book_records': sum(v['count'] for v in result.values()),
+        'note': 'Books may contain overlapping economic events. Historical backtests not stored in these paper ledgers are not included.'
+    }
