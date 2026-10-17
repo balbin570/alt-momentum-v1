@@ -18892,6 +18892,35 @@ async def v89_scan_once():
             "V894_EXIT",pb["symbol"])
         V89_STATE["v894_open"]=v894_still
         V89_STATE["v894_closed"]=V89_STATE.get("v894_closed",[])[-1000:]
+        # R1/R2 shadow exits: independent paper positions; same STOP3/TIME60.
+        for variant, tag in (("v894_r1", "V894-R1"), ("v894_r2", "V894-R2")):
+          remaining=[]
+          for pr in V89_STATE.get(variant+"_open", []):
+            due=now>=int(pr["exit_due_ms"])
+            try:qr=await live_quote(client,pr["symbol"])
+            except Exception:qr=None
+            xp=float(qr["bid"]) if qr and qr.get("bid") is not None else None
+            if xp is None:
+              if not due:
+                remaining.append(pr);continue
+              candles=data.get(pr["symbol"],[])
+              xp=float(candles[-1]["close"]) if candles else float(pr["entry_price"])
+            gross=v74_pct(float(pr["entry_price"]),xp)
+            stop=gross<=-V89_STOP_PCT
+            if not stop and not due:
+              remaining.append(pr);continue
+            reason="STOP3" if stop else "TIME60"
+            pr.update(exit_price=xp,exit_utc=utc_now(),exit_reason=reason,
+              gross_pct=round(gross,4),cost_pct=0.15,net_pct=round(gross-0.15,4),
+              status="CLOSED_SHADOW",stop_overshoot_pct=round(max(0.0,-V89_STOP_PCT-gross),4))
+            V89_STATE.setdefault(variant+"_closed",[]).append(pr)
+            v89_save()
+            await alt_safe_send(
+              f"ALT {tag} PAPER CIKIS\nCoin: {pr['symbol']}\nGiris: {pr['entry_price']}\n"
+              f"Cikis: {xp}\nNet: {pr['net_pct']}%\nSebep: {reason}\nGERCEK EMIR YOK",
+              variant.upper()+"_EXIT",pr["symbol"])
+          V89_STATE[variant+"_open"]=remaining
+          V89_STATE[variant+"_closed"]=V89_STATE.get(variant+"_closed",[])[-1000:]
         # Causal market context: all candles here are completed before live entry.
         b30=v74_pct(btc[-7]["close"],btc[-1]["close"])
         a30=[v74_pct(c[-7]["close"],c[-1]["close"]) for c in data.values() if len(c)>=7]
@@ -19061,41 +19090,7 @@ async def v89_scan_once():
                 await alt_safe_send(f"ALT V89.3 PAPER GIRIS\nCoin: {e3['symbol']}\nBreakout: {e3['breakout_change_pct']:.3f}% | Vol: {e3['volume_ratio']:.2f}x\nDisp30: {disp30:.3f}\nSTOP -3% / TIME120 | GERCEK EMIR YOK","V893_ENTRY",e3["symbol"])
         # V89.5 and V89.6: same completed-candle confirmation and risk as V89.3,
         # but independent candidate rankings after breakout threshold filtering.
-        for variant, threshold, tag in (("v895",1.00,"V895"),("v896",1.25,"V896")):
-          eligible=[ev for ev in candidates if float(ev["breakout_change_pct"])>=threshold]
-          for ev in eligible[:3]:
-            if len(V89_STATE.get(variant+"_open",[]))>=5:break
-            keyv=f'{ev["symbol"]}:{ev["breakout_time"]}'
-            seenv=set(V89_STATE.get(variant+"_seen",[]))
-            if keyv in seenv:continue
-            seenv.add(keyv)
-            V89_STATE[variant+"_seen"]=list(seenv)[-2000:]
-            passesv=(float(ev["volume_ratio"])<V892_VOLUME_MAX
-              and float(ev["breakout_change_pct"])<V892_BREAKOUT_MAX
-              and not(V892_DISP_LOW<=disp30<=V892_DISP_HIGH))
-            if not passesv or any(pv["symbol"]==ev["symbol"] for pv in V89_STATE.get(variant+"_open",[])):
-              continue
-            try:qv=await live_quote(client,ev["symbol"])
-            except Exception:qv=None
-            if not(qv and qv.get("ask") and qv.get("bid") and qv["spread_pct"]<=SPREAD_MAX_PCT):continue
-            epv=float(qv["ask"]);msv=alt_now_ms()
-            pv={**ev,"entry_price":epv,"entry_utc":utc_now(),"entry_ms":msv,
-              "exit_due_ms":msv+120*60*1000,"status":"OPEN_SHADOW",
-              "execution_version":f"{tag}_BREAKOUT_{threshold:.2f}_CONFIRM10_STOP3_TIME120",
-              "stop_loss_pct":V89_STOP_PCT,
-              "stop_price":round(epv*(1-V89_STOP_PCT/100),12),
-              "spread_pct":round(float(qv["spread_pct"]),4),
-              "alt30_pct":round(alt30,6),"btc30_pct":round(b30,6),
-              "disp30_pct":round(disp30,6),"entry_gate":True,
-              "missing_quote_checks":0,"last_stop_check_utc":None,
-              "breakout_threshold_pct":threshold}
-            V89_STATE.setdefault(variant+"_open",[]).append(pv)
-            v89_save()
-            await alt_safe_send(
-              f"ALT {tag} PAPER GIRIS\nCoin: {pv['symbol']}\nGiris: {epv}\nStop: {pv['stop_price']}\n"
-              f"Breakout: {pv['breakout_change_pct']:.3f}% | Esik: {threshold:.2f}%\n"
-              f"Hacim: {pv['volume_ratio']:.2f}x\nSTOP -3% / TIME120 | GERCEK EMIR YOK",
-              tag+"_ENTRY",pv["symbol"])
+        # V89.5 and V89.6 RETIRED: no new paper entries or Telegram entry alerts.
         # V89.7: independent Top3 ranking of candidates, max 5 positions.
         # All entry features are from the already-confirmed V89.3 10m candidate set.
         for ev in candidates:
@@ -19164,6 +19159,26 @@ async def v89_scan_once():
                     "breakout_lt_pct":V892_BREAKOUT_MAX,
                     "disp30_excluded_pct":[V892_DISP_LOW,V892_DISP_HIGH]}}
                 V89_STATE.setdefault("v894_open",[]).append(pb)
+                # Parallel regime-gated clones of the SAME V89.4 entry.
+                # R1: ALT30 <= +0.20%; R2: ALT30 <= +0.20% and BTC30 <= 0%.
+                for variant, tag, permitted in (
+                    ("v894_r1", "V894-R1", alt30<=0.20),
+                    ("v894_r2", "V894-R2", alt30<=0.20 and b30<=0.0)):
+                  if not permitted or len(V89_STATE.get(variant+"_open",[]))>=5:
+                    continue
+                  if any(pr["symbol"]==pb["symbol"] for pr in V89_STATE.get(variant+"_open",[])):
+                    continue
+                  pr={**pb,"execution_version":tag+"_REGIME_PAPER_TIME60",
+                      "research_variant":tag,"parent_v894_entry_utc":pb["entry_utc"]}
+                  V89_STATE.setdefault(variant+"_open",[]).append(pr)
+                  v89_save()
+                  await alt_safe_send(
+                    f"ALT {tag} PAPER GIRIS\nCoin: {pr['symbol']}\nGiris: {epb}\n"
+                    f"Stop: {pr['stop_price']}\nALT30: {alt30:.3f}% | BTC30: {b30:.3f}%\n"
+                    f"Breakout: {pr['breakout_change_pct']:.3f}% | Hacim: {pr['volume_ratio']:.2f}x\n"
+                    "STOP3 / TIME60 | GERCEK EMIR YOK",
+                    variant.upper()+"_ENTRY",pr["symbol"])
+
                 V894_RESEARCH["entry_events"].append({"symbol":pb["symbol"],
                   "entry_utc":pb["entry_utc"],"entry_price":epb,
                   "stop_price":pb["stop_price"],"exit_due_ms":pb["exit_due_ms"],
@@ -26381,3 +26396,14 @@ async def v897_status():
       "closed_count":len(V89_STATE.get("v897_closed",[])),
       "performance":v89_perf(V89_STATE.get("v897_closed",[])),
       "recent_closed":V89_STATE.get("v897_closed",[])[-20:]}
+
+
+@app.get("/v894-regime-status")
+async def v894_regime_status():
+    return {**MODE_INFO,"status":"OK","paper_only":True,"orders":False,
+      "rules":{"R1":"ALT30 <= +0.20%","R2":"ALT30 <= +0.20% AND BTC30 <= 0%"},
+      "baseline":{"open":len(V89_STATE.get("v894_open",[])),"performance":v89_perf(V89_STATE.get("v894_closed",[]))},
+      "R1":{"open":V89_STATE.get("v894_r1_open",[]),"closed_count":len(V89_STATE.get("v894_r1_closed",[])),"performance":v89_perf(V89_STATE.get("v894_r1_closed",[])),"recent_closed":V89_STATE.get("v894_r1_closed",[])[-20:]},
+      "R2":{"open":V89_STATE.get("v894_r2_open",[]),"closed_count":len(V89_STATE.get("v894_r2_closed",[])),"performance":v89_perf(V89_STATE.get("v894_r2_closed",[])),"recent_closed":V89_STATE.get("v894_r2_closed",[])[-20:]},
+      "retired":{"V89_5":"NO_NEW_ENTRIES","V89_6":"NO_NEW_ENTRIES"},
+      "generated_utc":utc_now()}
