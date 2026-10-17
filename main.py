@@ -6248,7 +6248,7 @@ ALT_TG_DELIVERY = {"attempts": 0, "sent": 0, "failed": 0, "recent": []}
 
 async def alt_safe_send(msg, kind, symbol):
     """Paper strategy notification; diagnostic only, no trading logic changes."""
-    if kind not in {"V322_ENTRY", "V322_EXIT", "V893_ENTRY", "V893_EXIT", "V894_ENTRY", "V894_EXIT", "V895_ENTRY", "V895_EXIT", "V896_ENTRY", "V896_EXIT", "V897_ENTRY", "V897_EXIT", "V897_DAILY"}:
+    if kind not in {"V322_ENTRY", "V322_EXIT", "V893_ENTRY", "V893_EXIT", "V894_ENTRY", "V894_EXIT", "V894_R1_ENTRY", "V894_R1_EXIT", "V894_R2_ENTRY", "V894_R2_EXIT", "V895_ENTRY", "V895_EXIT", "V896_ENTRY", "V896_EXIT", "V897_ENTRY", "V897_EXIT", "V897_DAILY"}:
         result = {"type": kind, "symbol": symbol, "sent": False, "reason": "telegram_new_strategies_only"}
     else:
         try:
@@ -6865,6 +6865,10 @@ async def v22_telegram_send(message: str):
             message.startswith("ALT V89.4 PAPER GIRIS\n") or
             message.startswith("ALT V89.4 PAPER CIKIS\n") or
             message.startswith("ALT V89.4 TELEGRAM TEST\n") or
+            message.startswith("ALT V894-R1 PAPER GIRIS\n") or
+            message.startswith("ALT V894-R1 PAPER CIKIS\n") or
+            message.startswith("ALT V894-R2 PAPER GIRIS\n") or
+            message.startswith("ALT V894-R2 PAPER CIKIS\n") or
             message.startswith("ALT V895 PAPER GIRIS\n") or
             message.startswith("ALT V895 PAPER CIKIS\n") or
             message.startswith("ALT V896 PAPER GIRIS\n") or
