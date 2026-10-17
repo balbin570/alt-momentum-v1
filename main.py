@@ -18925,6 +18925,34 @@ async def v89_scan_once():
               variant.upper()+"_EXIT",pr["symbol"])
           V89_STATE[variant+"_open"]=remaining
           V89_STATE[variant+"_closed"]=V89_STATE.get(variant+"_closed",[])[-1000:]
+        # V89.3 BTC30 and V89.4 CHASE050: independent forward paper clones.
+        # Baselines and previously opened trades are untouched.
+        for variant, minutes in (("v893_btcneg",120),("v894_chase050",60)):
+          remaining=[]
+          for trade in V89_STATE.get(variant+"_open",[]):
+            due=now>=int(trade["exit_due_ms"])
+            try: quote=await live_quote(client,trade["symbol"])
+            except Exception: quote=None
+            price=float(quote["bid"]) if quote and quote.get("bid") is not None else None
+            if price is None:
+              trade["missing_quote_checks"]=int(trade.get("missing_quote_checks",0))+1
+              if not due:
+                remaining.append(trade);continue
+              cs=data.get(trade["symbol"],[])
+              price=float(cs[-1]["close"]) if cs else float(trade["entry_price"])
+            gross=v74_pct(float(trade["entry_price"]),price)
+            stopped=gross<=-V89_STOP_PCT
+            if not stopped and not due:
+              remaining.append(trade);continue
+            trade.update(exit_price=price,exit_utc=utc_now(),
+              exit_reason="STOP3" if stopped else "TIME"+str(minutes),
+              gross_pct=round(gross,4),cost_pct=0.15,
+              net_pct=round(gross-0.15,4),status="CLOSED_SHADOW",
+              stop_overshoot_pct=round(max(0.0,-V89_STOP_PCT-gross),4))
+            V89_STATE.setdefault(variant+"_closed",[]).append(trade)
+          V89_STATE[variant+"_open"]=remaining
+          V89_STATE[variant+"_closed"]=V89_STATE.get(variant+"_closed",[])[-1000:]
+        v89_save()
         # Causal market context: all candles here are completed before live entry.
         b30=v74_pct(btc[-7]["close"],btc[-1]["close"])
         a30=[v74_pct(c[-7]["close"],c[-1]["close"]) for c in data.values() if len(c)>=7]
@@ -19083,6 +19111,13 @@ async def v89_scan_once():
                     "breakout_lt_pct":V892_BREAKOUT_MAX,
                     "disp30_excluded_pct":[V892_DISP_LOW,V892_DISP_HIGH]}}
                 V89_STATE.setdefault("v893_open",[]).append(p3)
+                # Independent V89.3 BTC30<=0 shadow clone, same observed fill.
+                variant3="v893_btcneg"
+                if b30<=0.0 and len(V89_STATE.get(variant3+"_open",[]))<5 and not any(
+                    t["symbol"]==p3["symbol"] for t in V89_STATE.get(variant3+"_open",[])):
+                  clone3={**p3,"execution_version":"V893_BTC30_LE_0_SHADOW",
+                    "research_variant":"V893-BTCNEG","parent_v893_entry_utc":p3["entry_utc"]}
+                  V89_STATE.setdefault(variant3+"_open",[]).append(clone3)
                 V893_RESEARCH["entry_events"].append({"symbol":p3["symbol"],"entry_utc":p3["entry_utc"],
                   "entry_price":ep3,"stop_price":p3["stop_price"],"exit_due_ms":p3["exit_due_ms"],
                   "breakout_change_pct":p3["breakout_change_pct"],"volume_ratio":p3["volume_ratio"],
@@ -19163,6 +19198,17 @@ async def v89_scan_once():
                     "breakout_lt_pct":V892_BREAKOUT_MAX,
                     "disp30_excluded_pct":[V892_DISP_LOW,V892_DISP_HIGH]}}
                 V89_STATE.setdefault("v894_open",[]).append(pb)
+                # Independent V89.4 breakout chase <=0.5% shadow clone.
+                # Compare the observed live ask to the completed breakout close.
+                breakout_ref=float(eb.get("breakout_close") or 0)
+                chase_pct=v74_pct(breakout_ref,epb) if breakout_ref>0 else None
+                variant4="v894_chase050"
+                if chase_pct is not None and chase_pct<=0.50 and len(V89_STATE.get(variant4+"_open",[]))<5 and not any(
+                    t["symbol"]==pb["symbol"] for t in V89_STATE.get(variant4+"_open",[])):
+                  clone4={**pb,"execution_version":"V894_CHASE_LE_050_SHADOW",
+                    "research_variant":"V894-CHASE050","parent_v894_entry_utc":pb["entry_utc"],
+                    "chase_pct":round(chase_pct,6)}
+                  V89_STATE.setdefault(variant4+"_open",[]).append(clone4)
                 # Parallel regime-gated clones of the SAME V89.4 entry.
                 # R1: ALT30 <= +0.20%; R2: ALT30 <= +0.20% and BTC30 <= 0%.
                 for variant, tag, permitted in (
@@ -26411,3 +26457,16 @@ async def v894_regime_status():
       "R2":{"open":V89_STATE.get("v894_r2_open",[]),"closed_count":len(V89_STATE.get("v894_r2_closed",[])),"performance":v89_perf(V89_STATE.get("v894_r2_closed",[])),"recent_closed":V89_STATE.get("v894_r2_closed",[])[-20:]},
       "retired":{"V89_5":"NO_NEW_ENTRIES","V89_6":"NO_NEW_ENTRIES"},
       "generated_utc":utc_now()}
+
+@app.get("/v89-new-shadow-status")
+async def v89_new_shadow_status():
+    result={}
+    for variant in ("v893_btcneg","v894_chase050"):
+        closed=V89_STATE.get(variant+"_closed",[])
+        result[variant]={"open_count":len(V89_STATE.get(variant+"_open",[])),
+            "closed_count":len(closed),"performance":v89_perf(closed),
+            "open":V89_STATE.get(variant+"_open",[])[-10:],
+            "recent_closed":closed[-20:]}
+    return {**MODE_INFO,"status":"OK","paper_only":True,
+        "note":"Independent forward-paper clones; baselines unchanged; no real orders",
+        "variants":result,"generated_utc":utc_now()}
