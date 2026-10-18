@@ -26853,3 +26853,126 @@ async def big_move_research(count: int = Query(default=20, ge=1, le=40),
                   'warning':'Exploratory in-sample research, not validated trading performance.'}}
     except Exception as exc:
         return {**MODE_INFO,'status':'ERROR','paper_only':True,'error':str(exc)}
+# ============================================================
+# BIG-MOVE-RESEARCH V2: read-only historical comparisons.
+# ============================================================
+
+def _bmv2_gate(cs, i, loose=False):
+    if i < 20 or cs[i]['close'] <= 0:
+        return False
+    p = cs[i]['close']
+    avg = sum(x['volume'] for x in cs[i-6:i]) / 6
+    vr = cs[i]['volume']/avg if avg > 0 else 0
+    m5 = _bigmove_pct(cs[i-1]['close'], p)
+    m15 = _bigmove_pct(cs[i-3]['close'], p)
+    m30 = _bigmove_pct(cs[i-6]['close'], p)
+    if loose:
+        return .15 <= m5 <= 2 and m15 >= .25 and .25 <= m30 <= 4 and vr >= 1.1
+    return .30 <= m5 <= 3 and m15 >= .50 and .50 <= m30 <= 6 and vr >= 1.2
+
+
+def _bmv2_trade(cs, i, hold=48, stop_pct=3., reentry=False):
+    """One trade plus optional one reentry; conservative stop-first OHLC convention."""
+    price = cs[i]['close']
+    stop = price * (1 - stop_pct/100)
+    first_exit = None
+    stop_index = None
+    for j in range(i+1, i+hold+1):
+        if cs[j]['low'] <= stop:
+            first_exit, stop_index = stop, j
+            break
+    if stop_index is None:
+        first_exit = cs[i+hold]['close']
+    first_net = _bigmove_pct(price, first_exit) - ROUND_TRIP_COST_PCT
+    if not reentry or stop_index is None:
+        return {'net_pct':first_net,'reentered':False,'first_stopped':stop_index is not None}
+    # Reenter only after a COMPLETED 5m candle recovers original entry;
+    # fill at NEXT candle open; exclude ambiguous same-bar stop/entry.
+    for k in range(stop_index+1, i+hold):
+        if cs[k]['close'] > price and cs[k]['close'] > cs[k-1]['close']:
+            new_entry = cs[k+1]['open']
+            if new_entry <= 0:
+                break
+            new_stop = new_entry * (1 - stop_pct/100)
+            exit_price = cs[i+hold]['close']
+            for j in range(k+1, i+hold+1):
+                if cs[j]['low'] <= new_stop:
+                    exit_price = new_stop
+                    break
+            second_net = _bigmove_pct(new_entry, exit_price) - ROUND_TRIP_COST_PCT
+            return {'net_pct':first_net+second_net,'reentered':True,'first_stopped':True,
+                    'reentry_net_pct':second_net}
+    return {'net_pct':first_net,'reentered':False,'first_stopped':True}
+
+
+@app.get('/big-move-research-v2')
+async def big_move_research_v2(count: int = Query(default=20, ge=1, le=40),
+                               candles: int = Query(default=700, ge=150, le=1000),
+                               cooldown_bars: int = Query(default=12, ge=1, le=48)):
+    """Early momentum versus baseline and stop/reentry, with chronological holdout."""
+    try:
+        async with httpx.AsyncClient(timeout=35.0) as client:
+            universe = (await build_universe(client))[:count]
+            sem = asyncio.Semaphore(5)
+            async def fetch(item):
+                async with sem:
+                    try:
+                        return item['symbol'], await get_completed_5m_candles(client,item['symbol'],candles), None
+                    except Exception as exc:
+                        return item['symbol'], [], str(exc)[:160]
+            fetched = await asyncio.gather(*(fetch(x) for x in universe))
+        rows=[]; errors=[]
+        for symbol,cs,error in fetched:
+            if error:
+                errors.append({'symbol':symbol,'error':error}); continue
+            # Identical future horizon; chronological split by candle index, not by outcome.
+            i=20
+            while i+48 < len(cs):
+                standard=_bmv2_gate(cs,i)
+                early=_bmv2_gate(cs,i,loose=True)
+                if not (standard or early):
+                    i+=1; continue
+                window=cs[i+1:i+49]
+                mfe=max((_bigmove_pct(cs[i]['close'],x['high']) for x in window),default=0)
+                baseline=_bmv2_trade(cs,i,reentry=False)
+                again=_bmv2_trade(cs,i,reentry=True)
+                rows.append({'symbol':symbol,'timestamp':cs[i]['close_time'],
+                             'standard':standard,'early':early,'mfe':mfe,
+                             'baseline':baseline,'reentry':again})
+                i+=cooldown_bars
+        rows.sort(key=lambda x:x['timestamp'])
+        if rows:
+            cutoff=rows[int(len(rows)*.7)]['timestamp'] if len(rows)>1 else rows[0]['timestamp']
+        else:
+            cutoff=0
+        def summarize(part):
+            result={}
+            for key,subset,variant in (
+                ('standard_fixed3',[r for r in part if r['standard']],'baseline'),
+                ('standard_reentry',[r for r in part if r['standard']],'reentry'),
+                ('early_fixed3',[r for r in part if r['early']],'baseline'),
+                ('early_reentry',[r for r in part if r['early']],'reentry')):
+                sim=[{'net_pct':r[variant]['net_pct'],'exit_reason':'STOP' if r[variant]['first_stopped'] else 'TIME'} for r in subset]
+                result[key]={**_bigmove_stats(sim),
+                    'hit_10pct':sum(r['mfe']>=10 for r in subset),
+                    'hit_15pct':sum(r['mfe']>=15 for r in subset),
+                    'hit_20pct':sum(r['mfe']>=20 for r in subset),
+                    'reentry_count':sum(r[variant]['reentered'] for r in subset)}
+            return result
+        return {**MODE_INFO,'status':'OK','paper_only':True,'read_only':True,
+                'strategy':'BIG_MOVE_RESEARCH_V2','generated_utc':utc_now(),
+                'symbols_analyzed':len(fetched)-len(errors),'errors':errors,
+                'events_total':len(rows),'events_train':sum(r['timestamp']<cutoff for r in rows),
+                'events_holdout':sum(r['timestamp']>=cutoff for r in rows),
+                'train':summarize([r for r in rows if r['timestamp']<cutoff]),
+                'holdout':summarize([r for r in rows if r['timestamp']>=cutoff]),
+                'methodology':{'timeframe':'5m closed candles','hold_minutes':240,
+                    'split':'chronological 70/30 across all events; no fitting performed',
+                    'standard_gate':'V1 momentum gate',
+                    'early_gate':'looser momentum gate at current closed candle; NOT retroactive entry',
+                    'reentry':'once after first -3% stop; completed close above original entry and rising; next bar open fill',
+                    'cost':'0.15% per round trip, including second trade',
+                    'stop':'3% fixed, optimistic stop-price fills; OHLC ambiguous',
+                    'caveats':'Early and standard populations overlap but differ; results not paired. Current top-volume universe has survivorship bias; overlapping symbols/events, no spread/slippage, no real trades. Holdout is descriptive and not independent validation if rules were chosen after V1 results.'}}
+    except Exception as exc:
+        return {**MODE_INFO,'status':'ERROR','paper_only':True,'error':str(exc)}
