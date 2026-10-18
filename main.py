@@ -27293,9 +27293,19 @@ async def big_move_v5_scan(count: int = Query(default=20,ge=1,le=40)):
         if not url:
             return {**MODE_INFO,'status':'UNAVAILABLE','strategy':'BIG_MOVE_V5_FORWARD',
                     'reason':'DATABASE_URL missing; no in-memory fallback'}
+        # Always track existing PENDING/OPEN positions, even if a coin
+        # drops out of the current top-volume discovery universe.
+        import psycopg
+        with psycopg.connect(url,connect_timeout=12) as conn:
+            _bmv5_db(conn)
+            with conn.cursor() as cur:
+                cur.execute("SELECT DISTINCT symbol FROM big_move_v5_forward_paper WHERE status IN ('PENDING','OPEN')")
+                active_symbols=[r[0] for r in cur.fetchall()]
+            conn.commit()
         async with httpx.AsyncClient(timeout=35.0) as client:
             universe=(await build_universe(client))[:count]
-            symbols=list(dict.fromkeys(['BTCUSDT']+[x['symbol'] for x in universe]))
+            discovery_symbols=[x['symbol'] for x in universe]
+            symbols=list(dict.fromkeys(['BTCUSDT']+discovery_symbols+active_symbols))
             sem=asyncio.Semaphore(5)
             async def fetch(symbol):
                 async with sem:
@@ -27317,6 +27327,9 @@ async def big_move_v5_scan(count: int = Query(default=20,ge=1,le=40)):
                 for symbol,cs in data.items():
                     if symbol=='BTCUSDT':continue
                     _bmv5_advance(cur,symbol,cs)
+                    # Existing positions are always updated, but only the
+                    # requested discovery universe can create new signals.
+                    if symbol not in discovery_symbols: continue
                     i=len(cs)-1
                     f=_bmv3_features(cs,i)
                     if not f or not (.15<=f['m5']<=2 and f['m15']>=.25 and .25<=f['m30']<=4 and f['vr']>=1.1):continue
@@ -27337,7 +27350,7 @@ async def big_move_v5_scan(count: int = Query(default=20,ge=1,le=40)):
         telegram_events=await _bmv5_telegram_flush(url)
         return {**MODE_INFO,'status':'OK','strategy':'BIG_MOVE_V5_FORWARD','paper_only':True,
                 'trading':False,'orders':False,'new_signals':new_signals,'telegram_events':telegram_events,
-                'symbols_scanned':len(data)-1,'errors':errors,
+                'symbols_scanned':len([s for s in discovery_symbols if s in data]),'active_symbols_tracked':active_symbols,'errors':errors,
                 'note':'Manual scan only; Telegram ENTRY on OPEN and EXIT on CLOSED. Call every 5m externally or manually.'}
     except Exception as exc:
         return {**MODE_INFO,'status':'ERROR','strategy':'BIG_MOVE_V5_FORWARD','error':str(exc)}
