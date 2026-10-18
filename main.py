@@ -27197,6 +27197,8 @@ def _bmv5_db(conn):
             entry_tg_sent BOOLEAN NOT NULL DEFAULT FALSE,
             exit_tg_sent BOOLEAN NOT NULL DEFAULT FALSE,
             PRIMARY KEY (symbol, signal_close_ms))''')
+        cur.execute('''CREATE TABLE IF NOT EXISTS big_move_v5_scan_lease (
+            id INTEGER PRIMARY KEY, lease_until TIMESTAMPTZ NOT NULL)''')
         cur.execute('ALTER TABLE big_move_v5_forward_paper ADD COLUMN IF NOT EXISTS entry_tg_sent BOOLEAN NOT NULL DEFAULT FALSE')
         cur.execute('ALTER TABLE big_move_v5_forward_paper ADD COLUMN IF NOT EXISTS exit_tg_sent BOOLEAN NOT NULL DEFAULT FALSE')
 
@@ -27337,9 +27339,12 @@ async def big_move_v5_scan(count: int = Query(default=20,ge=1,le=40)):
                     if j is None or j<6:continue
                     b30=_bigmove_pct(btc[j-6]['close'],btc[j]['close'])
                     if b30>0:continue
-                    cur.execute('''SELECT 1 FROM big_move_v5_forward_paper
-                                   WHERE symbol=%s AND status IN ('PENDING','OPEN') LIMIT 1''',(symbol,))
+                    # Global one-active-position limit, including PENDING.
+                    cur.execute("SELECT 1 FROM big_move_v5_forward_paper WHERE status IN ('PENDING','OPEN') LIMIT 1")
                     if cur.fetchone():continue
+                    # At most three new signals per UTC day; limit persists across restarts.
+                    cur.execute("SELECT COUNT(*) FROM big_move_v5_forward_paper WHERE created_at >= date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'")
+                    if cur.fetchone()[0]>=3:continue
                     cur.execute('''INSERT INTO big_move_v5_forward_paper
                         (symbol,signal_close_ms,signal_price,btc30_pct)
                         VALUES (%s,%s,%s,%s) ON CONFLICT DO NOTHING RETURNING symbol''',
@@ -27351,7 +27356,7 @@ async def big_move_v5_scan(count: int = Query(default=20,ge=1,le=40)):
         return {**MODE_INFO,'status':'OK','strategy':'BIG_MOVE_V5_FORWARD','paper_only':True,
                 'trading':False,'orders':False,'new_signals':new_signals,'telegram_events':telegram_events,
                 'symbols_scanned':len([s for s in discovery_symbols if s in data]),'active_symbols_tracked':active_symbols,'errors':errors,
-                'note':'Manual scan only; Telegram ENTRY on OPEN and EXIT on CLOSED. Call every 5m externally or manually.'}
+                'note':'Auto scan every 5m when worker enabled; manual endpoint also available. Telegram ENTRY on OPEN and EXIT on CLOSED.'}
     except Exception as exc:
         return {**MODE_INFO,'status':'ERROR','strategy':'BIG_MOVE_V5_FORWARD','error':str(exc)}
 
@@ -27377,6 +27382,79 @@ async def big_move_v5_status():
                 'recent':[{'symbol':r[0],'signal_close_ms':r[1],'btc30_pct':r[2],
                            'status':r[3],'entry_price':r[4],'exit_reason':r[5],
                            'net_pct':r[6]} for r in rows[:30]],
-                'limitations':'manual scanning, latest-candle-only detection, DB persistence; no live orders, no slippage model'}
+                'limitations':'5m periodic scan (if worker enabled), latest-candle-only detection, DB persistence; no live orders, no slippage model'}
     except Exception as exc:
         return {**MODE_INFO,'status':'ERROR','strategy':'BIG_MOVE_V5_FORWARD','error':str(exc)}
+
+
+# ============================================================
+# BIG MOVE V5 AUTO: only V5, paper-only; no real orders.
+# Lease prevents concurrent workers on multiple Render instances.
+# Set BIG_MOVE_V5_AUTO_ENABLED=0 to disable.
+# ============================================================
+_bmv5_auto_task = None
+_bmv5_auto_last = {'status': 'NOT_STARTED'}
+
+async def _bmv5_auto_loop():
+    global _bmv5_auto_last
+    while True:
+        try:
+            url=os.getenv('DATABASE_URL','').strip()
+            if url:
+                import psycopg
+                # Atomic cross-instance lease; expires if process crashes.
+                with psycopg.connect(url,connect_timeout=12) as conn:
+                    _bmv5_db(conn)
+                    with conn.cursor() as cur:
+                        cur.execute("""INSERT INTO big_move_v5_scan_lease (id,lease_until)
+                            VALUES (1, now()+interval '4 minutes')
+                            ON CONFLICT (id) DO UPDATE
+                            SET lease_until=EXCLUDED.lease_until
+                            WHERE big_move_v5_scan_lease.lease_until < now()
+                            RETURNING id""")
+                        acquired=cur.fetchone() is not None
+                    conn.commit()
+                if acquired:
+                    result=await big_move_v5_scan(count=20)
+                    _bmv5_auto_last={'status':result.get('status'),
+                                    'new_signals':len(result.get('new_signals',[])),
+                                    'telegram_events':result.get('telegram_events',[]),
+                                    'errors':result.get('errors',[]),
+                                    'error':result.get('error')}
+                else:
+                    _bmv5_auto_last={'status':'SKIPPED_LEASE_HELD'}
+            else:
+                _bmv5_auto_last={'status':'DATABASE_URL_MISSING'}
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            _bmv5_auto_last={'status':'ERROR','error':str(exc)[:300]}
+        await asyncio.sleep(300)
+
+@app.on_event('startup')
+async def _bmv5_auto_startup():
+    global _bmv5_auto_task
+    if os.getenv('BIG_MOVE_V5_AUTO_ENABLED','1').lower() in ('0','false','no'):
+        return
+    if _bmv5_auto_task is None or _bmv5_auto_task.done():
+        _bmv5_auto_task=asyncio.create_task(_bmv5_auto_loop())
+
+@app.on_event('shutdown')
+async def _bmv5_auto_shutdown():
+    global _bmv5_auto_task
+    if _bmv5_auto_task is not None:
+        _bmv5_auto_task.cancel()
+        try:
+            await _bmv5_auto_task
+        except asyncio.CancelledError:
+            pass
+        _bmv5_auto_task=None
+
+@app.get('/big-move-v5-auto-status')
+async def big_move_v5_auto_status():
+    return {**MODE_INFO,'strategy':'BIG_MOVE_V5_FORWARD',
+            'auto_enabled':os.getenv('BIG_MOVE_V5_AUTO_ENABLED','1').lower() not in ('0','false','no'),
+            'task_running':_bmv5_auto_task is not None and not _bmv5_auto_task.done(),
+            'last_run':_bmv5_auto_last,
+            'interval_seconds':300,'max_daily_new_signals':3,
+            'max_global_pending_or_open':1,'paper_only':True,'orders':False}
