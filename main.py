@@ -19600,7 +19600,11 @@ def v323_observe_candidate(key, symbol, features, v322_gate):
         # Proposed research thresholds only; DO NOT execute these entries.
         v323_pass = ret60 >= 2.5 and 0.8 <= volume < 3.0 and z < 2.5 and 0 <= delay < 90
         v323b_pass = ret60 >= 2.5 and 0.8 <= volume < 3.5 and z < 3.5 and 0 <= delay < 120
-        v322_pass = bool(v322_gate.get("v321_pass"))
+        # Compare the published V32.2 thresholds on exactly the same feature set.
+        # The older v321_pass is a different, preliminary gate and must not be
+        # presented as the result of the V32.2 thresholds in /v323-research.
+        v322_pass = ret60 >= 3.9 and 0.9 <= volume < 3.0 and z < 2.0 and 0 <= delay < 60
+        legacy_v321_pre_gate_pass = bool(v322_gate.get("v321_pass")) if isinstance(v322_gate, dict) else False
         if v322_pass: r["v322_pass"] += 1
         if v323_pass: r["v323_pass"] += 1
         if v323_pass and not v322_pass: r["v323_only"] += 1
@@ -19608,7 +19612,8 @@ def v323_observe_candidate(key, symbol, features, v322_gate):
         row = {"utc": utc_now(), "key": key, "symbol": symbol,
                "ret60_pct": round(ret60, 4), "volume_ratio": round(volume, 4),
                "z": round(z, 4), "delay_seconds": round(delay, 2),
-               "v322_pass": v322_pass, "v323_pass": v323_pass, "v323b_pass": v323b_pass}
+               "v322_pass": v322_pass, "v323_pass": v323_pass, "v323b_pass": v323b_pass,
+               "legacy_v321_pre_gate_pass": legacy_v321_pre_gate_pass}
     except (KeyError, TypeError, ValueError, OverflowError):
         r["missing_features"] += 1
         row = {"utc": utc_now(), "key": key, "symbol": symbol,
@@ -20222,6 +20227,8 @@ async def v323_research():
     return {**MODE_INFO, "status": "OK", "paper_only": True,
             "execution_enabled": False, "strategy_unchanged": True,
             "comparison": "SAME_CANDIDATES_PRE_QUOTE",
+            "v322_pass_definition": "PUBLISHED_THRESHOLDS_ONLY_NOT_LIVE_ENTRY_GATE",
+            "legacy_v321_pre_gate_pass_definition": "EXISTING_PRELIMINARY_GATE_DIAGNOSTIC_ONLY",
             "v322_thresholds": {"ret60_min_pct": 3.9, "volume_min": 0.9,
                                 "volume_max_exclusive": 3.0, "z_max_exclusive": 2.0,
                                 "delay_max_exclusive_seconds": 60},
