@@ -26726,3 +26726,130 @@ async def v89_new_shadow_status():
     return {**MODE_INFO,"status":"OK","paper_only":True,
         "note":"Independent forward-paper clones; baselines unchanged; no real orders",
         "variants":result,"generated_utc":utc_now()}
+
+
+# ============================================================
+# BIG-MOVE-RESEARCH V1 — isolated, on-demand, read-only study.
+# No startup worker, no ledger writes, no Telegram, no orders.
+# ============================================================
+
+def _bigmove_pct(a, b):
+    return (b / a - 1.0) * 100.0 if a > 0 else 0.0
+
+
+def _bigmove_sim(candles, i, hold_bars, stop_kind, cost_pct):
+    entry = candles[i]['close']
+    prior = candles[max(0, i - 14):i + 1]
+    trs = []
+    for j in range(1, len(prior)):
+        prev = prior[j - 1]['close']
+        x = prior[j]
+        trs.append(max(x['high'] - x['low'], abs(x['high'] - prev), abs(x['low'] - prev)))
+    atr = sum(trs[-14:]) / len(trs[-14:]) if trs else 0
+    stop_dist = 3.0 if stop_kind == 'fixed3' else max(0.25, 2.0 * atr / entry * 100)
+    stop_price = entry * (1 - stop_dist / 100)
+    window = candles[i + 1:i + hold_bars + 1]
+    mfe = max((_bigmove_pct(entry, x['high']) for x in window), default=0)
+    mae = min((_bigmove_pct(entry, x['low']) for x in window), default=0)
+    exit_price = window[-1]['close']
+    reason = 'TIME'
+    for x in window:
+        if x['low'] <= stop_price:
+            exit_price = stop_price  # optimistic fill; gaps/slippage not modeled
+            reason = 'STOP'
+            break
+    return {'net_pct': round(_bigmove_pct(entry, exit_price) - cost_pct, 4),
+            'mfe_pct': round(mfe, 4), 'mae_pct': round(mae, 4),
+            'exit_reason': reason, 'stop_pct': round(stop_dist, 4)}
+
+
+def _bigmove_stats(rows):
+    if not rows:
+        return {'n': 0, 'mean_net_pct': None, 'win_rate_pct': None, 'profit_factor': None}
+    vals = [r['net_pct'] for r in rows]
+    gains = sum(v for v in vals if v > 0)
+    losses = -sum(v for v in vals if v < 0)
+    return {'n': len(vals), 'mean_net_pct': round(sum(vals)/len(vals), 4),
+            'sum_trade_net_pct': round(sum(vals), 4),
+            'win_rate_pct': round(100*sum(v > 0 for v in vals)/len(vals), 2),
+            'profit_factor': round(gains/losses, 4) if losses else None,
+            'stop_count': sum(r['exit_reason'] == 'STOP' for r in rows)}
+
+
+@app.get('/big-move-research')
+async def big_move_research(count: int = Query(default=20, ge=1, le=40),
+                            candles: int = Query(default=500, ge=100, le=1000),
+                            cooldown_bars: int = Query(default=12, ge=1, le=48)):
+    """Historical 5m momentum event study; strictly no trades or state changes."""
+    try:
+        async with httpx.AsyncClient(timeout=35.0) as client:
+            universe = (await build_universe(client))[:count]
+            sem = asyncio.Semaphore(5)
+            async def work(item):
+                async with sem:
+                    try:
+                        cs = await get_completed_5m_candles(client, item['symbol'], candles)
+                        return item['symbol'], cs, None
+                    except Exception as exc:
+                        return item['symbol'], [], str(exc)
+            fetched = await asyncio.gather(*(work(x) for x in universe))
+        results = {f'{h}m_{st}': [] for h in (60,120,240) for st in ('fixed3','atr2')}
+        event_rows = []
+        errors = []
+        for symbol, cs, error in fetched:
+            if error:
+                errors.append({'symbol': symbol, 'error': error[:160]})
+                continue
+            last_i = len(cs) - 49  # 48 future bars + current bar
+            i = 20
+            while i < last_i:
+                entry = cs[i]['close']
+                if entry <= 0:
+                    i += 1
+                    continue
+                vavg = sum(x['volume'] for x in cs[i-6:i]) / 6
+                vr = cs[i]['volume'] / vavg if vavg else 0
+                mom5 = _bigmove_pct(cs[i-1]['close'], entry)
+                mom15 = _bigmove_pct(cs[i-3]['close'], entry)
+                mom30 = _bigmove_pct(cs[i-6]['close'], entry)
+                # Same research momentum gates as historical_events(); not a live strategy replica.
+                if not (0.30 <= mom5 <= 3 and mom15 >= .50 and .50 <= mom30 <= 6 and vr >= 1.2):
+                    i += 1
+                    continue
+                max240 = max(_bigmove_pct(entry, x['high']) for x in cs[i+1:i+49])
+                row = {'symbol':symbol,'entry_utc':datetime.fromtimestamp(cs[i]['close_time']/1000,timezone.utc).isoformat(),
+                       'momentum_5m_pct':round(mom5,3),'momentum_15m_pct':round(mom15,3),
+                       'momentum_30m_pct':round(mom30,3),'volume_ratio':round(vr,3),
+                       'mfe_240m_pct':round(max240,3),
+                       'hit_10pct':max240 >= 10,'hit_15pct':max240 >= 15,'hit_20pct':max240 >= 20}
+                for hold in (60,120,240):
+                    for st in ('fixed3','atr2'):
+                        key = f'{hold}m_{st}'
+                        sim = _bigmove_sim(cs,i,hold//5,st,ROUND_TRIP_COST_PCT)
+                        results[key].append(sim)
+                        row[key+'_net_pct'] = sim['net_pct']
+                event_rows.append(row)
+                i += cooldown_bars
+        n = len(event_rows)
+        big = [r for r in event_rows if r['hit_10pct']]
+        return {**MODE_INFO,'status':'OK','paper_only':True,'read_only':True,
+                'strategy':'BIG_MOVE_RESEARCH_V1','generated_utc':utc_now(),
+                'symbols_requested':len(universe),'symbols_analyzed':len(fetched)-len(errors),
+                'errors':errors,'candles_requested_per_symbol':candles,
+                'event_count':n,'events_hit_10pct':len(big),
+                'events_hit_15pct':sum(r['hit_15pct'] for r in event_rows),
+                'events_hit_20pct':sum(r['hit_20pct'] for r in event_rows),
+                'scenario_results':{k:_bigmove_stats(v) for k,v in results.items()},
+                'big_move_examples':sorted(big,key=lambda r:r['mfe_240m_pct'],reverse=True)[:25],
+                'recent_events':event_rows[-25:],
+                'methodology':{'timeframe':'5m closed candles','forward_window_minutes':240,
+                  'entry':'historical_events momentum gate, NOT exact V89.4 entry',
+                  'stop':'fixed 3% or 2x ATR14; stop checked from next bar',
+                  'stop_fill':'at stop price, optimistic if price gaps',
+                  'intrabar_order':'not identifiable from OHLC',
+                  'cost_pct':ROUND_TRIP_COST_PCT,'cooldown_bars':cooldown_bars,
+                  'selection':'current top-volume symbols; survivorship bias',
+                  'future_data':'used only for outcome, not entry filter',
+                  'warning':'Exploratory in-sample research, not validated trading performance.'}}
+    except Exception as exc:
+        return {**MODE_INFO,'status':'ERROR','paper_only':True,'error':str(exc)}
