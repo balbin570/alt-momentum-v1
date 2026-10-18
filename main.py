@@ -26976,3 +26976,109 @@ async def big_move_research_v2(count: int = Query(default=20, ge=1, le=40),
                     'caveats':'Early and standard populations overlap but differ; results not paired. Current top-volume universe has survivorship bias; overlapping symbols/events, no spread/slippage, no real trades. Holdout is descriptive and not independent validation if rules were chosen after V1 results.'}}
     except Exception as exc:
         return {**MODE_INFO,'status':'ERROR','paper_only':True,'error':str(exc)}
+
+
+# ============================================================
+# BIG-MOVE-RESEARCH V3 -- manual, read-only, no startup worker.
+# ============================================================
+
+def _bmv3_features(cs, i):
+    if i < 20 or cs[i]['close'] <= 0:
+        return None
+    price = cs[i]['close']
+    vol = sum(x['volume'] for x in cs[i-6:i]) / 6
+    return {'m5':_bigmove_pct(cs[i-1]['close'],price),
+            'm15':_bigmove_pct(cs[i-3]['close'],price),
+            'm30':_bigmove_pct(cs[i-6]['close'],price),
+            'vr':cs[i]['volume']/vol if vol > 0 else 0}
+
+
+def _bmv3_simulate(cs,i,bars,stop_pct=3.0):
+    entry=cs[i]['close']
+    stop=entry*(1-stop_pct/100)
+    exit_price=cs[i+bars]['close']
+    reason='TIME'
+    for j in range(i+1,i+bars+1):
+        if cs[j]['low'] <= stop:
+            exit_price=stop
+            reason='STOP'
+            break
+    return {'net_pct':_bigmove_pct(entry,exit_price)-ROUND_TRIP_COST_PCT,
+            'exit_reason':reason}
+
+
+@app.get('/big-move-research-v3')
+async def big_move_research_v3(count: int = Query(default=20,ge=1,le=40),
+                               candles: int = Query(default=900,ge=150,le=1000),
+                               cooldown_bars: int = Query(default=12,ge=1,le=48)):
+    """Paired hold-time comparison and selective early-entry research, read-only."""
+    try:
+        async with httpx.AsyncClient(timeout=35.0) as client:
+            universe=(await build_universe(client))[:count]
+            sem=asyncio.Semaphore(5)
+            async def fetch(item):
+                async with sem:
+                    try:
+                        return item['symbol'],await get_completed_5m_candles(client,item['symbol'],candles),None
+                    except Exception as exc:
+                        return item['symbol'],[],str(exc)[:160]
+            fetched=await asyncio.gather(*(fetch(x) for x in universe))
+        rows=[];errors=[]
+        for symbol,cs,error in fetched:
+            if error:
+                errors.append({'symbol':symbol,'error':error});continue
+            i=20
+            while i+48<len(cs):
+                f=_bmv3_features(cs,i)
+                if f is None:
+                    i+=1;continue
+                # Candidate is defined entirely from completed entry-time candles.
+                early=(.15<=f['m5']<=2 and f['m15']>=.25 and .25<=f['m30']<=4 and f['vr']>=1.1)
+                if not early:
+                    i+=1;continue
+                standard=_bmv2_gate(cs,i)
+                # Pre-registered selective rules; no future outcome used in gate.
+                selective=(.20<=f['m5']<=1.2 and .40<=f['m15']<=2.5
+                           and .4<=f['m30']<=2.5 and 1.5<=f['vr']<=4)
+                forward=cs[i+1:i+49]
+                mfe=max((_bigmove_pct(cs[i]['close'],c['high']) for c in forward),default=0)
+                mae=min((_bigmove_pct(cs[i]['close'],c['low']) for c in forward),default=0)
+                sims={str(minutes):_bmv3_simulate(cs,i,minutes//5) for minutes in (30,60,120,240)}
+                rows.append({'symbol':symbol,'timestamp':cs[i]['close_time'],
+                             'early':True,'standard':standard,'selective':selective,
+                             'features':f,'mfe_240_pct':mfe,'mae_240_pct':mae,'sims':sims})
+                i+=cooldown_bars
+        rows.sort(key=lambda r:r['timestamp'])
+        cutoff=rows[int(len(rows)*.7)]['timestamp'] if len(rows)>1 else (rows[0]['timestamp'] if rows else 0)
+        def report(part):
+            result={}
+            for cohort in ('early','standard','selective'):
+                subset=[r for r in part if r[cohort]]
+                result[cohort]={'n_events':len(subset),'hit_10pct':sum(r['mfe_240_pct']>=10 for r in subset),
+                                'hit_15pct':sum(r['mfe_240_pct']>=15 for r in subset),
+                                'hit_20pct':sum(r['mfe_240_pct']>=20 for r in subset),
+                                'hold_scenarios':{minutes:_bigmove_stats([r['sims'][minutes] for r in subset])
+                                                  for minutes in ('30','60','120','240')}}
+            return result
+        train=[r for r in rows if r['timestamp']<cutoff]
+        holdout=[r for r in rows if r['timestamp']>=cutoff]
+        return {**MODE_INFO,'status':'OK','paper_only':True,'read_only':True,
+                'strategy':'BIG_MOVE_RESEARCH_V3','generated_utc':utc_now(),
+                'symbols_analyzed':len(fetched)-len(errors),'errors':errors,
+                'events_total':len(rows),'events_train':len(train),'events_holdout':len(holdout),
+                'train':report(train),'holdout':report(holdout),
+                'big_move_examples':[
+                    {'symbol':r['symbol'],'entry_utc':datetime.fromtimestamp(r['timestamp']/1000,tz=timezone.utc).isoformat(),
+                     'features':{k:round(v,3) for k,v in r['features'].items()},
+                     'mfe_240_pct':round(r['mfe_240_pct'],3),'mae_240_pct':round(r['mae_240_pct'],3),
+                     'selective':r['selective'],'net_by_hold':{k:round(v['net_pct'],3) for k,v in r['sims'].items()}}
+                    for r in sorted(rows,key=lambda x:x['mfe_240_pct'],reverse=True)[:12]],
+                'methodology':{'timeframe':'5m closed candles','split':'chronological 70/30 globally; descriptive holdout',
+                    'entry':'early gate from V2; standard is subset; selective is subset of early',
+                    'comparison':'same entries for all 30/60/120/240 hold durations within each cohort',
+                    'selection':'predefined momentum and volume bounds, not optimized',
+                    'btc_filter':'NOT IMPLEMENTED; BTC context requires aligned BTC candle data',
+                    'stop':'fixed 3% from next candle; optimistic stop fills; OHLC intrabar ambiguity',
+                    'cost_pct':ROUND_TRIP_COST_PCT,'limitations':'current-volume universe survivorship bias; overlapping events; no spread/slippage; holdout not independent after V1/V2 exploration; research only'}}
+    except Exception as exc:
+        return {**MODE_INFO,'status':'ERROR','paper_only':True,'read_only':True,'strategy':'BIG_MOVE_RESEARCH_V3','error':str(exc)}
