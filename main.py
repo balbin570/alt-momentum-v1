@@ -6862,6 +6862,7 @@ async def v22_telegram_send(message: str):
             message.startswith("ALT V32.3-B PAPER GIRIS") or
             message.startswith("ALT V32.3-B PAPER CIKIS") or
             message.startswith("ALT V32.3-B TELEGRAM TEST\n") or
+            message.startswith("ALT V32.3 ARASTIRMA SINYALI\n") or
             message.startswith("ALT V89.4 PAPER GIRIS\n") or
             message.startswith("ALT V89.4 PAPER CIKIS\n") or
             message.startswith("ALT V89.4 TELEGRAM TEST\n") or
@@ -8819,6 +8820,35 @@ async def v32_scan_once():
 
         now_ms_for_freshness = alt_now_ms()
         freshness_ms = 10 * 60 * 1000
+        # V323 research-only observer: evaluate fresh TOP1 candidates even while
+        # the V32.2 paper-entry loop below remains deliberately frozen.
+        # Never changes V32 positions, seen keys, order logic, or Telegram.
+        for _candidate in top1_rows:
+            try:
+                _entry_ms = int(_candidate["entry_open_time"])
+                _age_ms = now_ms_for_freshness - _entry_ms
+                if not (0 <= _age_ms <= freshness_ms):
+                    continue
+                _key = f'{_candidate["symbol"]}:{_entry_ms}'
+                if _key in V323_OBSERVED_KEYS:
+                    continue
+                _price = _candidate.get("checkpoint_open")
+                if _price is None:
+                    continue
+                _context = v61_entry_context(
+                    good.get(_candidate["symbol"]), good.get("BTCUSDT"),
+                    _entry_ms, float(_price))
+                _features = {**_context,
+                             "relative_momentum_z": _candidate.get("relative_momentum_z"),
+                             "entry_delay_seconds": max(0.0, _age_ms / 1000.0)}
+                _gate = v322_candidate_tag_without_ret60(_features)
+                v323_observe_candidate(_key, _candidate.get("symbol"), _features, _gate)
+                V323_OBSERVED_KEYS[_key] = now_ms_for_freshness
+            except Exception:
+                pass  # Research diagnostics must not interrupt the V32 scanner.
+        if len(V323_OBSERVED_KEYS) > 2000:
+            for _key, _ in sorted(V323_OBSERVED_KEYS.items(), key=lambda item: item[1])[:-1000]:
+                V323_OBSERVED_KEYS.pop(_key, None)
         entry_funnel = {
             "top1_total": len(top1_rows), "fresh_last_10m": 0,
             "rejected_not_fresh": 0, "rejected_seen_key": 0,
@@ -19551,13 +19581,13 @@ async def v892_status():
 # V32.3 CANDIDATE RESEARCH (observation only, NO paper entries)
 # Both gates evaluate the same candidate at the same pre-quote checkpoint.
 # No mutation of V32/V89 books, execution, alerts, or entry filters.
+V323_OBSERVED_KEYS = {}  # RAM-only de-duplication for research observations
 V323_RESEARCH = {"checked": 0, "v322_pass": 0, "v323_pass": 0,
                  "v323_only": 0, "both_reject": 0, "missing_features": 0,
                  "recent": []}
 
 def v323_observe_candidate(key, symbol, features, v322_gate):
-    # ROLLBACK: V32.3 research observation disabled; V32.2 gate remains intact.
-    return
+    # Read-only comparison; V32.2 paper entries remain frozen.
     r = V323_RESEARCH
     r["checked"] += 1
     fields = ("ctx_ret_60m_pct", "ctx_vol_ratio_15m_vs_4h",
@@ -19732,12 +19762,73 @@ async def v323b_status(limit: int = Query(default=50, ge=1, le=200)):
                 "mean_net_pct":round(mean(vals),4) if vals else None,
                 "win_rate_pct":round(100*sum(v>0 for v in vals)/len(vals),2) if vals else None},
             "trades":trades,"limitations":["RAM only; resets on restart",
-                "Read-only on-demand paper valuation; no exchange orders or Telegram",
+                "Read-only paper valuation; optional Telegram shadow notifications, no exchange orders",
                 "Only candidates reaching V32.2 pre-filter",
                 "Stop approximated from 1m candle lows at exact stop price; gaps/slippage not modeled",
                 "Historical API may not retain all needed candles after long delays",
                 "Not a live-fill model; overlapping signals may not be independent"],
             "generated_utc":utc_now()}
+
+# V32 family research Telegram: alert on NEW V32.3 filter passes only.
+# V32.3 is an observational signal, NOT an entry or exit.
+V323_TG_SENT = set()
+V323_TG_LAST = {"last_check_utc": None, "last_error": None, "sent": 0}
+V323_TG_BOOT_UTC = None
+V323_TG_TASK = None
+
+async def v323_research_telegram_loop():
+    while True:
+        try:
+            V323_TG_LAST["last_check_utc"] = utc_now()
+            for row in list(V323_FOLLOWUP_EVENTS):
+                if not row.get("v323_pass") or not row.get("key"):
+                    continue
+                # Do not replay prior signals on restart or send late old signals.
+                if row["utc"] < V323_TG_BOOT_UTC:
+                    continue
+                if (datetime.now(timezone.utc) - datetime.fromisoformat(row["utc"])).total_seconds() > 180:
+                    continue
+                key = str(row["key"])
+                if key in V323_TG_SENT:
+                    continue
+                msg = (f"ALT V32.3 ARASTIRMA SINYALI\n"
+                       f"Coin: {row['symbol']}\n"
+                       f"60dk momentum: {row['ret60_pct']:+.3f}%\n"
+                       f"Hacim orani: {row['volume_ratio']:.3f}\n"
+                       f"Z-skoru: {row['z']:.3f}\n"
+                       f"Gecikme: {row['delay_seconds']:.1f} sn\n"
+                       f"Gozlem UTC: {row['utc']}\n"
+                       "SADECE ARASTIRMA | Pozisyon acilmadi | Gercek emir YOK")
+                res = await v22_telegram_send(msg)
+                if res.get("sent"):
+                    V323_TG_SENT.add(key)
+                    V323_TG_LAST["sent"] += 1
+                else:
+                    V323_TG_LAST["last_error"] = res.get("reason", "not_sent")
+            if len(V323_TG_SENT) > 3000:
+                V323_TG_SENT.clear()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            V323_TG_LAST["last_error"] = f"{type(exc).__name__}: {str(exc)[:150]}"
+        await asyncio.sleep(30)
+
+@app.on_event("startup")
+async def v32_family_research_telegram_startup():
+    global V323_TG_BOOT_UTC, V323_TG_TASK, V323B_TG_TASK
+    V323_TG_BOOT_UTC = utc_now()
+    if V323_TG_TASK is None or V323_TG_TASK.done():
+        V323_TG_TASK = asyncio.create_task(v323_research_telegram_loop())
+    if V323B_TG_TASK is None or V323B_TG_TASK.done():
+        V323B_TG_TASK = asyncio.create_task(v323b_telegram_loop())
+
+@app.get("/v32-family-telegram-status")
+async def v32_family_telegram_status():
+    return {**MODE_INFO, "status": "OK", "telegram_configured": bool(V22_TG_TOKEN and V22_TG_CHAT_ID),
+            "v32_2": "EXISTING_PAPER_ENTRY_EXIT_UNCHANGED",
+            "v32_3": {"kind": "RESEARCH_SIGNAL_ONLY", "worker_running": bool(V323_TG_TASK and not V323_TG_TASK.done()), "stats": V323_TG_LAST},
+            "v32_3_b": {"kind": "SHADOW_PAPER_ENTRY_EXIT", "worker_running": bool(V323B_TG_TASK and not V323B_TG_TASK.done()), "stats": V323B_TG_LAST},
+            "startup_utc": V323_TG_BOOT_UTC, "historical_replay": False, "orders": False}
 
 # V32.3-B TELEGRAM: background notification observer, paper-only.
 # The existing status endpoint performs the same candle-based valuation.
@@ -19753,7 +19844,9 @@ async def v323b_telegram_cycle():
     # Otherwise a healthy idle worker incorrectly appears never to have run.
     V323B_TG_LAST["last_check_utc"] = utc_now()
     V323B_TG_LAST["cycle_count"] += 1
-    eligible_count = sum(bool(row.get("v323b_pass")) for row in V323_FOLLOWUP_EVENTS)
+    eligible_count = sum(bool(row.get("v323b_pass")) and bool(V323_TG_BOOT_UTC)
+                         and row.get("utc", "") >= V323_TG_BOOT_UTC
+                         for row in V323_FOLLOWUP_EVENTS)
     V323B_TG_LAST["candidate_count"] = eligible_count
     if not eligible_count:
         V323B_TG_LAST["last_cycle_state"] = "IDLE_NO_ELIGIBLE_CANDIDATES"
@@ -19764,6 +19857,10 @@ async def v323b_telegram_cycle():
     for trade in report.get("trades", []):
         key = trade.get("key")
         if not key or trade.get("status") not in ("OPEN_SHADOW", "CLOSED_SHADOW"):
+            continue
+        # Only notify trades originating after this deployment; no historic replay.
+        signal_utc = trade.get("signal_utc")
+        if not signal_utc or not V323_TG_BOOT_UTC or signal_utc < V323_TG_BOOT_UTC:
             continue
         sent = V323B_TG_SENT.setdefault(key, {"entry": False, "exit": False})
         symbol = trade.get("symbol", "?")
