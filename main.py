@@ -27372,7 +27372,7 @@ async def big_move_v5_status():
                               exit_reason,net_pct FROM big_move_v5_forward_paper
                               ORDER BY signal_close_ms DESC LIMIT 200''')
                 rows=cur.fetchall()
-        closed=[{'net_pct':r[6]} for r in rows if r[3]=='CLOSED' and r[6] is not None]
+        closed=[{'net_pct':r[6], 'exit_reason':r[5]} for r in rows if r[3]=='CLOSED' and r[6] is not None]
         return {**MODE_INFO,'status':'OK','strategy':'BIG_MOVE_V5_FORWARD','paper_only':True,
                 'total_returned':len(rows),'pending':sum(r[3]=='PENDING' for r in rows),
                 'open':sum(r[3]=='OPEN' for r in rows),'closed':len(closed),
