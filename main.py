@@ -19264,6 +19264,224 @@ async def v89_startup():
     if not V89_STATE.get("started_utc"):V89_STATE["started_utc"]=utc_now()
     if V89_TASK is None:V89_TASK=asyncio.create_task(v89_loop())
 
+# ============================================================
+# V89 100-COIN EXPANSION: INDEPENDENT PAPER-ONLY COHORT
+# Existing 40-coin scanner, V89.3/V89.4, BTCNEG/CHASE050,
+# and frozen R1/R2 are not modified.
+# Extra cohort covers ranks 41..100 only, to measure incremental value.
+# ============================================================
+V89_100_TASK = None
+V89_100_INTERVAL = 300
+V89_100_PREFIX = "v89_100_extra_"
+
+async def v89_100_scan_once():
+    started = utc_now()
+    stats = {"utc": started, "universe_range": "41-100", "errors": [],
+             "candidates_893": 0, "candidates_894": 0,
+             "btcneg_eligible": 0, "chase050_eligible": 0,
+             "new_entries": {"btcneg": 0, "chase050": 0}}
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
+            universe = await build_universe(client)
+            symbols = [u["symbol"] for u in universe if u["symbol"] != "BTCUSDT"][40:100]
+            stats["requested_symbols"] = len(symbols)
+            semaphore = asyncio.Semaphore(4)
+            async def fetch(sym):
+                async with semaphore:
+                    try:
+                        return sym, await asyncio.wait_for(v74_candles(client, sym, 90), 25), None
+                    except Exception as exc:
+                        return sym, None, f"{type(exc).__name__}: {exc}"[:180]
+            fetched = await asyncio.gather(*(fetch(sym) for sym in symbols))
+            data = {sym: candles for sym, candles, err in fetched if candles and len(candles) >= 55}
+            stats["analyzed_symbols"] = len(data)
+            stats["errors"] = [{"symbol": sym, "error": err} for sym, _, err in fetched if err][:15]
+            btc = await v74_candles(client, "BTCUSDT", 90)
+            if len(btc) < 55:
+                raise RuntimeError("BTC candles insufficient")
+            btc30 = v74_pct(btc[-7]["close"], btc[-1]["close"])
+            stats["btc30_pct"] = round(btc30, 4)
+            alt30_values = [v74_pct(c[-7]["close"], c[-1]["close"]) for c in data.values()]
+            # Baseline uses the original top-40 dispersion. Never substitute
+            # 41-100 dispersion as if it were the same market regime.
+            baseline = V89_STATE.get("last_scan") or {}
+            dispersion = baseline.get("disp30_pct")
+            stats["baseline_disp30_pct"] = dispersion
+            if dispersion is None:
+                stats["entry_blocked_reason"] = "BASELINE_DISPERSION_UNAVAILABLE"
+            now = alt_now_ms()
+            # Check existing expansion positions even when symbols fall out of top 100.
+            for variant, minutes in (("btcneg", 120), ("chase050", 60)):
+                key = V89_100_PREFIX + variant
+                remaining = []
+                for trade in V89_STATE.get(key + "_open", []):
+                    due = now >= int(trade["exit_due_ms"])
+                    trade["last_stop_check_utc"] = utc_now()
+                    try:
+                        quote = await live_quote(client, trade["symbol"])
+                    except Exception as exc:
+                        quote = None
+                        trade["last_quote_error"] = str(exc)[:180]
+                    bid = float(quote["bid"]) if quote and quote.get("bid") is not None else None
+                    if bid is None:
+                        trade["missing_quote_checks"] = int(trade.get("missing_quote_checks", 0)) + 1
+                        if not due:
+                            remaining.append(trade)
+                            continue
+                        candles = data.get(trade["symbol"], [])
+                        if not candles:
+                            try:
+                                candles = await v74_candles(client, trade["symbol"], 5)
+                            except Exception:
+                                candles = []
+                        bid = float(candles[-1]["close"]) if candles else None
+                        if bid is None:
+                            remaining.append(trade)
+                            continue
+                    gross = v74_pct(float(trade["entry_price"]), bid)
+                    stop = gross <= -V89_STOP_PCT
+                    if not stop and not due:
+                        remaining.append(trade)
+                        continue
+                    trade.update(exit_price=bid, exit_utc=utc_now(),
+                                 exit_reason="STOP3" if stop else f"TIME{minutes}",
+                                 gross_pct=round(gross, 4), cost_pct=0.15,
+                                 net_pct=round(gross - 0.15, 4), status="CLOSED_SHADOW")
+                    V89_STATE.setdefault(key + "_closed", []).append(trade)
+                V89_STATE[key + "_open"] = remaining
+                V89_STATE[key + "_closed"] = V89_STATE.get(key + "_closed", [])[-1000:]
+
+            c893, c894 = [], []
+            failures = {"confirm10_breakout": 0, "confirm10_volume": 0,
+                        "confirm10_rising": 0, "confirm5_breakout": 0,
+                        "confirm5_volume": 0, "confirm5_rising": 0}
+            for sym, candles in data.items():
+                i = len(candles) - 3
+                bo = candles[i]
+                change = v74_pct(bo["open"], bo["close"])
+                avg = sum(x["volume"] for x in candles[i-20:i]) / 20
+                volume = bo["volume"] / avg if avg > 0 else 0
+                if change < 0.50:
+                    failures["confirm10_breakout"] += 1
+                elif volume < 1.20:
+                    failures["confirm10_volume"] += 1
+                elif not (candles[i+1]["close"] > bo["close"] and
+                          candles[i+2]["close"] > candles[i+1]["close"]):
+                    failures["confirm10_rising"] += 1
+                else:
+                    c893.append({"symbol": sym, "breakout_time": bo["open_time"],
+                                 "breakout_close": bo["close"],
+                                 "breakout_change_pct": change, "volume_ratio": volume})
+                j = len(candles) - 2
+                bo = candles[j]
+                change = v74_pct(bo["open"], bo["close"])
+                avg = sum(x["volume"] for x in candles[j-20:j]) / 20
+                volume = bo["volume"] / avg if avg > 0 else 0
+                if change < 0.20:
+                    failures["confirm5_breakout"] += 1
+                elif volume < 1.20:
+                    failures["confirm5_volume"] += 1
+                elif not candles[j+1]["close"] > bo["close"]:
+                    failures["confirm5_rising"] += 1
+                else:
+                    c894.append({"symbol": sym, "breakout_time": bo["open_time"],
+                                 "breakout_close": bo["close"],
+                                 "breakout_change_pct": change, "volume_ratio": volume})
+            c893.sort(key=lambda x: (x["breakout_change_pct"], x["volume_ratio"]), reverse=True)
+            c894.sort(key=lambda x: (x["breakout_change_pct"], x["volume_ratio"]), reverse=True)
+            stats["candidates_893"] = len(c893)
+            stats["candidates_894"] = len(c894)
+            stats["first_failure_counts"] = failures
+            if dispersion is not None:
+                for variant, candidates, minutes in (("btcneg", c893[:1], 120),
+                                                      ("chase050", c894[:3], 60)):
+                    key = V89_100_PREFIX + variant
+                    for candidate in candidates:
+                        if len(V89_STATE.get(key + "_open", [])) >= 5:
+                            break
+                        if not (candidate["volume_ratio"] < V892_VOLUME_MAX and
+                                candidate["breakout_change_pct"] < V892_BREAKOUT_MAX and
+                                not (V892_DISP_LOW <= float(dispersion) <= V892_DISP_HIGH)):
+                            continue
+                        if variant == "btcneg" and btc30 > 0:
+                            continue
+                        seen_key = f'{candidate["symbol"]}:{candidate["breakout_time"]}'
+                        seen = V89_STATE.setdefault(key + "_seen", [])
+                        if seen_key in seen:
+                            continue
+                        seen.append(seen_key)
+                        del seen[:-2000]
+                        if any(t["symbol"] == candidate["symbol"] for t in V89_STATE.get(key + "_open", [])):
+                            continue
+                        if variant == "btcneg":
+                            stats["btcneg_eligible"] += 1
+                        try:
+                            quote = await live_quote(client, candidate["symbol"])
+                        except Exception:
+                            quote = None
+                        if not (quote and quote.get("ask") and quote.get("bid") and
+                                quote["spread_pct"] <= SPREAD_MAX_PCT):
+                            continue
+                        ask = float(quote["ask"])
+                        chase = v74_pct(float(candidate["breakout_close"]), ask)
+                        if variant == "chase050":
+                            if chase > 0.50:
+                                continue
+                            stats["chase050_eligible"] += 1
+                        entry_ms = alt_now_ms()
+                        trade = {**candidate, "entry_price": ask, "entry_utc": utc_now(),
+                                 "entry_ms": entry_ms, "exit_due_ms": entry_ms + minutes*60000,
+                                 "stop_price": round(ask * 0.97, 12),
+                                 "execution_version": "V89_100_EXTRA_" + variant.upper(),
+                                 "status": "OPEN_SHADOW", "research_only": True,
+                                 "chase_pct": round(chase, 6),
+                                 "spread_pct": round(float(quote["spread_pct"]), 4),
+                                 "btc30_pct": round(btc30, 6),
+                                 "baseline_disp30_pct": float(dispersion),
+                                 "last_stop_check_utc": None, "missing_quote_checks": 0}
+                        V89_STATE.setdefault(key + "_open", []).append(trade)
+                        stats["new_entries"][variant] += 1
+            V89_STATE["v89_100_last_scan"] = stats
+            v89_save()
+            return stats
+    except Exception as exc:
+        stats["error"] = f"{type(exc).__name__}: {exc}"[:350]
+        V89_STATE["v89_100_last_scan"] = stats
+        try:
+            v89_save()
+        except Exception:
+            pass
+        print("V89_100_SCAN_ERROR", stats["error"], flush=True)
+        return stats
+
+async def v89_100_loop():
+    while True:
+        await v89_100_scan_once()
+        await asyncio.sleep(V89_100_INTERVAL)
+
+@app.on_event("startup")
+async def v89_100_startup():
+    global V89_100_TASK
+    if V89_100_TASK is None:
+        V89_100_TASK = asyncio.create_task(v89_100_loop())
+
+@app.get("/v89-100-status")
+async def v89_100_status():
+    result = {"status": "OK", "paper_only": True, "orders": False,
+              "comparison": "UNCHANGED_TOP40_VS_EXTRA_RANKS_41_TO_100",
+              "scan_interval_seconds": V89_100_INTERVAL,
+              "last_scan": V89_STATE.get("v89_100_last_scan"),
+              "baseline_top40_last_scan": V89_STATE.get("last_scan"),
+              "variants": {}}
+    for variant in ("btcneg", "chase050"):
+        key = V89_100_PREFIX + variant
+        result["variants"][variant] = {
+            "open_count": len(V89_STATE.get(key + "_open", [])),
+            "closed_performance": v89_perf(V89_STATE.get(key + "_closed", [])),
+            "open": V89_STATE.get(key + "_open", [])[-10:],
+            "recent_closed": V89_STATE.get(key + "_closed", [])[-15:]}
+    return result
+
 @app.get("/v89-scan-now")
 async def v89_scan_now():return {"status":"OK","paper_only":True,"scan":await v89_scan_once()}
 
