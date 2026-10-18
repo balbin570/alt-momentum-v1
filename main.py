@@ -6876,7 +6876,9 @@ async def v22_telegram_send(message: str):
             message.startswith("ALT V897 PAPER GIRIS\n") or
             message.startswith("ALT V897 PAPER CIKIS\n") or
             message.startswith("ALT V897 GUNLUK OZET\n") or
-            message.startswith("ALT V89-100 PAPER ")):
+            message.startswith("ALT V89-100 PAPER ") or
+            message.startswith("BIG MOVE V5 PAPER GIRIS\n") or
+            message.startswith("BIG MOVE V5 PAPER CIKIS\n")):
         return {"sent": False, "reason": "telegram_new_strategies_only"}
     if not V22_TG_TOKEN or not V22_TG_CHAT_ID:
         return {"sent": False, "reason": "telegram_not_configured"}
@@ -27176,3 +27178,192 @@ async def big_move_research_v4(count: int = Query(default=20,ge=1,le=40),
     except Exception as exc:
         return {**MODE_INFO,'status':'ERROR','paper_only':True,'read_only':True,
                 'strategy':'BIG_MOVE_RESEARCH_V4','error':str(exc)}
+
+# ============================================================
+# BIG MOVE V5: PROSPECTIVE PAPER TRACKER (manual scan only).
+# No orders, Telegram on persisted entry/exit, no background scheduler.
+# ============================================================
+_BMV5_TABLE = 'big_move_v5_forward_paper'
+
+def _bmv5_db(conn):
+    with conn.cursor() as cur:
+        cur.execute('''CREATE TABLE IF NOT EXISTS big_move_v5_forward_paper (
+            symbol TEXT NOT NULL, signal_close_ms BIGINT NOT NULL,
+            signal_price DOUBLE PRECISION NOT NULL, btc30_pct DOUBLE PRECISION NOT NULL,
+            status TEXT NOT NULL DEFAULT 'PENDING', entry_ms BIGINT,
+            entry_price DOUBLE PRECISION, exit_ms BIGINT, exit_price DOUBLE PRECISION,
+            exit_reason TEXT, net_pct DOUBLE PRECISION,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            entry_tg_sent BOOLEAN NOT NULL DEFAULT FALSE,
+            exit_tg_sent BOOLEAN NOT NULL DEFAULT FALSE,
+            PRIMARY KEY (symbol, signal_close_ms))''')
+        cur.execute('ALTER TABLE big_move_v5_forward_paper ADD COLUMN IF NOT EXISTS entry_tg_sent BOOLEAN NOT NULL DEFAULT FALSE')
+        cur.execute('ALTER TABLE big_move_v5_forward_paper ADD COLUMN IF NOT EXISTS exit_tg_sent BOOLEAN NOT NULL DEFAULT FALSE')
+
+def _bmv5_advance(cur, symbol, cs):
+    cur.execute('''SELECT signal_close_ms, status, entry_ms, entry_price
+                   FROM big_move_v5_forward_paper
+                   WHERE symbol=%s AND status IN ('PENDING','OPEN')
+                   ORDER BY signal_close_ms''', (symbol,))
+    active=cur.fetchall()
+    for signal_ms,status,entry_ms,entry_price in active:
+        if status=='PENDING':
+            first=next((c for c in cs if c['close_time']>signal_ms),None)
+            if first is None: continue
+            entry_ms=first['close_time']
+            entry_price=first['open']
+            cur.execute('''UPDATE big_move_v5_forward_paper SET status='OPEN',entry_ms=%s,entry_price=%s
+                           WHERE symbol=%s AND signal_close_ms=%s AND status='PENDING' ''',
+                        (entry_ms,entry_price,symbol,signal_ms))
+        if not entry_price or entry_price<=0: continue
+        # Start at the next completed candle following the signal. The signal is
+        # observed only at close, so the entry is the following candle's open.
+        forward=[c for c in cs if c['close_time']>signal_ms]
+        stop=entry_price*.97
+        exit_c=None; exit_price=None; reason=None
+        for idx,c in enumerate(forward):
+            if c['low']<=stop:
+                exit_c=c; exit_price=min(stop,c['open']);reason='STOP';break
+            if idx>=23:
+                exit_c=c;exit_price=c['close'];reason='TIME_120M';break
+        if exit_c is not None:
+            net=_bigmove_pct(entry_price,exit_price)-ROUND_TRIP_COST_PCT
+            cur.execute('''UPDATE big_move_v5_forward_paper SET status='CLOSED',exit_ms=%s,
+                           exit_price=%s,exit_reason=%s,net_pct=%s
+                           WHERE symbol=%s AND signal_close_ms=%s AND status='OPEN' ''',
+                        (exit_c['close_time'],exit_price,reason,net,symbol,signal_ms))
+
+async def _bmv5_telegram_flush(url):
+    """Send only unsent persisted paper events; never send for PENDING signals."""
+    import psycopg
+    notices=[]
+    with psycopg.connect(url,connect_timeout=12) as conn:
+        _bmv5_db(conn)
+        with conn.cursor() as cur:
+            cur.execute("""SELECT symbol,signal_close_ms,status,entry_price,exit_price,
+                          exit_reason,net_pct,btc30_pct,entry_tg_sent,exit_tg_sent
+                          FROM big_move_v5_forward_paper
+                          WHERE (status IN ('OPEN','CLOSED') AND entry_tg_sent=FALSE)
+                             OR (status='CLOSED' AND exit_tg_sent=FALSE)
+                          ORDER BY signal_close_ms ASC LIMIT 50""")
+            rows=cur.fetchall()
+    for symbol,signal_ms,status,entry,exit_price,reason,net,btc30,entry_sent,exit_sent in rows:
+        if not entry_sent and entry:
+            msg=(f"BIG MOVE V5 PAPER GIRIS\n"
+                 f"Coin: {symbol}\nGiriş: {entry:.8g} USDT\n"
+                 f"Stop (-%3): {entry*.97:.8g} USDT\n"
+                 f"BTC 30dk: %{btc30:+.3f}\nHedef süre: 120 dk\n"
+                 f"Gerçek emir: YOK")
+            try:
+                res=await v22_telegram_send(msg)
+                sent=bool(res.get('sent')) if isinstance(res,dict) else False
+                notices.append({'symbol':symbol,'type':'ENTRY','sent':sent,'result':res})
+                if sent:
+                    with psycopg.connect(url,connect_timeout=12) as conn:
+                        with conn.cursor() as cur:
+                            cur.execute('UPDATE big_move_v5_forward_paper SET entry_tg_sent=TRUE WHERE symbol=%s AND signal_close_ms=%s', (symbol,signal_ms))
+                        conn.commit()
+            except Exception as exc:
+                notices.append({'symbol':symbol,'type':'ENTRY','sent':False,'error':str(exc)[:160]})
+                continue
+        if status=='CLOSED' and not exit_sent and exit_price is not None and net is not None:
+            msg=(f"BIG MOVE V5 PAPER CIKIS\n"
+                 f"Coin: {symbol}\nGiriş: {entry:.8g} USDT\n"
+                 f"Çıkış: {exit_price:.8g} USDT\n"
+                 f"Net K/Z: %{net:+.3f} (maliyet dahil)\n"
+                 f"Neden: {reason}\nGerçek emir: YOK")
+            try:
+                res=await v22_telegram_send(msg)
+                sent=bool(res.get('sent')) if isinstance(res,dict) else False
+                notices.append({'symbol':symbol,'type':'EXIT','sent':sent,'result':res})
+                if sent:
+                    with psycopg.connect(url,connect_timeout=12) as conn:
+                        with conn.cursor() as cur:
+                            cur.execute('UPDATE big_move_v5_forward_paper SET exit_tg_sent=TRUE WHERE symbol=%s AND signal_close_ms=%s', (symbol,signal_ms))
+                        conn.commit()
+            except Exception as exc:
+                notices.append({'symbol':symbol,'type':'EXIT','sent':False,'error':str(exc)[:160]})
+    return notices
+
+@app.get('/big-move-v5-scan')
+async def big_move_v5_scan(count: int = Query(default=20,ge=1,le=40)):
+    """MANUAL prospective paper scan. DB persists signals; no live orders."""
+    try:
+        url=os.getenv('DATABASE_URL','').strip()
+        if not url:
+            return {**MODE_INFO,'status':'UNAVAILABLE','strategy':'BIG_MOVE_V5_FORWARD',
+                    'reason':'DATABASE_URL missing; no in-memory fallback'}
+        async with httpx.AsyncClient(timeout=35.0) as client:
+            universe=(await build_universe(client))[:count]
+            symbols=list(dict.fromkeys(['BTCUSDT']+[x['symbol'] for x in universe]))
+            sem=asyncio.Semaphore(5)
+            async def fetch(symbol):
+                async with sem:
+                    try:return symbol,await get_completed_5m_candles(client,symbol,100),None
+                    except Exception as e:return symbol,[],str(e)[:160]
+            fetched=await asyncio.gather(*(fetch(s) for s in symbols))
+        data={s:cs for s,cs,e in fetched if not e and len(cs)>=25}
+        errors=[{'symbol':s,'error':e or 'insufficient candles'} for s,cs,e in fetched if e or len(cs)<25]
+        btc=data.get('BTCUSDT',[])
+        if not btc:
+            return {**MODE_INFO,'status':'ERROR','strategy':'BIG_MOVE_V5_FORWARD',
+                    'reason':'BTC candles unavailable','errors':errors}
+        btc_by_time={c['close_time']:i for i,c in enumerate(btc)}
+        new_signals=[]
+        import psycopg
+        with psycopg.connect(url,connect_timeout=12) as conn:
+            _bmv5_db(conn)
+            with conn.cursor() as cur:
+                for symbol,cs in data.items():
+                    if symbol=='BTCUSDT':continue
+                    _bmv5_advance(cur,symbol,cs)
+                    i=len(cs)-1
+                    f=_bmv3_features(cs,i)
+                    if not f or not (.15<=f['m5']<=2 and f['m15']>=.25 and .25<=f['m30']<=4 and f['vr']>=1.1):continue
+                    j=btc_by_time.get(cs[i]['close_time'])
+                    if j is None or j<6:continue
+                    b30=_bigmove_pct(btc[j-6]['close'],btc[j]['close'])
+                    if b30>0:continue
+                    cur.execute('''SELECT 1 FROM big_move_v5_forward_paper
+                                   WHERE symbol=%s AND status IN ('PENDING','OPEN') LIMIT 1''',(symbol,))
+                    if cur.fetchone():continue
+                    cur.execute('''INSERT INTO big_move_v5_forward_paper
+                        (symbol,signal_close_ms,signal_price,btc30_pct)
+                        VALUES (%s,%s,%s,%s) ON CONFLICT DO NOTHING RETURNING symbol''',
+                        (symbol,cs[i]['close_time'],cs[i]['close'],b30))
+                    if cur.fetchone():new_signals.append({'symbol':symbol,'signal_close_ms':cs[i]['close_time'],
+                                                           'signal_price':cs[i]['close'],'btc30_pct':round(b30,4)})
+            conn.commit()
+        telegram_events=await _bmv5_telegram_flush(url)
+        return {**MODE_INFO,'status':'OK','strategy':'BIG_MOVE_V5_FORWARD','paper_only':True,
+                'trading':False,'orders':False,'new_signals':new_signals,'telegram_events':telegram_events,
+                'symbols_scanned':len(data)-1,'errors':errors,
+                'note':'Manual scan only; Telegram ENTRY on OPEN and EXIT on CLOSED. Call every 5m externally or manually.'}
+    except Exception as exc:
+        return {**MODE_INFO,'status':'ERROR','strategy':'BIG_MOVE_V5_FORWARD','error':str(exc)}
+
+@app.get('/big-move-v5-status')
+async def big_move_v5_status():
+    """Persistent forward-paper results, without market-data side effects."""
+    try:
+        url=os.getenv('DATABASE_URL','').strip()
+        if not url:return {**MODE_INFO,'status':'UNAVAILABLE','reason':'DATABASE_URL missing'}
+        import psycopg
+        with psycopg.connect(url,connect_timeout=12) as conn:
+            _bmv5_db(conn)
+            with conn.cursor() as cur:
+                cur.execute('''SELECT symbol,signal_close_ms,btc30_pct,status,entry_price,
+                              exit_reason,net_pct FROM big_move_v5_forward_paper
+                              ORDER BY signal_close_ms DESC LIMIT 200''')
+                rows=cur.fetchall()
+        closed=[{'net_pct':r[6]} for r in rows if r[3]=='CLOSED' and r[6] is not None]
+        return {**MODE_INFO,'status':'OK','strategy':'BIG_MOVE_V5_FORWARD','paper_only':True,
+                'total_returned':len(rows),'pending':sum(r[3]=='PENDING' for r in rows),
+                'open':sum(r[3]=='OPEN' for r in rows),'closed':len(closed),
+                'closed_stats':_bigmove_stats(closed),
+                'recent':[{'symbol':r[0],'signal_close_ms':r[1],'btc30_pct':r[2],
+                           'status':r[3],'entry_price':r[4],'exit_reason':r[5],
+                           'net_pct':r[6]} for r in rows[:30]],
+                'limitations':'manual scanning, latest-candle-only detection, DB persistence; no live orders, no slippage model'}
+    except Exception as exc:
+        return {**MODE_INFO,'status':'ERROR','strategy':'BIG_MOVE_V5_FORWARD','error':str(exc)}
