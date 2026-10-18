@@ -6875,7 +6875,8 @@ async def v22_telegram_send(message: str):
             message.startswith("ALT V896 PAPER CIKIS\n") or
             message.startswith("ALT V897 PAPER GIRIS\n") or
             message.startswith("ALT V897 PAPER CIKIS\n") or
-            message.startswith("ALT V897 GUNLUK OZET\n")):
+            message.startswith("ALT V897 GUNLUK OZET\n") or
+            message.startswith("ALT V89-100 PAPER ")):
         return {"sent": False, "reason": "telegram_new_strategies_only"}
     if not V22_TG_TOKEN or not V22_TG_CHAT_ID:
         return {"sent": False, "reason": "telegram_not_configured"}
@@ -19275,6 +19276,7 @@ V89_100_INTERVAL = 300
 V89_100_PREFIX = "v89_100_extra_"
 
 async def v89_100_scan_once():
+    notifications = []
     started = utc_now()
     stats = {"utc": started, "universe_range": "41-100", "errors": [],
              "candidates_893": 0, "candidates_894": 0,
@@ -19348,6 +19350,7 @@ async def v89_100_scan_once():
                                  gross_pct=round(gross, 4), cost_pct=0.15,
                                  net_pct=round(gross - 0.15, 4), status="CLOSED_SHADOW")
                     V89_STATE.setdefault(key + "_closed", []).append(trade)
+                    notifications.append(("CIKIS", variant, dict(trade)))
                 V89_STATE[key + "_open"] = remaining
                 V89_STATE[key + "_closed"] = V89_STATE.get(key + "_closed", [])[-1000:]
 
@@ -19441,8 +19444,41 @@ async def v89_100_scan_once():
                                  "last_stop_check_utc": None, "missing_quote_checks": 0}
                         V89_STATE.setdefault(key + "_open", []).append(trade)
                         stats["new_entries"][variant] += 1
+                        notifications.append(("GIRIS", variant, dict(trade)))
             V89_STATE["v89_100_last_scan"] = stats
             v89_save()
+            # Persist first, send Telegram second; a Telegram outage must not
+            # invalidate paper trade state or interrupt the scanner.
+            for event, variant, trade in notifications:
+                label = "BTCNEG" if variant == "btcneg" else "CHASE050"
+                if event == "GIRIS":
+                    msg = (f"ALT V89-100 PAPER GIRIS\n"
+                           f"Strateji: {label} (coin 41-100)\n"
+                           f"Coin: {trade['symbol']}\n"
+                           f"Giris: {trade['entry_price']}\n"
+                           f"Stop: {trade['stop_price']} (-3%)\n"
+                           f"Planlanan sure: {120 if variant == 'btcneg' else 60} dk\n"
+                           f"Saat UTC: {trade['entry_utc']}\n"
+                           "SADECE PAPER - GERCEK EMIR YOK")
+                else:
+                    msg = (f"ALT V89-100 PAPER CIKIS\n"
+                           f"Strateji: {label} (coin 41-100)\n"
+                           f"Coin: {trade['symbol']}\n"
+                           f"Cikis nedeni: {trade['exit_reason']}\n"
+                           f"Net: {trade['net_pct']:+.4f}%\n"
+                           f"Saat UTC: {trade['exit_utc']}\n"
+                           "SADECE PAPER - GERCEK EMIR YOK")
+                try:
+                    delivery = await v22_telegram_send(msg)
+                except Exception as exc:
+                    delivery = {"sent": False, "error": f"{type(exc).__name__}: {exc}"[:200]}
+                V89_STATE.setdefault("v89_100_telegram_log", []).append({
+                    "event": event, "variant": variant, "symbol": trade["symbol"],
+                    "utc": utc_now(), "delivery": delivery})
+                V89_STATE["v89_100_telegram_log"] = V89_STATE["v89_100_telegram_log"][-100:]
+                print("V89_100_TELEGRAM", event, variant, trade["symbol"], delivery, flush=True)
+            if notifications:
+                v89_save()
             return stats
     except Exception as exc:
         stats["error"] = f"{type(exc).__name__}: {exc}"[:350]
@@ -19472,6 +19508,8 @@ async def v89_100_status():
               "scan_interval_seconds": V89_100_INTERVAL,
               "last_scan": V89_STATE.get("v89_100_last_scan"),
               "baseline_top40_last_scan": V89_STATE.get("last_scan"),
+              "telegram_configured": bool(V22_TG_TOKEN and V22_TG_CHAT_ID),
+              "recent_telegram": V89_STATE.get("v89_100_telegram_log", [])[-15:],
               "variants": {}}
     for variant in ("btcneg", "chase050"):
         key = V89_100_PREFIX + variant
