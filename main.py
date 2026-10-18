@@ -27339,12 +27339,10 @@ async def big_move_v5_scan(count: int = Query(default=20,ge=1,le=40)):
                     if j is None or j<6:continue
                     b30=_bigmove_pct(btc[j-6]['close'],btc[j]['close'])
                     if b30>0:continue
-                    # Global one-active-position limit, including PENDING.
-                    cur.execute("SELECT 1 FROM big_move_v5_forward_paper WHERE status IN ('PENDING','OPEN') LIMIT 1")
-                    if cur.fetchone():continue
-                    # At most three new signals per UTC day; limit persists across restarts.
-                    cur.execute("SELECT COUNT(*) FROM big_move_v5_forward_paper WHERE created_at >= date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'")
-                    if cur.fetchone()[0]>=3:continue
+                    # Cap concurrent PENDING + OPEN paper positions at four.
+                    # No daily entry cap: eligible candidates may enter as slots free up.
+                    cur.execute("SELECT COUNT(*) FROM big_move_v5_forward_paper WHERE status IN ('PENDING','OPEN')")
+                    if cur.fetchone()[0] >= 4: continue
                     cur.execute('''INSERT INTO big_move_v5_forward_paper
                         (symbol,signal_close_ms,signal_price,btc30_pct)
                         VALUES (%s,%s,%s,%s) ON CONFLICT DO NOTHING RETURNING symbol''',
@@ -27456,5 +27454,5 @@ async def big_move_v5_auto_status():
             'auto_enabled':os.getenv('BIG_MOVE_V5_AUTO_ENABLED','1').lower() not in ('0','false','no'),
             'task_running':_bmv5_auto_task is not None and not _bmv5_auto_task.done(),
             'last_run':_bmv5_auto_last,
-            'interval_seconds':300,'max_daily_new_signals':3,
-            'max_global_pending_or_open':1,'paper_only':True,'orders':False}
+            'interval_seconds':300,'max_daily_new_signals':None,
+            'max_global_pending_or_open':4,'paper_only':True,'orders':False}
