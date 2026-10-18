@@ -27394,39 +27394,71 @@ _bmv5_auto_task = None
 _bmv5_auto_last = {'status': 'NOT_STARTED'}
 
 async def _bmv5_auto_loop():
+    """Run V5 scans with a PostgreSQL lease; release our own lease immediately.
+
+    A lease remains until expiry only after a worker crash. Multiple workers
+    can still report SKIPPED while another is scanning; this is expected.
+    """
     global _bmv5_auto_last
+    import uuid
     while True:
+        acquired = False
+        lease_token = None
+        url = os.getenv('DATABASE_URL', '').strip()
         try:
-            url=os.getenv('DATABASE_URL','').strip()
-            if url:
+            if not url:
+                _bmv5_auto_last = {'status': 'DATABASE_URL_MISSING', 'checked_utc': utc_now()}
+            else:
                 import psycopg
-                # Atomic cross-instance lease; expires if process crashes.
-                with psycopg.connect(url,connect_timeout=12) as conn:
+                lease_token = str(uuid.uuid4())
+                with psycopg.connect(url, connect_timeout=12) as conn:
                     _bmv5_db(conn)
                     with conn.cursor() as cur:
-                        cur.execute("""INSERT INTO big_move_v5_scan_lease (id,lease_until)
-                            VALUES (1, now()+interval '4 minutes')
+                        cur.execute('ALTER TABLE big_move_v5_scan_lease ADD COLUMN IF NOT EXISTS owner_token TEXT')
+                        cur.execute("""INSERT INTO big_move_v5_scan_lease (id, lease_until, owner_token)
+                            VALUES (1, now() + interval '4 minutes', %s)
                             ON CONFLICT (id) DO UPDATE
-                            SET lease_until=EXCLUDED.lease_until
+                            SET lease_until = EXCLUDED.lease_until,
+                                owner_token = EXCLUDED.owner_token
                             WHERE big_move_v5_scan_lease.lease_until < now()
-                            RETURNING id""")
-                        acquired=cur.fetchone() is not None
+                            RETURNING id""", (lease_token,))
+                        acquired = cur.fetchone() is not None
                     conn.commit()
                 if acquired:
-                    result=await big_move_v5_scan(count=20)
-                    _bmv5_auto_last={'status':result.get('status'),
-                                    'new_signals':len(result.get('new_signals',[])),
-                                    'telegram_events':result.get('telegram_events',[]),
-                                    'errors':result.get('errors',[]),
-                                    'error':result.get('error')}
+                    started = utc_now()
+                    result = await big_move_v5_scan(count=20)
+                    _bmv5_auto_last = {
+                        'status': result.get('status'),
+                        'started_utc': started,
+                        'finished_utc': utc_now(),
+                        'new_signals': len(result.get('new_signals', [])),
+                        'telegram_events': result.get('telegram_events', []),
+                        'errors': result.get('errors', []),
+                        'error': result.get('error'),
+                    }
                 else:
-                    _bmv5_auto_last={'status':'SKIPPED_LEASE_HELD'}
-            else:
-                _bmv5_auto_last={'status':'DATABASE_URL_MISSING'}
+                    # A concurrent worker may legitimately own the lease.
+                    # Preserve last successful result for diagnostics.
+                    previous = _bmv5_auto_last
+                    _bmv5_auto_last = {
+                        'status': 'SKIPPED_LEASE_HELD',
+                        'checked_utc': utc_now(),
+                        'previous_run': previous if previous.get('status') != 'SKIPPED_LEASE_HELD' else previous.get('previous_run'),
+                    }
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            _bmv5_auto_last={'status':'ERROR','error':str(exc)[:300]}
+            _bmv5_auto_last = {'status': 'ERROR', 'error': str(exc)[:300], 'checked_utc': utc_now()}
+        finally:
+            if acquired and lease_token and url:
+                try:
+                    import psycopg
+                    with psycopg.connect(url, connect_timeout=12) as conn:
+                        with conn.cursor() as cur:
+                            cur.execute('DELETE FROM big_move_v5_scan_lease WHERE id=1 AND owner_token=%s', (lease_token,))
+                        conn.commit()
+                except Exception as exc:
+                    _bmv5_auto_last['lease_release_error'] = str(exc)[:200]
         await asyncio.sleep(300)
 
 @app.on_event('startup')
@@ -27456,3 +27488,27 @@ async def big_move_v5_auto_status():
             'last_run':_bmv5_auto_last,
             'interval_seconds':300,'max_daily_new_signals':None,
             'max_global_pending_or_open':4,'paper_only':True,'orders':False}
+
+@app.get('/big-move-v5-lease-status')
+async def big_move_v5_lease_status():
+    """Read-only lease diagnostics; no tokens or secrets exposed."""
+    try:
+        url = os.getenv('DATABASE_URL', '').strip()
+        if not url:
+            return {**MODE_INFO, 'status': 'UNAVAILABLE', 'reason': 'DATABASE_URL missing'}
+        import psycopg
+        with psycopg.connect(url, connect_timeout=12) as conn:
+            _bmv5_db(conn)
+            with conn.cursor() as cur:
+                cur.execute("""SELECT lease_until, lease_until > now(),
+                                      EXTRACT(EPOCH FROM (lease_until - now()))
+                               FROM big_move_v5_scan_lease WHERE id=1""")
+                row = cur.fetchone()
+        return {**MODE_INFO, 'status': 'OK', 'strategy': 'BIG_MOVE_V5_FORWARD',
+                'lease_present': row is not None,
+                'lease_active': bool(row[1]) if row else False,
+                'lease_until_utc': row[0].isoformat() if row else None,
+                'seconds_until_expiry': round(float(row[2]), 1) if row else None,
+                'paper_only': True}
+    except Exception as exc:
+        return {**MODE_INFO, 'status': 'ERROR', 'error': str(exc)[:300]}
