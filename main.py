@@ -27082,3 +27082,97 @@ async def big_move_research_v3(count: int = Query(default=20,ge=1,le=40),
                     'cost_pct':ROUND_TRIP_COST_PCT,'limitations':'current-volume universe survivorship bias; overlapping events; no spread/slippage; holdout not independent after V1/V2 exploration; research only'}}
     except Exception as exc:
         return {**MODE_INFO,'status':'ERROR','paper_only':True,'read_only':True,'strategy':'BIG_MOVE_RESEARCH_V3','error':str(exc)}
+
+
+# ============================================================
+# BIG-MOVE-RESEARCH V4 -- aligned BTC regime, manual read-only.
+# ============================================================
+@app.get('/big-move-research-v4')
+async def big_move_research_v4(count: int = Query(default=20,ge=1,le=40),
+                               candles: int = Query(default=900,ge=150,le=1000),
+                               cooldown_bars: int = Query(default=12,ge=1,le=48)):
+    """Compare BTC trend and alt relative strength on the same early-entry events."""
+    try:
+        async with httpx.AsyncClient(timeout=35.0) as client:
+            universe=(await build_universe(client))[:count]
+            sem=asyncio.Semaphore(5)
+            async def fetch(symbol):
+                async with sem:
+                    try:
+                        return symbol,await get_completed_5m_candles(client,symbol,candles),None
+                    except Exception as exc:
+                        return symbol,[],str(exc)[:160]
+            symbols=list(dict.fromkeys(['BTCUSDT']+[x['symbol'] for x in universe]))
+            fetched=await asyncio.gather(*(fetch(x) for x in symbols))
+        data={symbol:cs for symbol,cs,error in fetched if not error}
+        errors=[{'symbol':symbol,'error':error} for symbol,cs,error in fetched if error]
+        btc=data.get('BTCUSDT',[])
+        if len(btc)<80:
+            return {**MODE_INFO,'status':'ERROR','strategy':'BIG_MOVE_RESEARCH_V4',
+                    'error':'BTCUSDT aligned 5m candle data unavailable','errors':errors}
+        btc_by_time={c['close_time']:j for j,c in enumerate(btc)}
+        rows=[]; unmatched=0
+        for symbol,cs in data.items():
+            if symbol=='BTCUSDT':continue
+            i=20
+            while i+48<len(cs):
+                f=_bmv3_features(cs,i)
+                if not f or not (.15<=f['m5']<=2 and f['m15']>=.25 and .25<=f['m30']<=4 and f['vr']>=1.1):
+                    i+=1;continue
+                j=btc_by_time.get(cs[i]['close_time'])
+                if j is None or j<12:
+                    unmatched+=1;i+=cooldown_bars;continue
+                b30=_bigmove_pct(btc[j-6]['close'],btc[j]['close'])
+                b60=_bigmove_pct(btc[j-12]['close'],btc[j]['close'])
+                relative=f['m30']-b30
+                # Predefined descriptive cohorts, NOT tuned to outcome.
+                tags={'all':True,
+                      'btc30_positive':b30>0,
+                      'btc30_nonpositive':b30<=0,
+                      'btc60_positive':b60>0,
+                      'btc60_nonpositive':b60<=0,
+                      'relative30_positive':relative>0,
+                      'relative30_gt_0_5':relative>0.5,
+                      'btc_positive_and_relative':b30>0 and relative>0,
+                      'btc_nonpositive_and_relative':b30<=0 and relative>0}
+                sims={str(minutes):_bmv3_simulate(cs,i,minutes//5) for minutes in (30,60,120,240)}
+                forward=cs[i+1:i+49]
+                mfe=max((_bigmove_pct(cs[i]['close'],x['high']) for x in forward),default=0)
+                rows.append({'symbol':symbol,'timestamp':cs[i]['close_time'],
+                             'btc30_pct':b30,'btc60_pct':b60,'relative30_pct':relative,
+                             'tags':tags,'mfe':mfe,'sims':sims})
+                i+=cooldown_bars
+        rows.sort(key=lambda r:r['timestamp'])
+        cutoff=rows[int(len(rows)*.7)]['timestamp'] if len(rows)>1 else (rows[0]['timestamp'] if rows else 0)
+        def summarize(part):
+            out={}
+            for cohort in ('all','btc30_positive','btc30_nonpositive','btc60_positive',
+                           'btc60_nonpositive','relative30_positive','relative30_gt_0_5',
+                           'btc_positive_and_relative','btc_nonpositive_and_relative'):
+                subset=[r for r in part if r['tags'][cohort]]
+                out[cohort]={'n_events':len(subset),'hit_10pct':sum(r['mfe']>=10 for r in subset),
+                             'hit_15pct':sum(r['mfe']>=15 for r in subset),
+                             'hold_scenarios':{str(m):_bigmove_stats([r['sims'][str(m)] for r in subset])
+                                               for m in (30,60,120,240)}}
+            return out
+        train=[r for r in rows if r['timestamp']<cutoff]
+        holdout=[r for r in rows if r['timestamp']>=cutoff]
+        return {**MODE_INFO,'status':'OK','paper_only':True,'read_only':True,
+                'strategy':'BIG_MOVE_RESEARCH_V4','generated_utc':utc_now(),
+                'symbols_analyzed':len(data)-int('BTCUSDT' in data),
+                'errors':errors,'unmatched_btc_events':unmatched,
+                'events_total':len(rows),'events_train':len(train),'events_holdout':len(holdout),
+                'train':summarize(train),'holdout':summarize(holdout),
+                'methodology':{'timeframe':'aligned completed 5m candles by close_time',
+                    'entry':'same V3 early gate; no lookahead BTC context',
+                    'btc30':'BTC close-to-close return over 30m ending at entry candle',
+                    'btc60':'BTC close-to-close return over 60m ending at entry candle',
+                    'relative30':'alt 30m percent return minus BTC 30m percent return',
+                    'comparison':'same underlying entry events and 30/60/120/240m exits within cohorts',
+                    'split':'global chronological 70/30; descriptive, not independent validation',
+                    'stop':'3% fixed, optimistic stop fills; OHLC ambiguity',
+                    'cost_pct':ROUND_TRIP_COST_PCT,
+                    'limitations':'current-volume universe survivorship bias; overlapping trades; no spread/slippage; BTC regimes and cohorts explored in-sample; no real orders'}}
+    except Exception as exc:
+        return {**MODE_INFO,'status':'ERROR','paper_only':True,'read_only':True,
+                'strategy':'BIG_MOVE_RESEARCH_V4','error':str(exc)}
