@@ -19211,9 +19211,9 @@ async def v89_scan_once():
                   V89_STATE.setdefault(variant4+"_open",[]).append(clone4)
                 # Parallel regime-gated clones of the SAME V89.4 entry.
                 # R1: ALT30 <= +0.20%; R2: ALT30 <= +0.20% and BTC30 <= 0%.
-                for variant, tag, permitted in (
-                    ("v894_r1", "V894-R1", alt30<=0.20),
-                    ("v894_r2", "V894-R2", alt30<=0.20 and b30<=0.0)):
+                # R1/R2 FROZEN: preserve historical paper records and allow existing
+                # open positions to exit normally, but create NO NEW R1/R2 entries.
+                for variant, tag, permitted in ():
                   if not permitted or len(V89_STATE.get(variant+"_open",[]))>=5:
                     continue
                   if any(pr["symbol"]==pb["symbol"] for pr in V89_STATE.get(variant+"_open",[])):
@@ -26455,7 +26455,7 @@ async def v894_regime_status():
       "baseline":{"open":len(V89_STATE.get("v894_open",[])),"performance":v89_perf(V89_STATE.get("v894_closed",[]))},
       "R1":{"open":V89_STATE.get("v894_r1_open",[]),"closed_count":len(V89_STATE.get("v894_r1_closed",[])),"performance":v89_perf(V89_STATE.get("v894_r1_closed",[])),"recent_closed":V89_STATE.get("v894_r1_closed",[])[-20:]},
       "R2":{"open":V89_STATE.get("v894_r2_open",[]),"closed_count":len(V89_STATE.get("v894_r2_closed",[])),"performance":v89_perf(V89_STATE.get("v894_r2_closed",[])),"recent_closed":V89_STATE.get("v894_r2_closed",[])[-20:]},
-      "retired":{"V89_5":"NO_NEW_ENTRIES","V89_6":"NO_NEW_ENTRIES"},
+      "retired":{"V89_5":"NO_NEW_ENTRIES","V89_6":"NO_NEW_ENTRIES","R1":"NO_NEW_ENTRIES","R2":"NO_NEW_ENTRIES"},
       "generated_utc":utc_now()}
 
 @app.get("/v89-new-shadow-status")
