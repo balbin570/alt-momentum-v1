@@ -6261,7 +6261,7 @@ async def alt_safe_send(msg, kind, symbol):
     item = {"utc": utc_now(), **result}
     ALT_TG_DELIVERY["recent"].append(item)
     del ALT_TG_DELIVERY["recent"][:-60]
-    print(f"ALT_TG_DELIVERY kind={kind} symbol={symbol} sent={result.get('sent')} reason={result.get('reason', '-')} error={result.get('error', '-')}", flush=True)
+    print(f"ALT_TG_DELIVERY kind={kind} symbol={symbol} sent={result.get('sent')} message_id={result.get('message_id', '-')} chat_type={result.get('chat_type', '-')} reason={result.get('reason', '-')} error={result.get('error', '-')}", flush=True)
     return result
 
 
@@ -6895,7 +6895,14 @@ async def v22_telegram_send(message: str):
             },
         )
         r.raise_for_status()
-    return {"sent": True}
+        # Telegram HTTP 200 alone is insufficient: verify API acknowledgment.
+        payload = r.json()
+        if payload.get("ok") is not True:
+            return {"sent": False, "reason": "telegram_api_not_ok",
+                    "description": str(payload.get("description", ""))[:180]}
+        delivered = payload.get("result") or {}
+        return {"sent": True, "message_id": delivered.get("message_id"),
+                "chat_type": (delivered.get("chat") or {}).get("type")}
 
 
 async def v22_run_notify_and_persist():
