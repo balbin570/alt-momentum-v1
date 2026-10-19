@@ -19979,11 +19979,9 @@ async def v323b_db_loop():
             V323B_DB_HEALTH["last_error"] = f"{type(exc).__name__}: {str(exc)[:180]}"
         await asyncio.sleep(15)
 
-# DISABLED_BACKGROUND_STARTUP_MEMORY_FIX: v323b_db_startup
-# @app.on_event("startup")
+# V32.3B persistence startup restored; strategy logic unchanged.
+@app.on_event("startup")
 async def v323b_db_startup():
-    # ROLLBACK: disable V32.3-B background worker without changing legacy strategies.
-    return
     global V323B_DB_TASK
     try:
         await asyncio.to_thread(v323b_db_initialize_and_restore)
@@ -20111,11 +20109,9 @@ async def v323b_trade_db_loop():
             V323B_TRADE_DB_HEALTH["last_error"] = f"{type(exc).__name__}: {str(exc)[:180]}"
         await asyncio.sleep(90)
 
-# DISABLED_BACKGROUND_STARTUP_MEMORY_FIX: v323b_trade_db_startup
-# @app.on_event("startup")
+# V32.3B persistence startup restored; strategy logic unchanged.
+@app.on_event("startup")
 async def v323b_trade_db_startup():
-    # ROLLBACK: disable V32.3-B background worker without changing legacy strategies.
-    return
     global V323B_TRADE_DB_TASK
     try:
         await asyncio.to_thread(v323b_trade_db_init)
