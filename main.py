@@ -20076,6 +20076,68 @@ def v323b_trade_db_save(trades):
                         (WHERE trade_status = 'CLOSED_SHADOW') FROM alt_v323b_paper_trades""")
             return cur.fetchone()
 
+# V32.3B-only recovery: revisit persisted OPEN_SHADOW snapshots that aged
+# beyond the original three-hour candidate window. No strategy/order changes.
+def v323b_trade_db_stale_open():
+    with v323b_db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT payload FROM alt_v323b_paper_trades
+                WHERE trade_status = 'OPEN_SHADOW' ORDER BY signal_utc ASC LIMIT 25""")
+            return [r[0] for r in cur.fetchall()]
+
+async def v323b_trade_db_reconcile_open():
+    rows = await asyncio.to_thread(v323b_trade_db_stale_open)
+    if not rows:
+        return 0
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    updated = []
+    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
+        for row in rows:
+            try:
+                entry_ms = int(datetime.fromisoformat(row["entry_utc"]).timestamp() * 1000)
+                if now_ms < entry_ms + 120 * 60000:
+                    continue
+                raw = await get_json(client, "/api/v3/klines", params={
+                    "symbol": row["symbol"], "interval": "1m",
+                    "startTime": entry_ms, "endTime": entry_ms + 120 * 60000,
+                    "limit": 121})
+                candles = sorted((k for k in raw if int(k[6]) < now_ms), key=lambda k: int(k[0]))
+                # Never invent an exit if exchange history is incomplete.
+                if len(candles) < 120 or any(int(k[0]) != entry_ms + i * 60000
+                                               for i, k in enumerate(candles[:120])):
+                    continue
+                price = float(row["entry_price"])
+                stop = float(row["stop_price"])
+                if price <= 0:
+                    continue
+                exit_price = None
+                exit_reason = None
+                exit_ms = None
+                for i, k in enumerate(candles[:120]):
+                    if float(k[3]) <= stop:
+                        exit_price = stop
+                        exit_reason = "STOP3_CANDLE_LOW_PROXY"
+                        exit_ms = int(k[6])
+                        break
+                if exit_price is None:
+                    exit_price = float(candles[119][4])
+                    exit_reason = "TIME120"
+                    exit_ms = int(candles[119][6])
+                gross = (exit_price / price - 1) * 100
+                new_row = dict(row)
+                new_row.update(status="CLOSED_SHADOW", exit_reason=exit_reason,
+                               exit_price=exit_price,
+                               exit_utc=datetime.fromtimestamp(exit_ms / 1000, tz=timezone.utc).isoformat(),
+                               gross_pct=round(gross, 4),
+                               net_pct=round(gross - ROUND_TRIP_COST_PCT, 4))
+                updated.append(new_row)
+            except Exception as exc:
+                print(f"V323B_STALE_OPEN_RECHECK key={row.get('key')} error={type(exc).__name__}: {str(exc)[:120]}")
+    if updated:
+        await asyncio.to_thread(v323b_trade_db_save, updated)
+        print(f"V323B_STALE_OPEN_RECONCILED count={len(updated)}")
+    return len(updated)
+
 async def v323b_trade_db_cycle():
     # Avoid revaluing closed trades. Limit data requests to new/recent candidates.
     existing = await asyncio.to_thread(v323b_trade_db_existing)
@@ -20102,6 +20164,10 @@ async def v323b_trade_db_cycle():
         trades = [t for t in report.get("trades", []) if str(t.get("key")) in keys]
         counts = await asyncio.to_thread(v323b_trade_db_save, trades)
     else:
+        counts = await asyncio.to_thread(v323b_trade_db_save, [])
+    # Reconcile historical open snapshots even when no new V32.3B candidate arrives.
+    reconciled = await v323b_trade_db_reconcile_open()
+    if reconciled:
         counts = await asyncio.to_thread(v323b_trade_db_save, [])
     V323B_TRADE_DB_HEALTH.update(ready=True, stored=counts[0], closed=counts[1],
                                 last_sync_utc=utc_now(), last_error=None)
