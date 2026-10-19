@@ -27568,7 +27568,7 @@ async def _bmv5_auto_loop():
 @app.on_event('startup')
 async def _bmv5_auto_startup():
     global _bmv5_auto_task
-    if os.getenv('BIG_MOVE_V5_AUTO_ENABLED','1').lower() in ('0','false','no'):
+    if os.getenv('BIG_MOVE_V5_AUTO_ENABLED','0').lower() in ('0','false','no'):
         return
     if _bmv5_auto_task is None or _bmv5_auto_task.done():
         _bmv5_auto_task=asyncio.create_task(_bmv5_auto_loop())
@@ -27587,7 +27587,7 @@ async def _bmv5_auto_shutdown():
 @app.get('/big-move-v5-auto-status')
 async def big_move_v5_auto_status():
     return {**MODE_INFO,'strategy':'BIG_MOVE_V5_FORWARD',
-            'auto_enabled':os.getenv('BIG_MOVE_V5_AUTO_ENABLED','1').lower() not in ('0','false','no'),
+            'auto_enabled':os.getenv('BIG_MOVE_V5_AUTO_ENABLED','0').lower() not in ('0','false','no'),
             'task_running':_bmv5_auto_task is not None and not _bmv5_auto_task.done(),
             'last_run':_bmv5_auto_last,
             'interval_seconds':300,'max_daily_new_signals':None,
