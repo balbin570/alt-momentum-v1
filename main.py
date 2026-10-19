@@ -27652,3 +27652,77 @@ async def v894_pnl24h():
         'closed_trades_24h': sorted(closed, key=lambda t: str(t.get('exit_utc', ''))),
         'note': 'Sum of per-trade percentage returns is not portfolio P&L or USD profit. Open positions are unmarked; unrealized P&L is not calculated. Closed trades are filtered by exit UTC. Data coverage depends on retained V89 state.'
     }
+
+
+# V89.4 seven-day day/night diagnostic (read-only; no worker or trading changes).
+@app.get('/v894-day-night-7d')
+async def v894_day_night_7d():
+    from collections import Counter
+    from zoneinfo import ZoneInfo
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(days=7)
+    tz = ZoneInfo('Europe/Istanbul')
+    groups = {'night_22_08': [], 'day_08_22': []}
+    by_day = {}
+    all_closed = V89_STATE.get('v894_closed', [])
+    invalid = 0
+    for trade in all_closed:
+        if not isinstance(trade, dict):
+            invalid += 1
+            continue
+        try:
+            entry = datetime.fromisoformat(str(trade['entry_utc']).replace('Z', '+00:00'))
+            if entry.tzinfo is None:
+                raise ValueError('naive datetime')
+            entry = entry.astimezone(timezone.utc)
+            net = float(trade['net_pct'])
+            if not math.isfinite(net):
+                raise ValueError('nonfinite net')
+        except (KeyError, TypeError, ValueError, OverflowError):
+            invalid += 1
+            continue
+        if not start <= entry <= now:
+            continue
+        local = entry.astimezone(tz)
+        group = 'night_22_08' if local.hour >= 22 or local.hour < 8 else 'day_08_22'
+        groups[group].append(trade)
+        by_day.setdefault(local.date().isoformat(), {'night_22_08': [], 'day_08_22': []})[group].append(trade)
+
+    def summarize(items):
+        vals = [float(t['net_pct']) for t in items]
+        wins = [v for v in vals if v > 0]
+        losses = [v for v in vals if v < 0]
+        def average_field(field):
+            nums = []
+            for t in items:
+                try:
+                    v = float(t[field])
+                    if math.isfinite(v):
+                        nums.append(v)
+                except (KeyError, ValueError, TypeError):
+                    pass
+            return round(sum(nums)/len(nums), 5) if nums else None
+        return {
+            'n': len(vals), 'wins': len(wins), 'losses': len(losses),
+            'win_rate_pct': round(100*len(wins)/len(vals), 2) if vals else None,
+            'mean_net_pct': round(sum(vals)/len(vals), 5) if vals else None,
+            'sum_trade_net_pct': round(sum(vals), 5),
+            'profit_factor': round(sum(wins)/abs(sum(losses)), 4) if losses else None,
+            'exit_reasons': dict(Counter(str(t.get('exit_reason','UNKNOWN')) for t in items)),
+            'mean_btc30_pct': average_field('btc30_pct'),
+            'mean_alt30_pct': average_field('alt30_pct'),
+            'mean_volume_ratio': average_field('volume_ratio'),
+            'mean_spread_pct': average_field('spread_pct'),
+        }
+    return {
+        **MODE_INFO, 'status': 'OK', 'strategy': 'V89.4', 'read_only': True,
+        'timezone': 'Europe/Istanbul', 'grouping': 'entry_utc',
+        'window_start_utc': start.isoformat(), 'window_end_utc': now.isoformat(),
+        'retained_closed_count_all_dates': len(all_closed),
+        'valid_closed_in_7d': sum(map(len, groups.values())),
+        'invalid_records': invalid,
+        'night_22_08': summarize(groups['night_22_08']),
+        'day_08_22': summarize(groups['day_08_22']),
+        'by_local_entry_date': {day: {g: summarize(items) for g, items in vals.items()} for day, vals in sorted(by_day.items())},
+        'limitations': 'Uses retained in-memory V89.4 closed trades (last 1000); not a guaranteed complete seven-day archive. Entry-time grouping, not exit-time. Sums of trade returns are not portfolio returns. No real fills.'
+    }
