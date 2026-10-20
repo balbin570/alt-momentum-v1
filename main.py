@@ -1,5 +1,9 @@
 """V90.2 standalone paper research scanner. No order endpoints or API keys."""
 import asyncio
+import json
+import gc
+import resource
+from pathlib import Path
 import os
 import statistics
 import time
@@ -202,10 +206,44 @@ V90_STATE = {"started_utc": None, "last_scan": None, "last_error": None,
              "frozen_legacy": ["V32", "V32.2", "V32.3-B", "V89.4", "V89-100", "BIG_MOVE_V5"]}
 V90_TASK = None
 V90_LOCK = None
-V90_MAX_TRADES = 3000
+V90_MAX_TRADES = 600
 V90_SCAN_SECONDS = 300
 V90_COST_PCT = 0.15
-V90_DELAY_SECONDS = 300  # V90.2: match five-minute scan cadence
+V90_DELAY_SECONDS = 300
+V90_STATE_PATH = Path(os.getenv("V90_STATE_PATH", "/tmp/v90_state.json"))
+
+
+def v903_memory_mb():
+    # Linux ru_maxrss is the peak resident set size in KiB.
+    return round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024, 1)
+
+
+def v903_save_state():
+    """Best-effort local checkpoint; Render ephemeral disk is NOT durable storage."""
+    try:
+        payload = {k: V90_STATE[k] for k in ("trades", "seen", "signals", "telegram")}
+        temp = V90_STATE_PATH.with_suffix(".tmp")
+        temp.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+        temp.replace(V90_STATE_PATH)
+    except Exception as exc:
+        V90_STATE["last_error"] = "checkpoint: " + str(exc)[:150]
+
+
+def v903_load_state():
+    try:
+        if V90_STATE_PATH.is_file():
+            saved = json.loads(V90_STATE_PATH.read_text(encoding="utf-8"))
+            for k in ("trades", "seen", "signals"):
+                if k in saved:
+                    V90_STATE[k] = saved[k]
+            # Preserve current env-based Telegram configured state.
+            tg = saved.get("telegram", {})
+            for k in ("sent", "failed", "last"):
+                if k in tg:
+                    V90_STATE["telegram"][k] = tg[k]
+    except Exception as exc:
+        V90_STATE["last_error"] = "restore: " + str(exc)[:150]
+
 
 
 async def v902_notify(message, event, symbol):
@@ -221,7 +259,7 @@ async def v902_notify(message, event, symbol):
     state["sent" if ok else "failed"] += 1
     state["last"] = {"utc": utc_now(), "event": event, "symbol": symbol,
                      "sent": ok, "reason": reason}
-    print(f"V902_TELEGRAM event={event} symbol={symbol} sent={ok} reason={reason}", flush=True)
+    print(f"V903_TELEGRAM event={event} symbol={symbol} sent={ok} reason={reason}", flush=True)
     return state["last"]
 
 
@@ -280,11 +318,13 @@ async def v90_monitor(client):
     closed_now = [t for t in active if t["status"] == "CLOSED_SHADOW" and not t.get("telegram_exit_attempted")]
     for t in closed_now:
         t["telegram_exit_attempted"] = True
-        msg = (f"ALT V90.2 PAPER CIKIS\n{t['symbol']} | Model {t['variant']}\n"
+        msg = (f"ALT V90.3 PAPER CIKIS\n{t['symbol']} | Model {t['variant']}\n"
                f"Net: {t['net_pct']:+.3f}% | Neden: {t['exit_reason']}\n"
                f"Giris: {t['entry_price']:.10g} | Cikis: {t['exit_price']:.10g}\n"
                "PAPER ONLY | GERCEK EMIR YOK")
         await v902_notify(msg, "EXIT_" + t["variant"], t["symbol"])
+    if closed_now:
+        v903_save_state()
     return len(active)
 
 
@@ -296,11 +336,11 @@ async def v90_scan_once():
         V90_STATE["scans"] += 1
         scan = {"utc":utc_now(),"checked":0,"candidates":0,"new_coins":0,"errors":0, "filter_counts":{}, "near_misses":[]}
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
+            async with httpx.AsyncClient(timeout=30.0, limits=httpx.Limits(max_connections=4, max_keepalive_connections=2)) as client:
                 await v90_monitor(client)
                 universe = (await build_universe(client))[:100]
                 # Only one network scan, three paper valuation models.
-                semaphore = asyncio.Semaphore(8)
+                semaphore = asyncio.Semaphore(3)
                 from collections import Counter
                 rejected = Counter()
                 near_misses = []
@@ -352,7 +392,12 @@ async def v90_scan_once():
                             scan["errors"]+=1
                             rejected["candle_or_calculation_error"] += 1
                             return None
-                candidates = [r for r in await asyncio.gather(*(check(i) for i in universe)) if r]
+                # Small batches avoid retaining 100 tasks/responses simultaneously.
+                candidates = []
+                for offset in range(0, len(universe), 5):
+                    batch = await asyncio.gather(*(check(i) for i in universe[offset:offset+5]))
+                    candidates.extend(r for r in batch if r)
+                    del batch
                 scan["checked"] = len(universe)
                 scan["candidates"] = len(candidates)
                 scan["filter_counts"] = dict(rejected)
@@ -389,12 +434,13 @@ async def v90_scan_once():
                         active_syms.add(sym)
                         scan["new_coins"]+=1
                         V90_STATE["signals"]+=1
-                        msg = (f"ALT V90.2 PAPER GIRIS\n{sym} | A/B/C (tek sinyal)\n"
+                        msg = (f"ALT V90.3 PAPER GIRIS\n{sym} | A/B/C (tek sinyal)\n"
                                f"Giris: {ask:.10g} | Stop: {ask*0.97:.10g}\n"
                                f"Momentum60: {c['ret60_pct']:+.2f}% | Hacim: {c['volume_ratio']:.2f}x\n"
                                f"Breakout: {c['breakout_pct']:+.3f}% | Spread: {spread:.3f}%\n"
                                "PAPER ONLY | GERCEK EMIR YOK")
                         await v902_notify(msg, "ENTRY", sym)
+                        v903_save_state()
                     except Exception:
                         scan["errors"]+=1
                 # Keep completed results for review, bounded RAM.
@@ -405,6 +451,8 @@ async def v90_scan_once():
                 cutoff=int(time.time()*1000)-7*86400000
                 V90_STATE["seen"]={k:v for k,v in V90_STATE["seen"].items() if v>cutoff}
             V90_STATE["last_scan"]=scan
+            v903_save_state()
+            gc.collect()
             return scan
         except Exception as exc:
             V90_STATE["last_error"]=str(exc)[:300]
@@ -425,20 +473,22 @@ async def v90_loop():
 async def v90_startup():
     global V90_TASK
     V90_STATE["started_utc"]=utc_now()
+    v903_load_state()
     if V90_TASK is None or V90_TASK.done():V90_TASK=asyncio.create_task(v90_loop())
 
 
 @app.get("/v90-status")
 async def v90_status():
-    return {**MODE_INFO,"status":"OK","strategy":"V90_HYBRID_MOMENTUM", "diagnostic_version":"V90_2_TELEGRAM_DELAY300",
+    return {**MODE_INFO,"status":"OK","strategy":"V90_HYBRID_MOMENTUM", "diagnostic_version":"V90_3_MEMORY_CHECKPOINT",
             "paper_only":True,"orders":False,"auto_running":bool(V90_TASK and not V90_TASK.done()),
             "scan_interval_seconds":V90_SCAN_SECONDS,"last_scan":V90_STATE["last_scan"],
             "last_error":V90_STATE["last_error"],"total_signals":V90_STATE["signals"],
             "signal_delay_limit_seconds":V90_DELAY_SECONDS,"telegram":V90_STATE["telegram"],
+            "memory_peak_mb":v903_memory_mb(), "checkpoint_path":str(V90_STATE_PATH),
             "frozen_legacy":V90_STATE["frozen_legacy"],
             "variants":{v:v90_stats([t for t in V90_STATE["trades"] if t["variant"]==v]) for v in ("A","B","C")},
             "recent_trades":V90_STATE["trades"][-24:],
-            "limitations":["RAM-only state resets on restart", "5-minute scan can miss signals", 
+            "limitations":["Local checkpoint on ephemeral filesystem; may disappear on Render restart/deploy", "5-minute scan can miss signals", 
                            "Stop/TP monitored by quotes every 5 minutes; gaps and slippage possible",
                            "No real fills, no real orders", "Experimental thresholds not validated"]}
 
@@ -446,7 +496,7 @@ async def v90_status():
 @app.get("/v90-filter-analysis")
 async def v90_filter_analysis():
     last = V90_STATE.get("last_scan") or {}
-    return {**MODE_INFO, "status":"OK", "strategy":"V90_2_FILTER_ANALYSIS",
+    return {**MODE_INFO, "status":"OK", "strategy":"V90_3_FILTER_ANALYSIS",
             "auto_running":bool(V90_TASK and not V90_TASK.done()),
             "scan_interval_seconds":V90_SCAN_SECONDS, "signal_delay_limit_seconds":V90_DELAY_SECONDS,
             "last_scan_utc":last.get("utc"), "checked":last.get("checked"),
@@ -465,5 +515,5 @@ async def v902_telegram_test():
     if V902_TEST_LAST_MONO and now - V902_TEST_LAST_MONO < 60:
         return {**MODE_INFO, "status": "RATE_LIMITED", "reason": "one_test_per_60_seconds"}
     V902_TEST_LAST_MONO = now
-    delivery = await v902_notify("ALT V90.2 TELEGRAM TEST\nBildirim testi. Islem acilmadi.\nPAPER ONLY | GERCEK EMIR YOK", "TEST", "-")
+    delivery = await v902_notify("ALT V90.3 TELEGRAM TEST\nBildirim testi. Islem acilmadi.\nPAPER ONLY | GERCEK EMIR YOK", "TEST", "-")
     return {**MODE_INFO, "status": "OK" if delivery["sent"] else "NOT_SENT", "telegram": delivery}
