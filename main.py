@@ -422,19 +422,19 @@ async def v90_scan_once():
                             elif not 0.2 <= breakout <= 1.5: reason = "breakout_range"
                         elif model == "V91_PULLBACK":
                             # Unlike C, can test a modest recovery after a pullback.
-                            if not 0.5 <= ret <= 8.0: reason = "trend_range"
-                            elif not 0.7 <= vol < 3.5: reason = "volume_range"
+                            if not 0.2 <= ret <= 6.0: reason = "trend_range"
+                            elif not 0.6 <= vol < 3.0: reason = "volume_range"
                             elif not c["pullback_reclaim"]: reason = "no_reclaim"
                             elif z >= 3.5: reason = "z_extreme"
                         elif model == "V91_MOMENTUM":
-                            if not 1.5 <= ret <= 6.0: reason = "momentum_range"
-                            elif not 1.0 <= vol < 3.5: reason = "volume_range"
+                            if not 0.8 <= ret <= 5.0: reason = "momentum_range"
+                            elif not 0.9 <= vol < 3.0: reason = "volume_range"
                             elif z > 2.8: reason = "z_extreme"
                             elif not 0.1 <= breakout <= 1.0: reason = "breakout_range"
                         elif model == "V91_REGIME":
-                            if btc_ret60 is None or btc_ret60 <= 0 or breadth is None or breadth < 0.55:
+                            if btc_ret60 is None or btc_ret60 < -0.10 or breadth is None or breadth < 0.25:
                                 reason = "market_regime"
-                            elif not 1.0 <= ret <= 6.0: reason = "momentum_range"
+                            elif not 0.5 <= ret <= 5.0: reason = "momentum_range"
                             elif not 1.0 <= vol < 3.5: reason = "volume_range"
                             elif z >= 3.5: reason = "z_extreme"
                             elif not 0.1 <= breakout <= 1.5: reason = "breakout_range"
@@ -453,11 +453,14 @@ async def v90_scan_once():
                     try:
                         q=await get_json(client,"/api/v3/ticker/bookTicker",{"symbol":sym})
                         ask=float(q["askPrice"]);bid=float(q["bidPrice"])
-                        if ask<=0 or bid<=0:continue
+                        if ask<=0 or bid<=0:
+                            for model in selected: model_rejected[model]["invalid_quote"] += 1
+                            continue
                         spread=(ask-bid)/ask*100
                         chase=pct_change(c["breakout_price"],ask)
                         if spread>0.15 or chase>0.5:
-                            for model in selected: model_rejected[model]["spread_or_chase"] += 1
+                            for model in selected:
+                                model_rejected[model]["spread_too_wide" if spread>0.15 else "price_chase"] += 1
                             continue
                         if spread > 0.12 and "C" in selected:
                             selected.remove("C")
@@ -473,7 +476,6 @@ async def v90_scan_once():
                             active_by_model[variant].add(sym)
                         for variant in selected:
                             V90_STATE["seen"][f"{variant}:{key}"]=entry_ms
-                        new_signal_keys.add(key)
                         scan["new_coins"]+=1
                         V90_STATE["signals"]+=1
                         msg = (f"ALT V91 PAPER GIRIS\n{sym} | {', '.join(selected)}\n"
@@ -484,10 +486,12 @@ async def v90_scan_once():
                         v903_save_state()
                     except Exception as exc:
                         scan["errors"]+=1
+                        for model in selected: model_rejected[model]["entry_exception"] += 1
                         V90_STATE["last_error"] = "entry: " + str(exc)[:180]
                 scan["model_filters"] = {m:{"evaluated":len(candidates), "passed_entry_filters":model_passed[m],
                     "rejected":dict(model_rejected[m]),
-                    "new_positions":sum(t["variant"]==m and t["entry_ms"] >= scan_started_ms for t in V90_STATE["trades"])}
+                    "new_positions":sum(t["variant"]==m and t["entry_ms"] >= scan_started_ms for t in V90_STATE["trades"]),
+                    "post_filter_rejections":sum(n for reason,n in model_rejected[m].items() if reason in ("spread_too_wide", "price_chase", "invalid_quote", "c_spread", "entry_exception", "already_seen_or_open", "max_open_positions"))}
                     for m in V91_MODELS}
                 # Keep completed results for review, bounded RAM.
                 if len(V90_STATE["trades"])>V90_MAX_TRADES:
@@ -526,7 +530,7 @@ async def v90_startup():
 
 @app.get("/v90-status")
 async def v90_status():
-    return {**MODE_INFO,"status":"OK","strategy":"V90_HYBRID_MOMENTUM", "diagnostic_version":"V91_1_INDEPENDENT_FILTERS",
+    return {**MODE_INFO,"status":"OK","strategy":"V90_HYBRID_MOMENTUM", "diagnostic_version":"V91_2_RESEARCH_DIAGNOSTICS",
             "paper_only":True,"orders":False,"auto_running":bool(V90_TASK and not V90_TASK.done()),
             "scan_interval_seconds":V90_SCAN_SECONDS,"last_scan":V90_STATE["last_scan"],
             "last_error":V90_STATE["last_error"],"total_signals":V90_STATE["signals"],
