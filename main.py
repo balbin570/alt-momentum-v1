@@ -206,7 +206,9 @@ V90_STATE = {"started_utc": None, "last_scan": None, "last_error": None,
              "frozen_legacy": ["V32", "V32.2", "V32.3-B", "V89.4", "V89-100", "BIG_MOVE_V5"]}
 V90_TASK = None
 V90_LOCK = None
-V90_MAX_TRADES = 600
+V90_MAX_TRADES = 1200
+V91_MODELS = ("C", "V91_PULLBACK", "V91_MOMENTUM", "V91_REGIME")
+V91_FROZEN = ("A", "B")
 V90_SCAN_SECONDS = 300
 V90_COST_PCT = 0.15
 V90_DELAY_SECONDS = 300
@@ -304,7 +306,7 @@ async def v90_monitor(client):
             t["last_bid"] = bid
             if t["variant"] == "B" and t["max_bid"] >= t["entry_price"] * 1.02:
                 t["stop_price"] = max(t["stop_price"], t["entry_price"])
-            if t["variant"] == "C" and not t.get("tp1_done") and bid >= t["entry_price"]*1.03:
+            if t["variant"] in ("C", "V91_PULLBACK", "V91_MOMENTUM", "V91_REGIME") and not t.get("tp1_done") and bid >= t["entry_price"]*1.03:
                 t["tp1_done"] = True
                 t["tp1_price"] = bid
                 t["tp1_utc"] = utc_now()
@@ -312,7 +314,7 @@ async def v90_monitor(client):
                 v90_close(t, bid, "STOP_MONITORED", now_ms)
             elif now_ms >= t["entry_ms"] + 120*60000:
                 v90_close(t, bid, "TIME120", now_ms)
-            if t["status"] == "CLOSED_SHADOW" and t["variant"] == "C" and t.get("tp1_done"):
+            if t["status"] == "CLOSED_SHADOW" and t["variant"] in ("C", "V91_PULLBACK", "V91_MOMENTUM", "V91_REGIME") and t.get("tp1_done"):
                 t["net_pct"] = round(((((t["tp1_price"]/t["entry_price"])-1)*100)*0.5 +
                                       (((t["exit_price"]/t["entry_price"])-1)*100)*0.5 - V90_COST_PCT),5)
     closed_now = [t for t in active if t["status"] == "CLOSED_SHADOW" and not t.get("telegram_exit_attempted")]
@@ -344,6 +346,11 @@ async def v90_scan_once():
                 from collections import Counter
                 rejected = Counter()
                 near_misses = []
+                market_returns = []
+                # BTC is fetched once per scan for the regime research arm.
+                btc_candles = await get_completed_5m_candles(client, "BTCUSDT", limit=25)
+                btc_closes = [x["close"] for x in btc_candles]
+                btc_ret60 = pct_change(btc_closes[-13], btc_closes[-1]) if len(btc_closes) >= 13 else None
                 async def check(item):
                     async with semaphore:
                         try:
@@ -354,6 +361,7 @@ async def v90_scan_once():
                             cs = [x["close"] for x in candles]
                             vs = [x["volume"] for x in candles]
                             ret60 = pct_change(cs[-13],cs[-1])
+                            market_returns.append(ret60)
                             avg = sum(vs[-7:-1])/6
                             vol = vs[-1]/avg if avg else 0
                             past_returns = [pct_change(cs[i-12],cs[i]) for i in range(12,len(cs)-1)]
@@ -387,7 +395,9 @@ async def v90_scan_once():
                                 return None
                             return {"symbol":item["symbol"],"ret60_pct":ret60,"volume_ratio":vol,
                                     "z":z,"breakout_pct":breakout,"signal_ms":signal_ms,
-                                    "breakout_price":cs[-1]}
+                                    "breakout_price":cs[-1],
+                                    "pullback_reclaim": (cs[-3] < cs[-4] and cs[-2] > cs[-3] and cs[-1] > cs[-2] and cs[-1] > cs[-7]),
+                                    "ret15_pct": pct_change(cs[-4], cs[-1])}
                         except Exception:
                             scan["errors"]+=1
                             rejected["candle_or_calculation_error"] += 1
@@ -402,47 +412,66 @@ async def v90_scan_once():
                 scan["candidates"] = len(candidates)
                 scan["filter_counts"] = dict(rejected)
                 scan["near_misses"] = near_misses
-                # One coin at a time, max five independent coins; all A/B/C share entries.
-                active_syms = {t["symbol"] for t in V90_STATE["trades"] if t["status"]=="OPEN_SHADOW"}
+                # A/B are frozen: existing positions are monitored until closed, no new entries.
+                # New research arms share C's candidate signals but maintain independent shadow positions.
+                breadth = (sum(x > 0 for x in market_returns) / len(market_returns)
+                           if market_returns else None)
+                scan["market_context"] = {"btc_ret60_pct":btc_ret60,
+                                           "alt_positive_breadth":round(breadth,4) if breadth is not None else None,
+                                           "breadth_sample":len(market_returns)}
+                active_by_model = {v:{t["symbol"] for t in V90_STATE["trades"]
+                                      if t["status"]=="OPEN_SHADOW" and t["variant"]==v}
+                                   for v in V91_MODELS}
+                new_signal_keys = set()
                 for c in sorted(candidates,key=lambda r:r["ret60_pct"],reverse=True):
-                    if len(active_syms)>=5:break
                     sym=c["symbol"]
                     key=f'{sym}:{c["signal_ms"]}'
-                    if sym in active_syms or key in V90_STATE["seen"]:
-                        scan["filter_counts"]["already_open_or_seen"] = scan["filter_counts"].get("already_open_or_seen",0)+1
-                        continue
+                    if key in V90_STATE["seen"]:continue
+                    # Improved C: avoid overextended moves and weak-volume breakouts.
+                    selected = (["C"] if (c["ret60_pct"] <= 8.0
+                                           and c["breakout_pct"] <= 1.5
+                                           and c["volume_ratio"] >= 1.2) else [])
+                    if c["pullback_reclaim"] and 2.5 <= c["ret60_pct"] <= 8.0:
+                        selected.append("V91_PULLBACK")
+                    if 2.5 <= c["ret60_pct"] <= 6.0 and c["breakout_pct"] <= 1.0 and c["z"] <= 2.8:
+                        selected.append("V91_MOMENTUM")
+                    if (btc_ret60 is not None and btc_ret60 > 0 and breadth is not None
+                            and breadth >= 0.55):
+                        selected.append("V91_REGIME")
+                    selected = [v for v in selected if sym not in active_by_model[v]
+                                and len(active_by_model[v]) < 5]
+                    if not selected:continue
                     try:
                         q=await get_json(client,"/api/v3/ticker/bookTicker",{"symbol":sym})
                         ask=float(q["askPrice"]);bid=float(q["bidPrice"])
-                        if ask<=0 or bid<=0:
-                            scan["filter_counts"]["invalid_quote"] = scan["filter_counts"].get("invalid_quote",0)+1
-                            continue
+                        if ask<=0 or bid<=0:continue
                         spread=(ask-bid)/ask*100
                         chase=pct_change(c["breakout_price"],ask)
-                        if spread>0.15 or chase>0.5:
-                            reason = "spread_above_0_15" if spread>0.15 else "chase_above_0_5"
-                            scan["filter_counts"][reason] = scan["filter_counts"].get(reason,0)+1
-                            continue
+                        if spread>0.15 or chase>0.5:continue
+                        if spread > 0.12 and "C" in selected:
+                            selected.remove("C")
+                        if not selected:continue
                         entry_ms=int(time.time()*1000)
-                        for variant in ("A","B","C"):
+                        for variant in selected:
                             V90_STATE["trades"].append({**c,"variant":variant,"status":"OPEN_SHADOW",
                                 "entry_utc":utc_now(),"entry_ms":entry_ms,"entry_price":ask,
                                 "stop_price":ask*0.97,"spread_pct":round(spread,5),
                                 "chase_pct":round(chase,5),"max_bid":ask,"min_bid":ask,
                                 "tp1_done":False,"research_only":True})
+                            active_by_model[variant].add(sym)
                         V90_STATE["seen"][key]=entry_ms
-                        active_syms.add(sym)
+                        new_signal_keys.add(key)
                         scan["new_coins"]+=1
                         V90_STATE["signals"]+=1
-                        msg = (f"ALT V90.3 PAPER GIRIS\n{sym} | A/B/C (tek sinyal)\n"
+                        msg = (f"ALT V91 PAPER GIRIS\n{sym} | {', '.join(selected)}\n"
                                f"Giris: {ask:.10g} | Stop: {ask*0.97:.10g}\n"
                                f"Momentum60: {c['ret60_pct']:+.2f}% | Hacim: {c['volume_ratio']:.2f}x\n"
-                               f"Breakout: {c['breakout_pct']:+.3f}% | Spread: {spread:.3f}%\n"
                                "PAPER ONLY | GERCEK EMIR YOK")
                         await v902_notify(msg, "ENTRY", sym)
                         v903_save_state()
-                    except Exception:
+                    except Exception as exc:
                         scan["errors"]+=1
+                        V90_STATE["last_error"] = "entry: " + str(exc)[:180]
                 # Keep completed results for review, bounded RAM.
                 if len(V90_STATE["trades"])>V90_MAX_TRADES:
                     closed=[t for t in V90_STATE["trades"] if t["status"]=="CLOSED_SHADOW"]
@@ -474,22 +503,26 @@ async def v90_startup():
     global V90_TASK
     V90_STATE["started_utc"]=utc_now()
     v903_load_state()
+    # Keep historical A/B trades for reporting and finish any still-open A/B positions.
     if V90_TASK is None or V90_TASK.done():V90_TASK=asyncio.create_task(v90_loop())
 
 
 @app.get("/v90-status")
 async def v90_status():
-    return {**MODE_INFO,"status":"OK","strategy":"V90_HYBRID_MOMENTUM", "diagnostic_version":"V90_3_MEMORY_CHECKPOINT",
+    return {**MODE_INFO,"status":"OK","strategy":"V90_HYBRID_MOMENTUM", "diagnostic_version":"V91_C_PLUS_3_RESEARCH",
             "paper_only":True,"orders":False,"auto_running":bool(V90_TASK and not V90_TASK.done()),
             "scan_interval_seconds":V90_SCAN_SECONDS,"last_scan":V90_STATE["last_scan"],
             "last_error":V90_STATE["last_error"],"total_signals":V90_STATE["signals"],
             "signal_delay_limit_seconds":V90_DELAY_SECONDS,"telegram":V90_STATE["telegram"],
             "memory_peak_mb":v903_memory_mb(), "checkpoint_path":str(V90_STATE_PATH),
             "frozen_legacy":V90_STATE["frozen_legacy"],
-            "variants":{v:v90_stats([t for t in V90_STATE["trades"] if t["variant"]==v]) for v in ("A","B","C")},
+            "frozen_models":list(V91_FROZEN), "active_models":list(V91_MODELS),
+            "variants":{v:v90_stats([t for t in V90_STATE["trades"] if t["variant"]==v])
+                        for v in (*V91_FROZEN, *V91_MODELS)},
             "recent_trades":V90_STATE["trades"][-24:],
             "limitations":["Local checkpoint on ephemeral filesystem; may disappear on Render restart/deploy", "5-minute scan can miss signals", 
                            "Stop/TP monitored by quotes every 5 minutes; gaps and slippage possible",
+                           "V91 models use exploratory entry filters, not validated strategies",
                            "No real fills, no real orders", "Experimental thresholds not validated"]}
 
 
