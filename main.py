@@ -336,7 +336,8 @@ async def v90_scan_once():
     if V90_LOCK.locked(): return {"status":"BUSY"}
     async with V90_LOCK:
         V90_STATE["scans"] += 1
-        scan = {"utc":utc_now(),"checked":0,"candidates":0,"new_coins":0,"errors":0, "filter_counts":{}, "near_misses":[]}
+        scan_started_ms = int(time.time()*1000)
+        scan = {"utc":utc_now(),"checked":0,"candidates":0,"new_coins":0,"errors":0, "filter_counts":{}, "near_misses":[], "model_filters":{}}
         try:
             async with httpx.AsyncClient(timeout=30.0, limits=httpx.Limits(max_connections=4, max_keepalive_connections=2)) as client:
                 await v90_monitor(client)
@@ -347,6 +348,8 @@ async def v90_scan_once():
                 rejected = Counter()
                 near_misses = []
                 market_returns = []
+                model_rejected = {m: Counter() for m in V91_MODELS}
+                model_passed = {m: 0 for m in V91_MODELS}
                 # BTC is fetched once per scan for the regime research arm.
                 btc_candles = await get_completed_5m_candles(client, "BTCUSDT", limit=25)
                 btc_closes = [x["close"] for x in btc_candles]
@@ -369,29 +372,12 @@ async def v90_scan_once():
                             sd = statistics.pstdev(past_returns) if len(past_returns)>1 else 0
                             z = (ret60-mu)/sd if sd else 0
                             breakout = pct_change(max(x["high"] for x in candles[-7:-1]),cs[-1])
-                            if ret60 < 2.5:
-                                rejected["momentum_below_2_5"] += 1
-                                return None
-                            if not 1.0 <= vol < 3.5:
-                                rejected["volume_outside_1_0_3_5"] += 1
-                                return None
-                            if z >= 3.5:
-                                rejected["z_at_least_3_5"] += 1
-                                return None
-                            if breakout < 0.2:
-                                rejected["breakout_below_0_2"] += 1
-                                if len(near_misses) < 10:
-                                    near_misses.append({"symbol":item["symbol"],"ret60_pct":round(ret60,3),
-                                                        "volume_ratio":round(vol,3),"z":round(z,3),
-                                                        "breakout_pct":round(breakout,3),"blocked_by":"breakout"})
-                                return None
+                            # Shared checks are data quality/freshness only; each model
+                            # applies its own entry filters below.
                             signal_ms = candles[-1]["close_time"]
                             delay = (int(time.time()*1000)-signal_ms)/1000
-                            if not 0<=delay<V90_DELAY_SECONDS:
+                            if not 0 <= delay < V90_DELAY_SECONDS:
                                 rejected["signal_delay_outside_0_300_seconds"] += 1
-                                if len(near_misses) < 10:
-                                    near_misses.append({"symbol":item["symbol"],"ret60_pct":round(ret60,3),
-                                                        "delay_seconds":round(delay,1),"blocked_by":"delay"})
                                 return None
                             return {"symbol":item["symbol"],"ret60_pct":ret60,"volume_ratio":vol,
                                     "z":z,"breakout_pct":breakout,"signal_ms":signal_ms,
@@ -409,7 +395,7 @@ async def v90_scan_once():
                     candidates.extend(r for r in batch if r)
                     del batch
                 scan["checked"] = len(universe)
-                scan["candidates"] = len(candidates)
+                scan["candidates"] = len(candidates)  # valid, fresh candles; NOT entry signals
                 scan["filter_counts"] = dict(rejected)
                 scan["near_misses"] = near_misses
                 # A/B are frozen: existing positions are monitored until closed, no new entries.
@@ -422,24 +408,47 @@ async def v90_scan_once():
                 active_by_model = {v:{t["symbol"] for t in V90_STATE["trades"]
                                       if t["status"]=="OPEN_SHADOW" and t["variant"]==v}
                                    for v in V91_MODELS}
-                new_signal_keys = set()
                 for c in sorted(candidates,key=lambda r:r["ret60_pct"],reverse=True):
                     sym=c["symbol"]
                     key=f'{sym}:{c["signal_ms"]}'
-                    if key in V90_STATE["seen"]:continue
-                    # Improved C: avoid overextended moves and weak-volume breakouts.
-                    selected = (["C"] if (c["ret60_pct"] <= 8.0
-                                           and c["breakout_pct"] <= 1.5
-                                           and c["volume_ratio"] >= 1.2) else [])
-                    if c["pullback_reclaim"] and 2.5 <= c["ret60_pct"] <= 8.0:
-                        selected.append("V91_PULLBACK")
-                    if 2.5 <= c["ret60_pct"] <= 6.0 and c["breakout_pct"] <= 1.0 and c["z"] <= 2.8:
-                        selected.append("V91_MOMENTUM")
-                    if (btc_ret60 is not None and btc_ret60 > 0 and breadth is not None
-                            and breadth >= 0.55):
-                        selected.append("V91_REGIME")
-                    selected = [v for v in selected if sym not in active_by_model[v]
-                                and len(active_by_model[v]) < 5]
+                    selected = []
+                    for model in V91_MODELS:
+                        reason = None
+                        ret, vol, z, breakout = c["ret60_pct"], c["volume_ratio"], c["z"], c["breakout_pct"]
+                        if model == "C":
+                            if not 2.5 <= ret <= 8.0: reason = "momentum_range"
+                            elif not 1.2 <= vol < 3.5: reason = "volume_range"
+                            elif z >= 3.5: reason = "z_extreme"
+                            elif not 0.2 <= breakout <= 1.5: reason = "breakout_range"
+                        elif model == "V91_PULLBACK":
+                            # Unlike C, can test a modest recovery after a pullback.
+                            if not 0.5 <= ret <= 8.0: reason = "trend_range"
+                            elif not 0.7 <= vol < 3.5: reason = "volume_range"
+                            elif not c["pullback_reclaim"]: reason = "no_reclaim"
+                            elif z >= 3.5: reason = "z_extreme"
+                        elif model == "V91_MOMENTUM":
+                            if not 1.5 <= ret <= 6.0: reason = "momentum_range"
+                            elif not 1.0 <= vol < 3.5: reason = "volume_range"
+                            elif z > 2.8: reason = "z_extreme"
+                            elif not 0.1 <= breakout <= 1.0: reason = "breakout_range"
+                        elif model == "V91_REGIME":
+                            if btc_ret60 is None or btc_ret60 <= 0 or breadth is None or breadth < 0.55:
+                                reason = "market_regime"
+                            elif not 1.0 <= ret <= 6.0: reason = "momentum_range"
+                            elif not 1.0 <= vol < 3.5: reason = "volume_range"
+                            elif z >= 3.5: reason = "z_extreme"
+                            elif not 0.1 <= breakout <= 1.5: reason = "breakout_range"
+                        if reason:
+                            model_rejected[model][reason] += 1
+                        else:
+                            model_passed[model] += 1
+                            # Dedup per model so one model cannot block another.
+                            if f"{model}:{key}" in V90_STATE["seen"] or sym in active_by_model[model]:
+                                model_rejected[model]["already_seen_or_open"] += 1
+                            elif len(active_by_model[model]) >= 5:
+                                model_rejected[model]["max_open_positions"] += 1
+                            else:
+                                selected.append(model)
                     if not selected:continue
                     try:
                         q=await get_json(client,"/api/v3/ticker/bookTicker",{"symbol":sym})
@@ -447,9 +456,12 @@ async def v90_scan_once():
                         if ask<=0 or bid<=0:continue
                         spread=(ask-bid)/ask*100
                         chase=pct_change(c["breakout_price"],ask)
-                        if spread>0.15 or chase>0.5:continue
+                        if spread>0.15 or chase>0.5:
+                            for model in selected: model_rejected[model]["spread_or_chase"] += 1
+                            continue
                         if spread > 0.12 and "C" in selected:
                             selected.remove("C")
+                            model_rejected["C"]["c_spread"] += 1
                         if not selected:continue
                         entry_ms=int(time.time()*1000)
                         for variant in selected:
@@ -459,7 +471,8 @@ async def v90_scan_once():
                                 "chase_pct":round(chase,5),"max_bid":ask,"min_bid":ask,
                                 "tp1_done":False,"research_only":True})
                             active_by_model[variant].add(sym)
-                        V90_STATE["seen"][key]=entry_ms
+                        for variant in selected:
+                            V90_STATE["seen"][f"{variant}:{key}"]=entry_ms
                         new_signal_keys.add(key)
                         scan["new_coins"]+=1
                         V90_STATE["signals"]+=1
@@ -472,6 +485,10 @@ async def v90_scan_once():
                     except Exception as exc:
                         scan["errors"]+=1
                         V90_STATE["last_error"] = "entry: " + str(exc)[:180]
+                scan["model_filters"] = {m:{"evaluated":len(candidates), "passed_entry_filters":model_passed[m],
+                    "rejected":dict(model_rejected[m]),
+                    "new_positions":sum(t["variant"]==m and t["entry_ms"] >= scan_started_ms for t in V90_STATE["trades"])}
+                    for m in V91_MODELS}
                 # Keep completed results for review, bounded RAM.
                 if len(V90_STATE["trades"])>V90_MAX_TRADES:
                     closed=[t for t in V90_STATE["trades"] if t["status"]=="CLOSED_SHADOW"]
@@ -509,7 +526,7 @@ async def v90_startup():
 
 @app.get("/v90-status")
 async def v90_status():
-    return {**MODE_INFO,"status":"OK","strategy":"V90_HYBRID_MOMENTUM", "diagnostic_version":"V91_C_PLUS_3_RESEARCH",
+    return {**MODE_INFO,"status":"OK","strategy":"V90_HYBRID_MOMENTUM", "diagnostic_version":"V91_1_INDEPENDENT_FILTERS",
             "paper_only":True,"orders":False,"auto_running":bool(V90_TASK and not V90_TASK.done()),
             "scan_interval_seconds":V90_SCAN_SECONDS,"last_scan":V90_STATE["last_scan"],
             "last_error":V90_STATE["last_error"],"total_signals":V90_STATE["signals"],
@@ -535,8 +552,8 @@ async def v90_filter_analysis():
             "last_scan_utc":last.get("utc"), "checked":last.get("checked"),
             "candidates":last.get("candidates"), "new_coins":last.get("new_coins"),
             "errors":last.get("errors"), "filter_counts":last.get("filter_counts",{}),
-            "near_misses":last.get("near_misses",[]),
-            "note":"First failed filter per coin; no extra market API calls; no parameter changes; paper only."}
+            "near_misses":last.get("near_misses",[]), "model_filters":last.get("model_filters",{}),
+            "note":"Independent first-failed filter per model; exploratory thresholds; paper only."}
 
 
 V902_TEST_LAST_MONO = 0.0
