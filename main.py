@@ -207,7 +207,7 @@ V90_STATE = {"started_utc": None, "last_scan": None, "last_error": None,
 V90_TASK = None
 V90_LOCK = None
 V90_MAX_TRADES = 1200
-V91_MODELS = ("C", "V91_PULLBACK", "V91_MOMENTUM", "V91_REGIME")
+V91_MODELS = ("C", "V91_PULLBACK", "V91_MOMENTUM", "V91_REGIME", "V913_PULLBACK_MARKET", "V913_PULLBACK_TRAIL15")
 V91_FROZEN = ("A", "B")
 V90_SCAN_SECONDS = 300
 V90_COST_PCT = 0.15
@@ -306,15 +306,21 @@ async def v90_monitor(client):
             t["last_bid"] = bid
             if t["variant"] == "B" and t["max_bid"] >= t["entry_price"] * 1.02:
                 t["stop_price"] = max(t["stop_price"], t["entry_price"])
-            if t["variant"] in ("C", "V91_PULLBACK", "V91_MOMENTUM", "V91_REGIME") and not t.get("tp1_done") and bid >= t["entry_price"]*1.03:
+            if t["variant"] in V91_MODELS and not t.get("tp1_done") and bid >= t["entry_price"]*1.03:
                 t["tp1_done"] = True
                 t["tp1_price"] = bid
                 t["tp1_utc"] = utc_now()
+            # V91.3 trail arm: activate only after +1.5% gross gain; trail 1.5% below highest observed bid.
+            # Preserve original -3% hard stop until activation. This is sampled every 5 minutes.
+            if t["variant"] == "V913_PULLBACK_TRAIL15":
+                if t.get("trail_active") or t["max_bid"] >= t["entry_price"] * 1.015:
+                    t["trail_active"] = True
+                    t["stop_price"] = max(t["stop_price"], t["max_bid"] * 0.985)
             if bid <= t["stop_price"]:
-                v90_close(t, bid, "STOP_MONITORED", now_ms)
+                v90_close(t, bid, "TRAIL15_MONITORED" if t["variant"] == "V913_PULLBACK_TRAIL15" and t.get("trail_active") else "STOP_MONITORED", now_ms)
             elif now_ms >= t["entry_ms"] + 120*60000:
                 v90_close(t, bid, "TIME120", now_ms)
-            if t["status"] == "CLOSED_SHADOW" and t["variant"] in ("C", "V91_PULLBACK", "V91_MOMENTUM", "V91_REGIME") and t.get("tp1_done"):
+            if t["status"] == "CLOSED_SHADOW" and t["variant"] in V91_MODELS and t.get("tp1_done"):
                 t["net_pct"] = round(((((t["tp1_price"]/t["entry_price"])-1)*100)*0.5 +
                                       (((t["exit_price"]/t["entry_price"])-1)*100)*0.5 - V90_COST_PCT),5)
     closed_now = [t for t in active if t["status"] == "CLOSED_SHADOW" and not t.get("telegram_exit_attempted")]
@@ -420,12 +426,16 @@ async def v90_scan_once():
                             elif not 1.2 <= vol < 3.5: reason = "volume_range"
                             elif z >= 3.5: reason = "z_extreme"
                             elif not 0.2 <= breakout <= 1.5: reason = "breakout_range"
-                        elif model == "V91_PULLBACK":
+                        elif model in ("V91_PULLBACK", "V913_PULLBACK_MARKET", "V913_PULLBACK_TRAIL15"):
+                            if model == "V913_PULLBACK_MARKET" and (btc_ret60 is None or btc_ret60 < 0 or breadth is None or breadth < 0.50):
+                                reason = "market_regime"
+                            # Pullback entry rules are otherwise identical for fair comparison.
+                            if reason is None:
                             # Unlike C, can test a modest recovery after a pullback.
-                            if not 0.2 <= ret <= 6.0: reason = "trend_range"
-                            elif not 0.6 <= vol < 3.0: reason = "volume_range"
-                            elif not c["pullback_reclaim"]: reason = "no_reclaim"
-                            elif z >= 3.5: reason = "z_extreme"
+                                if not 0.2 <= ret <= 6.0: reason = "trend_range"
+                                elif not 0.6 <= vol < 3.0: reason = "volume_range"
+                                elif not c["pullback_reclaim"]: reason = "no_reclaim"
+                                elif z >= 3.5: reason = "z_extreme"
                         elif model == "V91_MOMENTUM":
                             if not 0.8 <= ret <= 5.0: reason = "momentum_range"
                             elif not 0.9 <= vol < 3.0: reason = "volume_range"
@@ -472,7 +482,7 @@ async def v90_scan_once():
                                 "entry_utc":utc_now(),"entry_ms":entry_ms,"entry_price":ask,
                                 "stop_price":ask*0.97,"spread_pct":round(spread,5),
                                 "chase_pct":round(chase,5),"max_bid":ask,"min_bid":ask,
-                                "tp1_done":False,"research_only":True})
+                                "tp1_done":False,"trail_active":False,"research_only":True})
                             active_by_model[variant].add(sym)
                         for variant in selected:
                             V90_STATE["seen"][f"{variant}:{key}"]=entry_ms
@@ -530,7 +540,7 @@ async def v90_startup():
 
 @app.get("/v90-status")
 async def v90_status():
-    return {**MODE_INFO,"status":"OK","strategy":"V90_HYBRID_MOMENTUM", "diagnostic_version":"V91_2_RESEARCH_DIAGNOSTICS",
+    return {**MODE_INFO,"status":"OK","strategy":"V90_HYBRID_MOMENTUM", "diagnostic_version":"V91_3_MARKET_AND_TRAIL15_PAPER",
             "paper_only":True,"orders":False,"auto_running":bool(V90_TASK and not V90_TASK.done()),
             "scan_interval_seconds":V90_SCAN_SECONDS,"last_scan":V90_STATE["last_scan"],
             "last_error":V90_STATE["last_error"],"total_signals":V90_STATE["signals"],
@@ -543,7 +553,7 @@ async def v90_status():
             "recent_trades":V90_STATE["trades"][-24:],
             "limitations":["Local checkpoint on ephemeral filesystem; may disappear on Render restart/deploy", "5-minute scan can miss signals", 
                            "Stop/TP monitored by quotes every 5 minutes; gaps and slippage possible",
-                           "V91 models use exploratory entry filters, not validated strategies",
+                           "V91/V91.3 models use exploratory entry filters, not validated strategies", "Trailing stop is sampled every 5 minutes and may exceed the threshold on gaps",
                            "No real fills, no real orders", "Experimental thresholds not validated"]}
 
 
