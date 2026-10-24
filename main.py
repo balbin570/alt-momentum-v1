@@ -6,6 +6,7 @@ import resource
 from pathlib import Path
 import os
 import statistics
+import tempfile
 import time
 from datetime import datetime, timezone
 import httpx
@@ -220,31 +221,86 @@ def v903_memory_mb():
     return round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024, 1)
 
 
+V915_STORAGE = {"last_save_utc": None, "last_save_ok": None, "last_save_error": None,
+                "last_restore_utc": None, "last_restore_status": "NOT_ATTEMPTED",
+                "restored_trades": 0, "save_count_since_start": 0}
+
+
 def v903_save_state():
-    """Best-effort local checkpoint; Render ephemeral disk is NOT durable storage."""
+    """Atomic checkpoint to configured disk; errors exposed in storage status."""
+    tmp = None
     try:
+        V90_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
         payload = {k: V90_STATE[k] for k in ("trades", "seen", "signals", "telegram")}
-        temp = V90_STATE_PATH.with_suffix(".tmp")
-        temp.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
-        temp.replace(V90_STATE_PATH)
+        # Same-directory temp file ensures atomic rename on the mounted disk.
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=str(V90_STATE_PATH.parent),
+                                         prefix=".v90-checkpoint-", suffix=".tmp", delete=False) as f:
+            tmp = Path(f.name)
+            json.dump(payload, f, separators=(",", ":"))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, V90_STATE_PATH)
+        tmp = None
+        V915_STORAGE["last_save_utc"] = utc_now()
+        V915_STORAGE["last_save_ok"] = True
+        V915_STORAGE["last_save_error"] = None
+        V915_STORAGE["save_count_since_start"] += 1
     except Exception as exc:
-        V90_STATE["last_error"] = "checkpoint: " + str(exc)[:150]
+        message = f"{type(exc).__name__}: {str(exc)[:180]}"
+        V915_STORAGE["last_save_ok"] = False
+        V915_STORAGE["last_save_error"] = message
+        V90_STATE["last_error"] = "checkpoint: " + message
+    finally:
+        if tmp is not None:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def v903_load_state():
+    V915_STORAGE["last_restore_utc"] = utc_now()
     try:
-        if V90_STATE_PATH.is_file():
-            saved = json.loads(V90_STATE_PATH.read_text(encoding="utf-8"))
-            for k in ("trades", "seen", "signals"):
-                if k in saved:
-                    V90_STATE[k] = saved[k]
-            # Preserve current env-based Telegram configured state.
-            tg = saved.get("telegram", {})
+        if not V90_STATE_PATH.is_file():
+            V915_STORAGE["last_restore_status"] = "NO_CHECKPOINT_YET"
+            return
+        saved = json.loads(V90_STATE_PATH.read_text(encoding="utf-8"))
+        if not isinstance(saved, dict) or not isinstance(saved.get("trades"), list) or not isinstance(saved.get("seen"), dict):
+            raise ValueError("checkpoint structure invalid")
+        for k in ("trades", "seen", "signals"):
+            if k in saved:
+                V90_STATE[k] = saved[k]
+        tg = saved.get("telegram", {})
+        if isinstance(tg, dict):
             for k in ("sent", "failed", "last"):
                 if k in tg:
                     V90_STATE["telegram"][k] = tg[k]
+        V915_STORAGE["restored_trades"] = len(V90_STATE["trades"])
+        V915_STORAGE["last_restore_status"] = "RESTORED"
     except Exception as exc:
-        V90_STATE["last_error"] = "restore: " + str(exc)[:150]
+        message = f"{type(exc).__name__}: {str(exc)[:180]}"
+        V915_STORAGE["last_restore_status"] = "ERROR: " + message
+        V90_STATE["last_error"] = "restore: " + message
+
+
+@app.get("/v915-storage-status")
+async def v915_storage_status():
+    """Read-only disk diagnostics: never alters the checkpoint."""
+    path = V90_STATE_PATH
+    try:
+        exists = path.is_file()
+        size = path.stat().st_size if exists else None
+        modified = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat() if exists else None
+        stat_error = None
+    except OSError as exc:
+        exists, size, modified = False, None, None
+        stat_error = f"{type(exc).__name__}: {str(exc)[:180]}"
+    return {**MODE_INFO, "status": "OK", "version": "V91.5_STORAGE_DIAGNOSTICS",
+            "checkpoint_path": str(path), "checkpoint_exists": exists,
+            "checkpoint_bytes": size, "checkpoint_modified_utc": modified,
+            "checkpoint_stat_error": stat_error, "storage": dict(V915_STORAGE),
+            "current_trades_in_memory": len(V90_STATE["trades"]),
+            "note": "Read-only endpoint; checkpoint is not overwritten or restarted."}
 
 
 
@@ -551,7 +607,7 @@ async def v90_status():
             "variants":{v:v90_stats([t for t in V90_STATE["trades"] if t["variant"]==v])
                         for v in (*V91_FROZEN, *V91_MODELS)},
             "recent_trades":V90_STATE["trades"][-24:],
-            "limitations":["Local checkpoint on ephemeral filesystem; may disappear on Render restart/deploy", "5-minute scan can miss signals", 
+            "limitations":["Checkpoint persistence requires a writable persistent mount and successful saves", "5-minute scan can miss signals", 
                            "Stop/TP monitored by quotes every 5 minutes; gaps and slippage possible",
                            "V91/V91.3 models use exploratory entry filters, not validated strategies", "Trailing stop is sampled every 5 minutes and may exceed the threshold on gaps",
                            "No real fills, no real orders", "Experimental thresholds not validated"]}
@@ -665,7 +721,7 @@ async def v914_research_analysis():
             "total_closed_in_memory": len(closed), "by_model": by_model,
             "pullback_pairwise": pairwise,
             "limitations": ["Only trades retained in memory/checkpoint are analyzed",
-                            "Render /tmp checkpoint is ephemeral and may reset on deploy",
+                            "Checkpoint persistence depends on V90_STATE_PATH and successful disk writes",
                             "5-minute sampled exits may differ from executable prices",
                             "Overlapping model trades are not independent observations",
                             "Report does not change entry/exit rules or place orders"]}
