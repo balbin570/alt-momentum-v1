@@ -581,3 +581,104 @@ async def v902_telegram_test():
     V902_TEST_LAST_MONO = now
     delivery = await v902_notify("ALT V90.3 TELEGRAM TEST\nBildirim testi. Islem acilmadi.\nPAPER ONLY | GERCEK EMIR YOK", "TEST", "-")
     return {**MODE_INFO, "status": "OK" if delivery["sent"] else "NOT_SENT", "telegram": delivery}
+
+
+# V91.4 preparation: read-only research diagnostics; no changes to trading logic.
+def v914_group_stats(rows):
+    return v90_stats(rows)
+
+
+def v914_bucket(value, bounds):
+    if value is None:
+        return "missing"
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return "missing"
+    for bound in bounds:
+        if value < bound:
+            return f"<{bound:g}"
+    return f">={bounds[-1]:g}"
+
+
+@app.get("/v914-research-analysis")
+async def v914_research_analysis():
+    closed = [t for t in V90_STATE["trades"] if t.get("status") == "CLOSED_SHADOW"
+              and t.get("variant") in V91_MODELS]
+    dimensions = {
+        "ret60_pct": [0, 0.5, 1, 2, 3, 5],
+        "ret15_pct": [0, 0.3, 0.7, 1.5, 3],
+        "volume_ratio": [0.6, 1, 1.5, 2, 3],
+        "z": [-1, 0, 1, 2, 3],
+        "breakout_pct": [0, 0.2, 0.5, 1],
+        "spread_pct": [0.02, 0.05, 0.1, 0.15],
+        "chase_pct": [-0.3, 0, 0.2, 0.5],
+        "hold_minutes": [15, 30, 60, 90, 120],
+    }
+    by_model = {}
+    for model in V91_MODELS:
+        rows = [t for t in closed if t.get("variant") == model]
+        breakdowns = {}
+        for field, bounds in dimensions.items():
+            groups = {}
+            for t in rows:
+                bucket = v914_bucket(t.get(field), bounds)
+                groups.setdefault(bucket, []).append(t)
+            breakdowns[field] = {k: v914_group_stats(v) for k, v in sorted(groups.items())}
+        reasons = {}
+        for t in rows:
+            reasons.setdefault(t.get("exit_reason", "UNKNOWN"), []).append(t)
+        by_model[model] = {
+            "summary": v914_group_stats(rows),
+            "exit_reasons": {k: v914_group_stats(v) for k, v in sorted(reasons.items())},
+            "breakdowns": breakdowns,
+        }
+    # Match the same entry by symbol and entry timestamp, allowing sub-second variation.
+    pullback_models = ("V91_PULLBACK", "V913_PULLBACK_MARKET", "V913_PULLBACK_TRAIL15")
+    paired = {}
+    for t in closed:
+        if t.get("variant") not in pullback_models:
+            continue
+        key = (t.get("symbol"), t.get("entry_ms"))
+        paired.setdefault(key, {})[t["variant"]] = t
+    pairwise = {}
+    for other in pullback_models[1:]:
+        matches = []
+        for (symbol, entry_ms), records in paired.items():
+            if "V91_PULLBACK" in records and other in records:
+                base = records["V91_PULLBACK"]
+                candidate = records[other]
+                matches.append({"symbol": symbol, "entry_ms": entry_ms,
+                                "normal_net_pct": base["net_pct"],
+                                "variant_net_pct": candidate["net_pct"],
+                                "difference_pct_points": round(candidate["net_pct"] - base["net_pct"], 5),
+                                "normal_exit": base.get("exit_reason"),
+                                "variant_exit": candidate.get("exit_reason")})
+        diffs = [r["difference_pct_points"] for r in matches]
+        pairwise[other] = {"matched_closed_pairs": len(matches),
+                           "mean_improvement_pct_points": round(sum(diffs)/len(diffs), 5) if diffs else None,
+                           "improved": sum(d > 0 for d in diffs),
+                           "worsened": sum(d < 0 for d in diffs),
+                           "equal": sum(d == 0 for d in diffs),
+                           "recent_pairs": matches[-30:]}
+    return {**MODE_INFO, "status": "OK", "report_version": "V914_DIAGNOSTICS_ONLY",
+            "total_closed_in_memory": len(closed), "by_model": by_model,
+            "pullback_pairwise": pairwise,
+            "limitations": ["Only trades retained in memory/checkpoint are analyzed",
+                            "Render /tmp checkpoint is ephemeral and may reset on deploy",
+                            "5-minute sampled exits may differ from executable prices",
+                            "Overlapping model trades are not independent observations",
+                            "Report does not change entry/exit rules or place orders"]}
+
+
+@app.get("/v914-closed-trades")
+async def v914_closed_trades(model: str = "ALL", limit: int = 500, offset: int = 0):
+    # Bounded pagination for export and reproducible external analysis.
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
+    rows = [t for t in V90_STATE["trades"] if t.get("status") == "CLOSED_SHADOW"
+            and (model == "ALL" or t.get("variant") == model)]
+    return {**MODE_INFO, "status": "OK", "model_filter": model,
+            "total": len(rows), "offset": offset, "limit": limit,
+            "trades": rows[offset:offset + limit],
+            "note": "Read-only retained paper trade records; pagination via offset and limit."}
