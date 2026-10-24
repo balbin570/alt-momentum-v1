@@ -685,7 +685,7 @@ async def v914_research_analysis():
         for t in rows:
             reasons.setdefault(t.get("exit_reason", "UNKNOWN"), []).append(t)
         by_model[model] = {
-            "summary": v914_group_stats(rows),
+            "summary": v914_group_stats([t for t in V90_STATE["trades"] if t.get("variant") == model]),
             "exit_reasons": {k: v914_group_stats(v) for k, v in sorted(reasons.items())},
             "breakdowns": breakdowns,
         }
@@ -738,3 +738,43 @@ async def v914_closed_trades(model: str = "ALL", limit: int = 500, offset: int =
             "total": len(rows), "offset": offset, "limit": limit,
             "trades": rows[offset:offset + limit],
             "note": "Read-only retained paper trade records; pagination via offset and limit."}
+
+
+# V91.6 read-only diagnostics. All entry/exit logic, including C, is unchanged.
+@app.get("/v916-performance")
+async def v916_performance():
+    models = {}
+    for model in V91_MODELS:
+        rows = [t for t in V90_STATE["trades"] if t.get("variant") == model]
+        opened = [t for t in rows if t.get("status") == "OPEN_SHADOW"]
+        closed = [t for t in rows if t.get("status") == "CLOSED_SHADOW"]
+        positions = []
+        for t in opened:
+            entry = t.get("entry_price")
+            bid = t.get("last_bid")
+            gross = ((bid / entry) - 1) * 100 if isinstance(entry, (int, float)) and entry > 0 and isinstance(bid, (int, float)) and bid > 0 else None
+            positions.append({"symbol": t.get("symbol"), "entry_utc": t.get("entry_utc"),
+                              "entry_price": entry, "last_observed_bid": bid,
+                              "gross_unrealized_pct": round(gross, 5) if gross is not None else None,
+                              "estimated_net_unrealized_pct": round(gross - V90_COST_PCT, 5) if gross is not None else None,
+                              "quote_is_live": False,
+                              "max_bid": t.get("max_bid"), "min_bid": t.get("min_bid"),
+                              "stop_price": t.get("stop_price"), "trail_active": t.get("trail_active")})
+        reasons = {}
+        for t in closed:
+            reason = t.get("exit_reason", "UNKNOWN")
+            reasons.setdefault(reason, []).append(t)
+        models[model] = {"summary": v90_stats(rows),
+                         "open_positions": positions,
+                         "closed_by_exit_reason": {k: v90_stats(v) for k, v in sorted(reasons.items())},
+                         "closed_gross_mean_pct": round(sum(t.get("net_pct", 0) + V90_COST_PCT for t in closed) / len(closed), 5) if closed else None,
+                         "assumed_round_trip_cost_pct": V90_COST_PCT}
+    return {**MODE_INFO, "status": "OK", "report_version": "V91.6_PERFORMANCE_READ_ONLY",
+            "reference_model": "C", "c_entry_exit_rules_unchanged": True,
+            "total_open_model_positions": sum(v["summary"]["open"] for v in models.values()),
+            "total_closed_model_positions": sum(v["summary"]["closed"] for v in models.values()),
+            "by_model": models,
+            "limitations": ["Open PnL uses last observed bid, not a real-time quote",
+                            "Net open PnL subtracts assumed 0.15 percentage-point round-trip cost",
+                            "Models may share underlying symbols; positions are not independent",
+                            "Five-minute exit sampling can miss intrabar stops", "Paper only; no orders"]}
