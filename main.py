@@ -208,7 +208,9 @@ V90_STATE = {"started_utc": None, "last_scan": None, "last_error": None,
 V90_TASK = None
 V90_LOCK = None
 V90_MAX_TRADES = 1200
-V91_MODELS = ("C", "V91_PULLBACK", "V91_MOMENTUM", "V91_REGIME", "V913_PULLBACK_MARKET", "V913_PULLBACK_TRAIL15")
+V91_MODELS = ("C", "C_TREND", "C_TRAIL", "C_TIME60", "C_MARKET")
+V92_RETIRED = ("V91_PULLBACK", "V91_MOMENTUM", "V91_REGIME", "V913_PULLBACK_MARKET", "V913_PULLBACK_TRAIL15")
+V92_ALL_MODELS = V91_MODELS + V92_RETIRED
 V91_FROZEN = ("A", "B")
 V90_SCAN_SECONDS = 300
 V90_COST_PCT = 0.15
@@ -362,21 +364,21 @@ async def v90_monitor(client):
             t["last_bid"] = bid
             if t["variant"] == "B" and t["max_bid"] >= t["entry_price"] * 1.02:
                 t["stop_price"] = max(t["stop_price"], t["entry_price"])
-            if t["variant"] in V91_MODELS and not t.get("tp1_done") and bid >= t["entry_price"]*1.03:
+            if t["variant"] in V92_ALL_MODELS and not t.get("tp1_done") and bid >= t["entry_price"]*1.03:
                 t["tp1_done"] = True
                 t["tp1_price"] = bid
                 t["tp1_utc"] = utc_now()
             # V91.3 trail arm: activate only after +1.5% gross gain; trail 1.5% below highest observed bid.
             # Preserve original -3% hard stop until activation. This is sampled every 5 minutes.
-            if t["variant"] == "V913_PULLBACK_TRAIL15":
+            if t["variant"] in ("V913_PULLBACK_TRAIL15", "C_TRAIL"):
                 if t.get("trail_active") or t["max_bid"] >= t["entry_price"] * 1.015:
                     t["trail_active"] = True
                     t["stop_price"] = max(t["stop_price"], t["max_bid"] * 0.985)
             if bid <= t["stop_price"]:
-                v90_close(t, bid, "TRAIL15_MONITORED" if t["variant"] == "V913_PULLBACK_TRAIL15" and t.get("trail_active") else "STOP_MONITORED", now_ms)
-            elif now_ms >= t["entry_ms"] + 120*60000:
-                v90_close(t, bid, "TIME120", now_ms)
-            if t["status"] == "CLOSED_SHADOW" and t["variant"] in V91_MODELS and t.get("tp1_done"):
+                v90_close(t, bid, "TRAIL15_MONITORED" if t["variant"] in ("V913_PULLBACK_TRAIL15", "C_TRAIL") and t.get("trail_active") else "STOP_MONITORED", now_ms)
+            elif now_ms >= t["entry_ms"] + (60 if t["variant"] == "C_TIME60" else 120)*60000:
+                v90_close(t, bid, "TIME60" if t["variant"] == "C_TIME60" else "TIME120", now_ms)
+            if t["status"] == "CLOSED_SHADOW" and t["variant"] in V92_ALL_MODELS and t.get("tp1_done"):
                 t["net_pct"] = round(((((t["tp1_price"]/t["entry_price"])-1)*100)*0.5 +
                                       (((t["exit_price"]/t["entry_price"])-1)*100)*0.5 - V90_COST_PCT),5)
     closed_now = [t for t in active if t["status"] == "CLOSED_SHADOW" and not t.get("telegram_exit_attempted")]
@@ -477,11 +479,18 @@ async def v90_scan_once():
                     for model in V91_MODELS:
                         reason = None
                         ret, vol, z, breakout = c["ret60_pct"], c["volume_ratio"], c["z"], c["breakout_pct"]
-                        if model == "C":
-                            if not 2.5 <= ret <= 8.0: reason = "momentum_range"
-                            elif not 1.2 <= vol < 3.5: reason = "volume_range"
-                            elif z >= 3.5: reason = "z_extreme"
-                            elif not 0.2 <= breakout <= 1.5: reason = "breakout_range"
+                        if model in ("C", "C_TRAIL", "C_TIME60", "C_MARKET", "C_TREND"):
+                             if model == "C_MARKET" and (btc_ret60 is None or btc_ret60 < 0 or breadth is None or breadth < 0.50):
+                                 reason = "market_regime"
+                             if model == "C_TREND" and not 3.0 <= ret <= 7.0:
+                                 reason = "momentum_range"
+                             if model == "C_TREND" and not 1.5 <= vol < 3.5:
+                                 reason = "volume_range"
+                             if reason is None:
+                                 if not 2.5 <= ret <= 8.0: reason = "momentum_range"
+                                 elif not 1.2 <= vol < 3.5: reason = "volume_range"
+                                 elif z >= 3.5: reason = "z_extreme"
+                                 elif not 0.2 <= breakout <= 1.5: reason = "breakout_range"
                         elif model in ("V91_PULLBACK", "V913_PULLBACK_MARKET", "V913_PULLBACK_TRAIL15"):
                             if model == "V913_PULLBACK_MARKET" and (btc_ret60 is None or btc_ret60 < 0 or breadth is None or breadth < 0.50):
                                 reason = "market_regime"
@@ -596,16 +605,16 @@ async def v90_startup():
 
 @app.get("/v90-status")
 async def v90_status():
-    return {**MODE_INFO,"status":"OK","strategy":"V90_HYBRID_MOMENTUM", "diagnostic_version":"V91_3_MARKET_AND_TRAIL15_PAPER",
+    return {**MODE_INFO,"status":"OK","strategy":"V90_HYBRID_MOMENTUM", "diagnostic_version":"V92_C_FAMILY_PAPER",
             "paper_only":True,"orders":False,"auto_running":bool(V90_TASK and not V90_TASK.done()),
             "scan_interval_seconds":V90_SCAN_SECONDS,"last_scan":V90_STATE["last_scan"],
             "last_error":V90_STATE["last_error"],"total_signals":V90_STATE["signals"],
             "signal_delay_limit_seconds":V90_DELAY_SECONDS,"telegram":V90_STATE["telegram"],
             "memory_peak_mb":v903_memory_mb(), "checkpoint_path":str(V90_STATE_PATH),
             "frozen_legacy":V90_STATE["frozen_legacy"],
-            "frozen_models":list(V91_FROZEN), "active_models":list(V91_MODELS),
+            "frozen_models":list(V91_FROZEN + V92_RETIRED), "active_models":list(V91_MODELS),
             "variants":{v:v90_stats([t for t in V90_STATE["trades"] if t["variant"]==v])
-                        for v in (*V91_FROZEN, *V91_MODELS)},
+                        for v in (*V91_FROZEN, *V92_ALL_MODELS)},
             "recent_trades":V90_STATE["trades"][-24:],
             "limitations":["Checkpoint persistence requires a writable persistent mount and successful saves", "5-minute scan can miss signals", 
                            "Stop/TP monitored by quotes every 5 minutes; gaps and slippage possible",
@@ -660,7 +669,7 @@ def v914_bucket(value, bounds):
 @app.get("/v914-research-analysis")
 async def v914_research_analysis():
     closed = [t for t in V90_STATE["trades"] if t.get("status") == "CLOSED_SHADOW"
-              and t.get("variant") in V91_MODELS]
+              and t.get("variant") in V92_ALL_MODELS]
     dimensions = {
         "ret60_pct": [0, 0.5, 1, 2, 3, 5],
         "ret15_pct": [0, 0.3, 0.7, 1.5, 3],
@@ -740,7 +749,7 @@ async def v914_closed_trades(model: str = "ALL", limit: int = 500, offset: int =
             "note": "Read-only retained paper trade records; pagination via offset and limit."}
 
 
-# V91.6 read-only diagnostics. All entry/exit logic, including C, is unchanged.
+# V91.6 read-only diagnostics retained; V92 adds independent C variants.
 @app.get("/v916-performance")
 async def v916_performance():
     models = {}
@@ -778,3 +787,21 @@ async def v916_performance():
                             "Net open PnL subtracts assumed 0.15 percentage-point round-trip cost",
                             "Models may share underlying symbols; positions are not independent",
                             "Five-minute exit sampling can miss intrabar stops", "Paper only; no orders"]}
+
+
+@app.get("/v92-c-family")
+async def v92_c_family():
+    """Read-only C-family comparison. No paper positions or checkpoints modified."""
+    models = {}
+    for model in V91_MODELS:
+        rows = [t for t in V90_STATE["trades"] if t.get("variant") == model]
+        reasons = {}
+        for t in rows:
+            if t.get("status") == "CLOSED_SHADOW":
+                reasons.setdefault(t.get("exit_reason", "UNKNOWN"), []).append(t)
+        models[model] = {"summary": v90_stats(rows),
+                         "exit_reasons": {k: v90_stats(v) for k, v in reasons.items()}}
+    return {**MODE_INFO, "status": "OK", "version": "V92_C_FAMILY_PAPER",
+            "reference_model": "C", "c_rules_unchanged": True,
+            "active_models": list(V91_MODELS), "retired_no_new_entries": list(V92_RETIRED),
+            "by_model": models, "note": "Paper only; same symbols can be shared across models; no real orders."}
