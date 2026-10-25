@@ -209,6 +209,8 @@ V90_TASK = None
 V90_LOCK = None
 V90_MAX_TRADES = 1200
 V91_MODELS = ("C", "C_TREND", "C_TRAIL", "C_TIME60", "C_MARKET")
+V93_TP_TARGETS = {"C_TP1": 1.0, "C_TP2": 2.0, "C_TP3": 3.0, "C_TP4": 4.0}
+V93_ALL_ACTIVE = V91_MODELS + tuple(V93_TP_TARGETS)
 V92_RETIRED = ("V91_PULLBACK", "V91_MOMENTUM", "V91_REGIME", "V913_PULLBACK_MARKET", "V913_PULLBACK_TRAIL15")
 V92_ALL_MODELS = V91_MODELS + V92_RETIRED
 V91_FROZEN = ("A", "B")
@@ -374,7 +376,9 @@ async def v90_monitor(client):
                 if t.get("trail_active") or t["max_bid"] >= t["entry_price"] * 1.015:
                     t["trail_active"] = True
                     t["stop_price"] = max(t["stop_price"], t["max_bid"] * 0.985)
-            if bid <= t["stop_price"]:
+            if t["variant"] in V93_TP_TARGETS and bid >= t["entry_price"] * (1 + V93_TP_TARGETS[t["variant"]] / 100):
+                v90_close(t, bid, "FIXED_TP_MONITORED", now_ms)
+            elif bid <= t["stop_price"]:
                 v90_close(t, bid, "TRAIL15_MONITORED" if t["variant"] in ("V913_PULLBACK_TRAIL15", "C_TRAIL") and t.get("trail_active") else "STOP_MONITORED", now_ms)
             elif now_ms >= t["entry_ms"] + (60 if t["variant"] == "C_TIME60" else 120)*60000:
                 v90_close(t, bid, "TIME60" if t["variant"] == "C_TIME60" else "TIME120", now_ms)
@@ -412,8 +416,8 @@ async def v90_scan_once():
                 rejected = Counter()
                 near_misses = []
                 market_returns = []
-                model_rejected = {m: Counter() for m in V91_MODELS}
-                model_passed = {m: 0 for m in V91_MODELS}
+                model_rejected = {m: Counter() for m in V93_ALL_ACTIVE}
+                model_passed = {m: 0 for m in V93_ALL_ACTIVE}
                 # BTC is fetched once per scan for the regime research arm.
                 btc_candles = await get_completed_5m_candles(client, "BTCUSDT", limit=25)
                 btc_closes = [x["close"] for x in btc_candles]
@@ -471,15 +475,15 @@ async def v90_scan_once():
                                            "breadth_sample":len(market_returns)}
                 active_by_model = {v:{t["symbol"] for t in V90_STATE["trades"]
                                       if t["status"]=="OPEN_SHADOW" and t["variant"]==v}
-                                   for v in V91_MODELS}
+                                   for v in V93_ALL_ACTIVE}
                 for c in sorted(candidates,key=lambda r:r["ret60_pct"],reverse=True):
                     sym=c["symbol"]
                     key=f'{sym}:{c["signal_ms"]}'
                     selected = []
-                    for model in V91_MODELS:
+                    for model in V93_ALL_ACTIVE:
                         reason = None
                         ret, vol, z, breakout = c["ret60_pct"], c["volume_ratio"], c["z"], c["breakout_pct"]
-                        if model in ("C", "C_TRAIL", "C_TIME60", "C_MARKET", "C_TREND"):
+                        if model in ("C", "C_TRAIL", "C_TIME60", "C_MARKET", "C_TREND", *V93_TP_TARGETS):
                              if model == "C_MARKET" and (btc_ret60 is None or btc_ret60 < 0 or breadth is None or breadth < 0.50):
                                  reason = "market_regime"
                              if model == "C_TREND" and not 3.0 <= ret <= 7.0:
@@ -537,9 +541,11 @@ async def v90_scan_once():
                             for model in selected:
                                 model_rejected[model]["spread_too_wide" if spread>0.15 else "price_chase"] += 1
                             continue
-                        if spread > 0.12 and "C" in selected:
-                            selected.remove("C")
-                            model_rejected["C"]["c_spread"] += 1
+                        if spread > 0.12:
+                            for cm in ("C", *V93_TP_TARGETS):
+                                if cm in selected:
+                                    selected.remove(cm)
+                                    model_rejected[cm]["c_spread"] += 1
                         if not selected:continue
                         entry_ms=int(time.time()*1000)
                         for variant in selected:
@@ -567,7 +573,7 @@ async def v90_scan_once():
                     "rejected":dict(model_rejected[m]),
                     "new_positions":sum(t["variant"]==m and t["entry_ms"] >= scan_started_ms for t in V90_STATE["trades"]),
                     "post_filter_rejections":sum(n for reason,n in model_rejected[m].items() if reason in ("spread_too_wide", "price_chase", "invalid_quote", "c_spread", "entry_exception", "already_seen_or_open", "max_open_positions"))}
-                    for m in V91_MODELS}
+                    for m in V93_ALL_ACTIVE}
                 # Keep completed results for review, bounded RAM.
                 if len(V90_STATE["trades"])>V90_MAX_TRADES:
                     closed=[t for t in V90_STATE["trades"] if t["status"]=="CLOSED_SHADOW"]
@@ -612,9 +618,9 @@ async def v90_status():
             "signal_delay_limit_seconds":V90_DELAY_SECONDS,"telegram":V90_STATE["telegram"],
             "memory_peak_mb":v903_memory_mb(), "checkpoint_path":str(V90_STATE_PATH),
             "frozen_legacy":V90_STATE["frozen_legacy"],
-            "frozen_models":list(V91_FROZEN + V92_RETIRED), "active_models":list(V91_MODELS),
+            "frozen_models":list(V91_FROZEN + V92_RETIRED), "active_models":list(V93_ALL_ACTIVE),
             "variants":{v:v90_stats([t for t in V90_STATE["trades"] if t["variant"]==v])
-                        for v in (*V91_FROZEN, *V92_ALL_MODELS)},
+                        for v in (*V91_FROZEN, *V92_ALL_MODELS, *V93_TP_TARGETS)},
             "recent_trades":V90_STATE["trades"][-24:],
             "limitations":["Checkpoint persistence requires a writable persistent mount and successful saves", "5-minute scan can miss signals", 
                            "Stop/TP monitored by quotes every 5 minutes; gaps and slippage possible",
@@ -681,7 +687,7 @@ async def v914_research_analysis():
         "hold_minutes": [15, 30, 60, 90, 120],
     }
     by_model = {}
-    for model in V91_MODELS:
+    for model in V93_ALL_ACTIVE:
         rows = [t for t in closed if t.get("variant") == model]
         breakdowns = {}
         for field, bounds in dimensions.items():
@@ -753,7 +759,7 @@ async def v914_closed_trades(model: str = "ALL", limit: int = 500, offset: int =
 @app.get("/v916-performance")
 async def v916_performance():
     models = {}
-    for model in V91_MODELS:
+    for model in V93_ALL_ACTIVE:
         rows = [t for t in V90_STATE["trades"] if t.get("variant") == model]
         opened = [t for t in rows if t.get("status") == "OPEN_SHADOW"]
         closed = [t for t in rows if t.get("status") == "CLOSED_SHADOW"]
@@ -793,7 +799,7 @@ async def v916_performance():
 async def v92_c_family():
     """Read-only C-family comparison. No paper positions or checkpoints modified."""
     models = {}
-    for model in V91_MODELS:
+    for model in V93_ALL_ACTIVE:
         rows = [t for t in V90_STATE["trades"] if t.get("variant") == model]
         reasons = {}
         for t in rows:
@@ -803,5 +809,46 @@ async def v92_c_family():
                          "exit_reasons": {k: v90_stats(v) for k, v in reasons.items()}}
     return {**MODE_INFO, "status": "OK", "version": "V92_C_FAMILY_PAPER",
             "reference_model": "C", "c_rules_unchanged": True,
-            "active_models": list(V91_MODELS), "retired_no_new_entries": list(V92_RETIRED),
+            "active_models": list(V93_ALL_ACTIVE), "retired_no_new_entries": list(V92_RETIRED),
             "by_model": models, "note": "Paper only; same symbols can be shared across models; no real orders."}
+
+
+@app.get("/v93-c-fixed-tp")
+async def v93_c_fixed_tp():
+    """Read-only side-by-side comparison; original C is untouched."""
+    models = ("C", *V93_TP_TARGETS)
+    result = {}
+    for model in models:
+        rows = [t for t in V90_STATE["trades"] if t.get("variant") == model]
+        closed = [t for t in rows if t.get("status") == "CLOSED_SHADOW"]
+        reasons = {}
+        for t in closed:
+            reason = t.get("exit_reason", "UNKNOWN")
+            reasons[reason] = reasons.get(reason, 0) + 1
+        result[model] = {
+            "take_profit_pct": V93_TP_TARGETS.get(model),
+            "summary": v90_stats(rows),
+            "exit_counts": reasons,
+            "recent_closed": [
+                {"symbol": t["symbol"], "net_pct": t.get("net_pct"),
+                 "exit_reason": t.get("exit_reason"),
+                 "hold_minutes": t.get("hold_minutes")}
+                for t in closed[-12:]
+            ],
+        }
+    return {**MODE_INFO, "version": "V93_C_FIXED_TP_PAPER",
+            "status": "RESEARCH_ONLY", "reference_model": "C",
+            "c_rules_unchanged": True,
+            "fixed_tp_full_position": True,
+            "stop_loss_pct": -3.0, "time_exit_minutes": 120,
+            "assumed_round_trip_cost_pct": V90_COST_PCT,
+            "exit_monitoring_interval_seconds": V90_SCAN_SECONDS,
+            "by_model": result,
+            "limitations": [
+                "Fixed TP is checked at the observed bid every scan, not continuously",
+                "An intrabar TP touch may be missed; observed exit may differ from target",
+                "TP and stop are sampled; gaps and slippage may affect realized returns",
+                "All variants are shadow trades only; no actual orders",
+                "Existing C keeps its original +3% half-profit and remaining position logic",
+                "Overlapping symbols are correlated, not independent samples",
+            ]}
