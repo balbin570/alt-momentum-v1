@@ -210,7 +210,10 @@ V90_LOCK = None
 V90_MAX_TRADES = 1200
 V91_MODELS = ("C", "C_TREND", "C_TRAIL", "C_TIME60", "C_MARKET")
 V93_TP_TARGETS = {"C_TP1": 1.0, "C_TP2": 2.0, "C_TP3": 3.0, "C_TP4": 4.0}
-V93_ALL_ACTIVE = V91_MODELS + tuple(V93_TP_TARGETS)
+# V93 risk research arms: C itself and all previous models remain unchanged.
+V93_RISK_MODELS = ("C_SL2", "C_SL25", "C_BE", "C_TP2_SL25")
+V93_RISK_STOPS = {"C_SL2": 0.98, "C_SL25": 0.975, "C_TP2_SL25": 0.975}
+V93_ALL_ACTIVE = V91_MODELS + tuple(V93_TP_TARGETS) + V93_RISK_MODELS
 V92_RETIRED = ("V91_PULLBACK", "V91_MOMENTUM", "V91_REGIME", "V913_PULLBACK_MARKET", "V913_PULLBACK_TRAIL15")
 V92_ALL_MODELS = V91_MODELS + V92_RETIRED
 V91_FROZEN = ("A", "B")
@@ -366,7 +369,7 @@ async def v90_monitor(client):
             t["last_bid"] = bid
             if t["variant"] == "B" and t["max_bid"] >= t["entry_price"] * 1.02:
                 t["stop_price"] = max(t["stop_price"], t["entry_price"])
-            if t["variant"] in V92_ALL_MODELS and not t.get("tp1_done") and bid >= t["entry_price"]*1.03:
+            if (t["variant"] in V92_ALL_MODELS or t["variant"] in ("C_SL2", "C_SL25", "C_BE")) and not t.get("tp1_done") and bid >= t["entry_price"]*1.03:
                 t["tp1_done"] = True
                 t["tp1_price"] = bid
                 t["tp1_utc"] = utc_now()
@@ -376,13 +379,19 @@ async def v90_monitor(client):
                 if t.get("trail_active") or t["max_bid"] >= t["entry_price"] * 1.015:
                     t["trail_active"] = True
                     t["stop_price"] = max(t["stop_price"], t["max_bid"] * 0.985)
-            if t["variant"] in V93_TP_TARGETS and bid >= t["entry_price"] * (1 + V93_TP_TARGETS[t["variant"]] / 100):
+            # New independent C_BE research arm; no change to baseline C.
+            if t["variant"] == "C_BE" and t["max_bid"] >= t["entry_price"] * 1.015:
+                t["be_armed"] = True
+                t["stop_price"] = max(t["stop_price"], t["entry_price"])
+            if t["variant"] == "C_TP2_SL25" and bid >= t["entry_price"] * 1.02:
+                v90_close(t, bid, "FIXED_TP_MONITORED", now_ms)
+            elif t["variant"] in V93_TP_TARGETS and bid >= t["entry_price"] * (1 + V93_TP_TARGETS[t["variant"]] / 100):
                 v90_close(t, bid, "FIXED_TP_MONITORED", now_ms)
             elif bid <= t["stop_price"]:
                 v90_close(t, bid, "TRAIL15_MONITORED" if t["variant"] in ("V913_PULLBACK_TRAIL15", "C_TRAIL") and t.get("trail_active") else "STOP_MONITORED", now_ms)
             elif now_ms >= t["entry_ms"] + (60 if t["variant"] == "C_TIME60" else 120)*60000:
                 v90_close(t, bid, "TIME60" if t["variant"] == "C_TIME60" else "TIME120", now_ms)
-            if t["status"] == "CLOSED_SHADOW" and t["variant"] in V92_ALL_MODELS and t.get("tp1_done"):
+            if t["status"] == "CLOSED_SHADOW" and (t["variant"] in V92_ALL_MODELS or t["variant"] in ("C_SL2", "C_SL25", "C_BE")) and t.get("tp1_done"):
                 t["net_pct"] = round(((((t["tp1_price"]/t["entry_price"])-1)*100)*0.5 +
                                       (((t["exit_price"]/t["entry_price"])-1)*100)*0.5 - V90_COST_PCT),5)
     closed_now = [t for t in active if t["status"] == "CLOSED_SHADOW" and not t.get("telegram_exit_attempted")]
@@ -483,7 +492,7 @@ async def v90_scan_once():
                     for model in V93_ALL_ACTIVE:
                         reason = None
                         ret, vol, z, breakout = c["ret60_pct"], c["volume_ratio"], c["z"], c["breakout_pct"]
-                        if model in ("C", "C_TRAIL", "C_TIME60", "C_MARKET", "C_TREND", *V93_TP_TARGETS):
+                        if model in ("C", "C_TRAIL", "C_TIME60", "C_MARKET", "C_TREND", *V93_TP_TARGETS, *V93_RISK_MODELS):
                              if model == "C_MARKET" and (btc_ret60 is None or btc_ret60 < 0 or breadth is None or breadth < 0.50):
                                  reason = "market_regime"
                              if model == "C_TREND" and not 3.0 <= ret <= 7.0:
@@ -542,7 +551,7 @@ async def v90_scan_once():
                                 model_rejected[model]["spread_too_wide" if spread>0.15 else "price_chase"] += 1
                             continue
                         if spread > 0.12:
-                            for cm in ("C", *V93_TP_TARGETS):
+                            for cm in ("C", *V93_TP_TARGETS, *V93_RISK_MODELS):
                                 if cm in selected:
                                     selected.remove(cm)
                                     model_rejected[cm]["c_spread"] += 1
@@ -551,9 +560,9 @@ async def v90_scan_once():
                         for variant in selected:
                             V90_STATE["trades"].append({**c,"variant":variant,"status":"OPEN_SHADOW",
                                 "entry_utc":utc_now(),"entry_ms":entry_ms,"entry_price":ask,
-                                "stop_price":ask*0.97,"spread_pct":round(spread,5),
+                                "stop_price":ask*V93_RISK_STOPS.get(variant, 0.97),"spread_pct":round(spread,5),
                                 "chase_pct":round(chase,5),"max_bid":ask,"min_bid":ask,
-                                "tp1_done":False,"trail_active":False,"research_only":True})
+                                "tp1_done":False,"trail_active":False,"research_only":True,"be_armed":False})
                             active_by_model[variant].add(sym)
                         for variant in selected:
                             V90_STATE["seen"][f"{variant}:{key}"]=entry_ms
@@ -611,7 +620,7 @@ async def v90_startup():
 
 @app.get("/v90-status")
 async def v90_status():
-    return {**MODE_INFO,"status":"OK","strategy":"V90_HYBRID_MOMENTUM", "diagnostic_version":"V92_C_FAMILY_PAPER",
+    return {**MODE_INFO,"status":"OK","strategy":"V90_HYBRID_MOMENTUM", "diagnostic_version":"V93_C_RISK_FAMILY_PAPER",
             "paper_only":True,"orders":False,"auto_running":bool(V90_TASK and not V90_TASK.done()),
             "scan_interval_seconds":V90_SCAN_SECONDS,"last_scan":V90_STATE["last_scan"],
             "last_error":V90_STATE["last_error"],"total_signals":V90_STATE["signals"],
@@ -620,7 +629,7 @@ async def v90_status():
             "frozen_legacy":V90_STATE["frozen_legacy"],
             "frozen_models":list(V91_FROZEN + V92_RETIRED), "active_models":list(V93_ALL_ACTIVE),
             "variants":{v:v90_stats([t for t in V90_STATE["trades"] if t["variant"]==v])
-                        for v in (*V91_FROZEN, *V92_ALL_MODELS, *V93_TP_TARGETS)},
+                        for v in (*V91_FROZEN, *V92_ALL_MODELS, *V93_TP_TARGETS, *V93_RISK_MODELS)},
             "recent_trades":V90_STATE["trades"][-24:],
             "limitations":["Checkpoint persistence requires a writable persistent mount and successful saves", "5-minute scan can miss signals", 
                            "Stop/TP monitored by quotes every 5 minutes; gaps and slippage possible",
@@ -852,3 +861,54 @@ async def v93_c_fixed_tp():
                 "Existing C keeps its original +3% half-profit and remaining position logic",
                 "Overlapping symbols are correlated, not independent samples",
             ]}
+
+
+@app.get("/v93-c-risk-family")
+async def v93_c_risk_family():
+    """Read-only paper research. Never changes C, trades, or checkpoint."""
+    models = ("C", *V93_RISK_MODELS)
+    by_model = {}
+    for model in models:
+        rows = [t for t in V90_STATE["trades"] if t.get("variant") == model]
+        reasons = {}
+        for t in rows:
+            if t.get("status") == "CLOSED_SHADOW":
+                reasons.setdefault(t.get("exit_reason", "UNKNOWN"), []).append(t)
+        by_model[model] = {"summary": v90_stats(rows),
+                           "exit_reasons": {k: v90_stats(v) for k, v in reasons.items()}}
+    closed = [t for t in V90_STATE["trades"] if t.get("status") == "CLOSED_SHADOW" and t.get("variant") in models]
+    paired = {}
+    for t in closed:
+        paired.setdefault((t.get("symbol"), t.get("entry_ms")), {})[t["variant"]] = t
+    comparisons = {}
+    for model in V93_RISK_MODELS:
+        matches = []
+        for (symbol, entry_ms), records in paired.items():
+            if "C" in records and model in records:
+                c, variant = records["C"], records[model]
+                matches.append({"symbol": symbol, "entry_ms": entry_ms,
+                                "c_net_pct": c["net_pct"], "variant_net_pct": variant["net_pct"],
+                                "difference_pct_points": round(variant["net_pct"] - c["net_pct"], 5),
+                                "c_exit": c.get("exit_reason"), "variant_exit": variant.get("exit_reason")})
+        differences = [x["difference_pct_points"] for x in matches]
+        comparisons[model] = {"matched_closed_pairs": len(matches),
+                              "mean_difference_pct_points": round(sum(differences) / len(differences), 5) if differences else None,
+                              "better": sum(x > 0 for x in differences),
+                              "worse": sum(x < 0 for x in differences),
+                              "equal": sum(x == 0 for x in differences),
+                              "recent_pairs": matches[-30:]}
+    return {**MODE_INFO, "status": "RESEARCH_ONLY", "version": "V93_C_RISK_FAMILY_PAPER",
+            "reference_model": "C", "c_rules_unchanged": True,
+            "risk_variants": {"C_SL2": "C entry, -2% initial stop, original C half TP at +3%",
+                              "C_SL25": "C entry, -2.5% initial stop, original C half TP at +3%",
+                              "C_BE": "C entry, original -3% stop; after observed +1.5% bid, stop raised to entry; original C half TP at +3%",
+                              "C_TP2_SL25": "C entry, -2.5% stop, full exit at observed +2% bid, no half TP"},
+            "by_model": by_model, "paired_vs_C": comparisons,
+            "assumed_round_trip_cost_pct": V90_COST_PCT,
+            "monitor_interval_seconds": V90_SCAN_SECONDS,
+            "limitations": ["Only positions opened after deployment participate in new variants",
+                            "Pairs require both trades closed and matching symbol and entry_ms",
+                            "Stops and take profits are checked at observed bids every ~5 minutes, not continuously",
+                            "Breakeven at entry price does not imply net breakeven after costs",
+                            "Same symbols and entry times across models are correlated",
+                            "No actual orders, fills or real-money execution"]}
