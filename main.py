@@ -214,7 +214,8 @@ V93_TP_TARGETS = {"C_TP1": 1.0, "C_TP2": 2.0, "C_TP3": 3.0, "C_TP4": 4.0}
 V93_RISK_MODELS = ("C_SL2", "C_SL25", "C_BE", "C_TP2_SL25")
 V93_RISK_STOPS = {"C_SL2": 0.98, "C_SL25": 0.975, "C_TP2_SL25": 0.975}
 V94_MODELS = ("V94_A", "V94_B", "V94_C")
-V93_ALL_ACTIVE = V91_MODELS + tuple(V93_TP_TARGETS) + V93_RISK_MODELS + V94_MODELS
+V95_MODELS = ("V95_EARLY5", "V95_EARLY10")
+V93_ALL_ACTIVE = V91_MODELS + tuple(V93_TP_TARGETS) + V93_RISK_MODELS + V94_MODELS + V95_MODELS
 V92_RETIRED = ("V91_PULLBACK", "V91_MOMENTUM", "V91_REGIME", "V913_PULLBACK_MARKET", "V913_PULLBACK_TRAIL15")
 V92_ALL_MODELS = V91_MODELS + V92_RETIRED
 V91_FROZEN = ("A", "B")
@@ -368,9 +369,17 @@ async def v90_monitor(client):
             t["max_bid"] = max(t.get("max_bid",t["entry_price"]), bid)
             t["min_bid"] = min(t.get("min_bid",t["entry_price"]), bid)
             t["last_bid"] = bid
+            # V95: snapshot earliest available monitored bid at/after 5m and 10m.
+            # Capture from baseline C only, without modifying its exits.
+            if t["variant"] == "C":
+                for minute in (5, 10):
+                    field = f"early_{minute}m"
+                    if field not in t and now_ms >= t["entry_ms"] + minute * 60000:
+                        t[field] = {"observed_ms": now_ms,
+                                    "gross_pct": round((bid / t["entry_price"] - 1) * 100, 5)}
             if t["variant"] == "B" and t["max_bid"] >= t["entry_price"] * 1.02:
                 t["stop_price"] = max(t["stop_price"], t["entry_price"])
-            if (t["variant"] in V92_ALL_MODELS or t["variant"] in ("C_SL2", "C_SL25", "C_BE", *V94_MODELS)) and not t.get("tp1_done") and bid >= t["entry_price"]*1.03:
+            if (t["variant"] in V92_ALL_MODELS or t["variant"] in ("C_SL2", "C_SL25", "C_BE", *V94_MODELS, *V95_MODELS)) and not t.get("tp1_done") and bid >= t["entry_price"]*1.03:
                 t["tp1_done"] = True
                 t["tp1_price"] = bid
                 t["tp1_utc"] = utc_now()
@@ -392,7 +401,7 @@ async def v90_monitor(client):
                 v90_close(t, bid, "TRAIL15_MONITORED" if t["variant"] in ("V913_PULLBACK_TRAIL15", "C_TRAIL") and t.get("trail_active") else "STOP_MONITORED", now_ms)
             elif now_ms >= t["entry_ms"] + (60 if t["variant"] == "C_TIME60" else 120)*60000:
                 v90_close(t, bid, "TIME60" if t["variant"] == "C_TIME60" else "TIME120", now_ms)
-            if t["status"] == "CLOSED_SHADOW" and (t["variant"] in V92_ALL_MODELS or t["variant"] in ("C_SL2", "C_SL25", "C_BE", *V94_MODELS)) and t.get("tp1_done"):
+            if t["status"] == "CLOSED_SHADOW" and (t["variant"] in V92_ALL_MODELS or t["variant"] in ("C_SL2", "C_SL25", "C_BE", *V94_MODELS, *V95_MODELS)) and t.get("tp1_done"):
                 t["net_pct"] = round(((((t["tp1_price"]/t["entry_price"])-1)*100)*0.5 +
                                       (((t["exit_price"]/t["entry_price"])-1)*100)*0.5 - V90_COST_PCT),5)
     closed_now = [t for t in active if t["status"] == "CLOSED_SHADOW" and not t.get("telegram_exit_attempted")]
@@ -448,6 +457,42 @@ def v94_regime(now_ms):
         outcome[model] = {"mode": mode, "max_open": 10 if mode == "BOOST" else 5,
                           "until_utc": datetime.fromtimestamp(until_ms / 1000, timezone.utc).isoformat() if until_ms else None}
     return outcome
+
+
+def v95_regime(now_ms):
+    """Early unrealized C PnL, timestamped at observation; never use final exit PnL.
+
+    Latest eligible observation wins. After negative: PAUSE 10m; after positive:
+    BOOST 10m (capacity 10). Neutral observations produce NORMAL.
+    """
+    outcomes = {}
+    for model, minute in (("V95_EARLY5", 5), ("V95_EARLY10", 10)):
+        observations = []
+        for trade in V90_STATE["trades"]:
+            if trade.get("variant") != "C":
+                continue
+            snapshot = trade.get(f"early_{minute}m")
+            if not isinstance(snapshot, dict):
+                continue
+            obs_ms = snapshot.get("observed_ms")
+            if not isinstance(obs_ms, (int, float)) or obs_ms > now_ms:
+                continue
+            observations.append((obs_ms, trade.get("entry_ms", 0), trade, snapshot))
+        observations.sort(key=lambda x: (x[0], x[1]))
+        mode, until_ms, signal = "NORMAL", None, None
+        if observations:
+            obs_ms, _, trade, snapshot = observations[-1]
+            pnl = snapshot["gross_pct"]
+            signal = {"symbol": trade["symbol"], "entry_ms": trade["entry_ms"],
+                      "observed_utc": datetime.fromtimestamp(obs_ms / 1000, timezone.utc).isoformat(),
+                      "gross_pct": pnl}
+            if now_ms < obs_ms + 600000:
+                mode = "PAUSE" if pnl < 0 else ("BOOST" if pnl > 0 else "NORMAL")
+                until_ms = obs_ms + 600000 if mode != "NORMAL" else None
+        outcomes[model] = {"mode": mode, "max_open": 10 if mode == "BOOST" else 5,
+                           "until_utc": datetime.fromtimestamp(until_ms / 1000, timezone.utc).isoformat() if until_ms else None,
+                           "source": signal}
+    return outcomes
 
 
 async def v90_scan_once():
@@ -527,6 +572,8 @@ async def v90_scan_once():
                                            "breadth_sample":len(market_returns)}
                 regimes = v94_regime(scan_started_ms)
                 scan["v94_regime"] = regimes
+                early_regimes = v95_regime(scan_started_ms)
+                scan["v95_regime"] = early_regimes
                 active_by_model = {v:{t["symbol"] for t in V90_STATE["trades"]
                                       if t["status"]=="OPEN_SHADOW" and t["variant"]==v}
                                    for v in V93_ALL_ACTIVE}
@@ -537,7 +584,7 @@ async def v90_scan_once():
                     for model in V93_ALL_ACTIVE:
                         reason = None
                         ret, vol, z, breakout = c["ret60_pct"], c["volume_ratio"], c["z"], c["breakout_pct"]
-                        if model in ("C", "C_TRAIL", "C_TIME60", "C_MARKET", "C_TREND", *V93_TP_TARGETS, *V93_RISK_MODELS, *V94_MODELS):
+                        if model in ("C", "C_TRAIL", "C_TIME60", "C_MARKET", "C_TREND", *V93_TP_TARGETS, *V93_RISK_MODELS, *V94_MODELS, *V95_MODELS):
                              if model == "C_MARKET" and (btc_ret60 is None or btc_ret60 < 0 or breadth is None or breadth < 0.50):
                                  reason = "market_regime"
                              if model == "C_TREND" and not 3.0 <= ret <= 7.0:
@@ -578,9 +625,11 @@ async def v90_scan_once():
                             # Dedup per model so one model cannot block another.
                             if model in V94_MODELS and regimes[model]["mode"] == "PAUSE":
                                 model_rejected[model]["regime_pause"] += 1
+                            elif model in V95_MODELS and early_regimes[model]["mode"] == "PAUSE":
+                                model_rejected[model]["regime_pause"] += 1
                             elif f"{model}:{key}" in V90_STATE["seen"] or sym in active_by_model[model]:
                                 model_rejected[model]["already_seen_or_open"] += 1
-                            elif len(active_by_model[model]) >= (regimes[model]["max_open"] if model in V94_MODELS else 5):
+                            elif len(active_by_model[model]) >= (regimes[model]["max_open"] if model in V94_MODELS else early_regimes[model]["max_open"] if model in V95_MODELS else 5):
                                 model_rejected[model]["max_open_positions"] += 1
                             else:
                                 selected.append(model)
@@ -598,7 +647,7 @@ async def v90_scan_once():
                                 model_rejected[model]["spread_too_wide" if spread>0.15 else "price_chase"] += 1
                             continue
                         if spread > 0.12:
-                            for cm in ("C", *V93_TP_TARGETS, *V93_RISK_MODELS, *V94_MODELS):
+                            for cm in ("C", *V93_TP_TARGETS, *V93_RISK_MODELS, *V94_MODELS, *V95_MODELS):
                                 if cm in selected:
                                     selected.remove(cm)
                                     model_rejected[cm]["c_spread"] += 1
@@ -992,3 +1041,30 @@ async def v94_regime_report():
                             "If C filters yield fewer than 5 concurrent signals, boost cannot add trades",
                             "New arms have no retroactive positions; histories and exposure differ",
                             "Sampled stops can exceed nominal stop; no actual exchange orders"]}
+
+
+@app.get("/v95-early-regime-report")
+async def v95_early_regime_report():
+    """Read-only early-PnL regime arms. C and C_SL2 unchanged."""
+    rows = V90_STATE["trades"]
+    regimes = v95_regime(int(time.time() * 1000))
+    filters = (V90_STATE.get("last_scan") or {}).get("model_filters") or {}
+    return {**MODE_INFO, "version": "V95_EARLY_REGIME_PAPER", "status": "RESEARCH_ONLY",
+            "paper_only": True, "trading": False, "orders": False,
+            "c_rules_unchanged": True, "c_sl2_rules_unchanged": True,
+            "baseline_C": v90_stats([t for t in rows if t.get("variant") == "C"]),
+            "baseline_C_SL2": v90_stats([t for t in rows if t.get("variant") == "C_SL2"]),
+            "models": {m: {"summary": v90_stats([t for t in rows if t.get("variant") == m]),
+                            "regime": regimes[m], "last_scan_filters": filters.get(m, {}),
+                            "recent_closed": [{"symbol": t["symbol"], "net_pct": t.get("net_pct"),
+                                               "exit_utc": t.get("exit_utc")}
+                                              for t in rows if t.get("variant") == m and t.get("status") == "CLOSED_SHADOW"][-15:]}
+                       for m in V95_MODELS},
+            "rules": {"V95_EARLY5": "C observed gross PnL at first monitor >=5m: loss PAUSE 10m; profit BOOST capacity 10 for 10m",
+                      "V95_EARLY10": "C observed gross PnL at first monitor >=10m: loss PAUSE 10m; profit BOOST capacity 10 for 10m"},
+            "limitations": ["Only C observations recorded after deployment count; old trades cannot be reconstructed",
+                            "Monitored every ~5 minutes: observations may occur later than exact 5m or 10m",
+                            "Signals come from baseline C, not other arms; avoids duplicate correlated votes",
+                            "Existing open positions are never force-closed by PAUSE",
+                            "BOOST raises capacity only; does not relax C entry filters",
+                            "No real orders; results are paper estimates"]}
