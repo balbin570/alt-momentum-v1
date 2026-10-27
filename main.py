@@ -215,7 +215,8 @@ V93_RISK_MODELS = ("C_SL2", "C_SL25", "C_BE", "C_TP2_SL25")
 V93_RISK_STOPS = {"C_SL2": 0.98, "C_SL25": 0.975, "C_TP2_SL25": 0.975}
 V94_MODELS = ("V94_A", "V94_B", "V94_C")
 V95_MODELS = ("V95_EARLY5", "V95_EARLY10")
-V93_ALL_ACTIVE = V91_MODELS + tuple(V93_TP_TARGETS) + V93_RISK_MODELS + V94_MODELS + V95_MODELS
+V96_RETIRED = V94_MODELS  # no NEW V94 entries; historical open trades still monitored
+V93_ALL_ACTIVE = V91_MODELS + tuple(V93_TP_TARGETS) + V93_RISK_MODELS + V95_MODELS
 V92_RETIRED = ("V91_PULLBACK", "V91_MOMENTUM", "V91_REGIME", "V913_PULLBACK_MARKET", "V913_PULLBACK_TRAIL15")
 V92_ALL_MODELS = V91_MODELS + V92_RETIRED
 V91_FROZEN = ("A", "B")
@@ -660,6 +661,12 @@ async def v90_scan_once():
                                 "chase_pct":round(chase,5),"max_bid":ask,"min_bid":ask,
                                 "tp1_done":False,"trail_active":False,"research_only":True,"be_armed":False})
                             active_by_model[variant].add(sym)
+                        # V96: baseline C trade records which V95 pauses would have skipped it.
+                        if "C" in selected:
+                            for trade in reversed(V90_STATE["trades"]):
+                                if trade.get("variant") == "C" and trade.get("entry_ms") == entry_ms and trade.get("symbol") == sym:
+                                    trade["v96_early_decisions"] = {m: {"mode": early_regimes[m]["mode"], "would_block": early_regimes[m]["mode"] == "PAUSE"} for m in V95_MODELS}
+                                    break
                         for variant in selected:
                             V90_STATE["seen"][f"{variant}:{key}"]=entry_ms
                         scan["new_coins"]+=1
@@ -723,7 +730,7 @@ async def v90_status():
             "signal_delay_limit_seconds":V90_DELAY_SECONDS,"telegram":V90_STATE["telegram"],
             "memory_peak_mb":v903_memory_mb(), "checkpoint_path":str(V90_STATE_PATH),
             "frozen_legacy":V90_STATE["frozen_legacy"],
-            "frozen_models":list(V91_FROZEN + V92_RETIRED), "active_models":list(V93_ALL_ACTIVE),
+            "frozen_models":list(V91_FROZEN + V92_RETIRED + V96_RETIRED), "active_models":list(V93_ALL_ACTIVE),
             "variants":{v:v90_stats([t for t in V90_STATE["trades"] if t["variant"]==v])
                         for v in (*V91_FROZEN, *V92_ALL_MODELS, *V93_TP_TARGETS, *V93_RISK_MODELS)},
             "recent_trades":V90_STATE["trades"][-24:],
@@ -1068,3 +1075,29 @@ async def v95_early_regime_report():
                             "Existing open positions are never force-closed by PAUSE",
                             "BOOST raises capacity only; does not relax C entry filters",
                             "No real orders; results are paper estimates"]}
+
+
+@app.get("/v96-opportunity-report")
+async def v96_opportunity_report():
+    """Read-only paper comparison of actual C entries against V95 pause decisions."""
+    c = [t for t in V90_STATE["trades"] if t.get("variant") == "C"]
+    result = {}
+    for model in V95_MODELS:
+        tagged = [t for t in c if model in t.get("v96_early_decisions", {})]
+        blocked = [t for t in tagged if t["v96_early_decisions"][model]["would_block"]]
+        closed = [t for t in blocked if t.get("status") == "CLOSED_SHADOW" and isinstance(t.get("net_pct"), (int, float))]
+        result[model] = {"observed_C_entries": len(tagged), "would_block": len(blocked),
+                         "blocked_closed": len(closed), "blocked_still_open": len(blocked)-len(closed),
+                         "losers_avoided": sum(t["net_pct"] < 0 for t in closed),
+                         "winners_missed": sum(t["net_pct"] > 0 for t in closed),
+                         "sum_blocked_C_net_pct": round(sum(t["net_pct"] for t in closed), 5),
+                         "estimated_avoided_pct_points": round(-sum(t["net_pct"] for t in closed), 5),
+                         "recent": [{"symbol":t["symbol"], "net_pct":t["net_pct"], "exit_utc":t.get("exit_utc")} for t in closed[-20:]]}
+    return {**MODE_INFO, "version":"V96_OPPORTUNITY_PAPER", "paper_only":True,
+            "c_rules_unchanged":True, "c_sl2_rules_unchanged":True,
+            "retired_no_new_entries":list(V96_RETIRED), "active_models":list(V93_ALL_ACTIVE),
+            "baseline_C":v90_stats(c), "comparison":result,
+            "limitations":["Only actual baseline C entries after V96 deployment are evaluated; not all possible candidate signals.",
+                           "Avoided results assume skipping the C trade does not affect other entries.",
+                           "BOOST extra entries not independently evaluated.",
+                           "No checkpoint data deleted; existing retired positions finish normally."]}
