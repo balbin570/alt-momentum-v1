@@ -216,7 +216,11 @@ V93_RISK_STOPS = {"C_SL2": 0.98, "C_SL25": 0.975, "C_TP2_SL25": 0.975}
 V94_MODELS = ("V94_A", "V94_B", "V94_C")
 V95_MODELS = ("V95_EARLY5", "V95_EARLY10")
 V96_RETIRED = V94_MODELS  # no NEW V94 entries; historical open trades still monitored
-V93_ALL_ACTIVE = V91_MODELS + tuple(V93_TP_TARGETS) + V93_RISK_MODELS + V95_MODELS
+V97_TRAIL_MODELS = ("C_SL5_TRAIL5", "C_SL10_TRAIL5")
+V97_TRAIL_STOPS = {"C_SL5_TRAIL5": 0.95, "C_SL10_TRAIL5": 0.90}
+# Only these seven models may open NEW paper trades.
+# Previously opened trades from retired models are still monitored to closure.
+V93_ALL_ACTIVE = ("C", "C_SL2", "C_TREND", *V95_MODELS, *V97_TRAIL_MODELS)
 V92_RETIRED = ("V91_PULLBACK", "V91_MOMENTUM", "V91_REGIME", "V913_PULLBACK_MARKET", "V913_PULLBACK_TRAIL15")
 V92_ALL_MODELS = V91_MODELS + V92_RETIRED
 V91_FROZEN = ("A", "B")
@@ -390,6 +394,12 @@ async def v90_monitor(client):
                 if t.get("trail_active") or t["max_bid"] >= t["entry_price"] * 1.015:
                     t["trail_active"] = True
                     t["stop_price"] = max(t["stop_price"], t["max_bid"] * 0.985)
+            # V97: +5% activation, then 5% below the highest observed bid.
+            # Before activation the initial -5% / -10% stop remains in force.
+            if t["variant"] in V97_TRAIL_MODELS:
+                if t.get("trail_active") or t["max_bid"] >= t["entry_price"] * 1.05:
+                    t["trail_active"] = True
+                    t["stop_price"] = max(t["stop_price"], t["max_bid"] * 0.95)
             # New independent C_BE research arm; no change to baseline C.
             if t["variant"] == "C_BE" and t["max_bid"] >= t["entry_price"] * 1.015:
                 t["be_armed"] = True
@@ -399,7 +409,9 @@ async def v90_monitor(client):
             elif t["variant"] in V93_TP_TARGETS and bid >= t["entry_price"] * (1 + V93_TP_TARGETS[t["variant"]] / 100):
                 v90_close(t, bid, "FIXED_TP_MONITORED", now_ms)
             elif bid <= t["stop_price"]:
-                v90_close(t, bid, "TRAIL15_MONITORED" if t["variant"] in ("V913_PULLBACK_TRAIL15", "C_TRAIL") and t.get("trail_active") else "STOP_MONITORED", now_ms)
+                v90_close(t, bid, ("TRAIL5_MONITORED" if t["variant"] in V97_TRAIL_MODELS and t.get("trail_active")
+                                  else "TRAIL15_MONITORED" if t["variant"] in ("V913_PULLBACK_TRAIL15", "C_TRAIL") and t.get("trail_active")
+                                  else "STOP_MONITORED"), now_ms)
             elif now_ms >= t["entry_ms"] + (60 if t["variant"] == "C_TIME60" else 120)*60000:
                 v90_close(t, bid, "TIME60" if t["variant"] == "C_TIME60" else "TIME120", now_ms)
             if t["status"] == "CLOSED_SHADOW" and (t["variant"] in V92_ALL_MODELS or t["variant"] in ("C_SL2", "C_SL25", "C_BE", *V94_MODELS, *V95_MODELS)) and t.get("tp1_done"):
@@ -585,7 +597,7 @@ async def v90_scan_once():
                     for model in V93_ALL_ACTIVE:
                         reason = None
                         ret, vol, z, breakout = c["ret60_pct"], c["volume_ratio"], c["z"], c["breakout_pct"]
-                        if model in ("C", "C_TRAIL", "C_TIME60", "C_MARKET", "C_TREND", *V93_TP_TARGETS, *V93_RISK_MODELS, *V94_MODELS, *V95_MODELS):
+                        if model in ("C", "C_TRAIL", "C_TIME60", "C_MARKET", "C_TREND", *V93_TP_TARGETS, *V93_RISK_MODELS, *V94_MODELS, *V95_MODELS, *V97_TRAIL_MODELS):
                              if model == "C_MARKET" and (btc_ret60 is None or btc_ret60 < 0 or breadth is None or breadth < 0.50):
                                  reason = "market_regime"
                              if model == "C_TREND" and not 3.0 <= ret <= 7.0:
@@ -648,7 +660,7 @@ async def v90_scan_once():
                                 model_rejected[model]["spread_too_wide" if spread>0.15 else "price_chase"] += 1
                             continue
                         if spread > 0.12:
-                            for cm in ("C", *V93_TP_TARGETS, *V93_RISK_MODELS, *V94_MODELS, *V95_MODELS):
+                            for cm in ("C", *V93_TP_TARGETS, *V93_RISK_MODELS, *V94_MODELS, *V95_MODELS, *V97_TRAIL_MODELS):
                                 if cm in selected:
                                     selected.remove(cm)
                                     model_rejected[cm]["c_spread"] += 1
@@ -657,7 +669,7 @@ async def v90_scan_once():
                         for variant in selected:
                             V90_STATE["trades"].append({**c,"variant":variant,"status":"OPEN_SHADOW",
                                 "entry_utc":utc_now(),"entry_ms":entry_ms,"entry_price":ask,
-                                "stop_price":ask*V93_RISK_STOPS.get(variant, 0.97),"spread_pct":round(spread,5),
+                                 "stop_price":ask*V97_TRAIL_STOPS.get(variant, V93_RISK_STOPS.get(variant, 0.97)),"spread_pct":round(spread,5),
                                 "chase_pct":round(chase,5),"max_bid":ask,"min_bid":ask,
                                 "tp1_done":False,"trail_active":False,"research_only":True,"be_armed":False})
                             active_by_model[variant].add(sym)
@@ -730,9 +742,11 @@ async def v90_status():
             "signal_delay_limit_seconds":V90_DELAY_SECONDS,"telegram":V90_STATE["telegram"],
             "memory_peak_mb":v903_memory_mb(), "checkpoint_path":str(V90_STATE_PATH),
             "frozen_legacy":V90_STATE["frozen_legacy"],
-            "frozen_models":list(V91_FROZEN + V92_RETIRED + V96_RETIRED), "active_models":list(V93_ALL_ACTIVE),
+             "frozen_models":list(dict.fromkeys(V91_FROZEN + V92_RETIRED + V96_RETIRED +
+                 tuple(m for m in (V91_MODELS + tuple(V93_TP_TARGETS) + V93_RISK_MODELS) if m not in V93_ALL_ACTIVE))),
+             "active_models":list(V93_ALL_ACTIVE),
             "variants":{v:v90_stats([t for t in V90_STATE["trades"] if t["variant"]==v])
-                        for v in (*V91_FROZEN, *V92_ALL_MODELS, *V93_TP_TARGETS, *V93_RISK_MODELS)},
+                        for v in dict.fromkeys((*V91_FROZEN, *V92_ALL_MODELS, *V93_TP_TARGETS, *V93_RISK_MODELS, *V94_MODELS, *V95_MODELS, *V97_TRAIL_MODELS))},
             "recent_trades":V90_STATE["trades"][-24:],
             "limitations":["Checkpoint persistence requires a writable persistent mount and successful saves", "5-minute scan can miss signals", 
                            "Stop/TP monitored by quotes every 5 minutes; gaps and slippage possible",
@@ -1095,9 +1109,30 @@ async def v96_opportunity_report():
                          "recent": [{"symbol":t["symbol"], "net_pct":t["net_pct"], "exit_utc":t.get("exit_utc")} for t in closed[-20:]]}
     return {**MODE_INFO, "version":"V96_OPPORTUNITY_PAPER", "paper_only":True,
             "c_rules_unchanged":True, "c_sl2_rules_unchanged":True,
-            "retired_no_new_entries":list(V96_RETIRED), "active_models":list(V93_ALL_ACTIVE),
+             "retired_no_new_entries":list(dict.fromkeys(V96_RETIRED +
+                 tuple(m for m in (V91_MODELS + tuple(V93_TP_TARGETS) + V93_RISK_MODELS) if m not in V93_ALL_ACTIVE))),
+            "active_models":list(V93_ALL_ACTIVE),
             "baseline_C":v90_stats(c), "comparison":result,
             "limitations":["Only actual baseline C entries after V96 deployment are evaluated; not all possible candidate signals.",
                            "Avoided results assume skipping the C trade does not affect other entries.",
                            "BOOST extra entries not independently evaluated.",
                            "No checkpoint data deleted; existing retired positions finish normally."]}
+
+
+@app.get("/v97-trailing-report")
+async def v97_trailing_report():
+    """Read-only V97 comparison; no new orders or mutations."""
+    return {**MODE_INFO, "status": "OK", "version": "V97_SEVEN_MODELS_PAPER",
+            "paper_only": True, "orders": False, "trading": False,
+            "active_models": list(V93_ALL_ACTIVE),
+            "trailing_activation_gross_pct": 5.0,
+            "trailing_distance_pct": 5.0, "max_hold_minutes": 120,
+            "monitor_interval_seconds": V90_SCAN_SECONDS,
+            "by_model": {m: {"initial_stop_pct": -5.0 if m == "C_SL5_TRAIL5" else -10.0,
+                             "summary": v90_stats([t for t in V90_STATE["trades"] if t.get("variant") == m]),
+                             "recent_trades": [t for t in V90_STATE["trades"] if t.get("variant") == m][-10:]}
+                         for m in V97_TRAIL_MODELS},
+            "limitations": ["Trailing activation and stop are sampled every 5 minutes, not continuously",
+                            "A price jump can cause fills beyond the nominal stop",
+                            "Same C entry rules; no retroactive historical positions",
+                            "Paper only; no real exchange orders"]}
