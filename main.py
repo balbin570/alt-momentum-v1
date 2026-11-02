@@ -221,6 +221,8 @@ V97_TRAIL_STOPS = {"C_SL5_TRAIL5": 0.95, "C_SL10_TRAIL5": 0.90}
 # Only C_TREND and C_BE may open NEW paper trades.
 # Previously opened trades from all retired models are still monitored to closure.
 V93_ALL_ACTIVE = ("C_TREND", "C_BE")
+# Passive mirror of C_TREND entries; not an active signal model.
+C_OBS120 = "C_OBS120"
 V92_RETIRED = ("V91_PULLBACK", "V91_MOMENTUM", "V91_REGIME", "V913_PULLBACK_MARKET", "V913_PULLBACK_TRAIL15")
 V92_ALL_MODELS = V91_MODELS + V92_RETIRED
 V91_FROZEN = ("A", "B")
@@ -408,7 +410,7 @@ async def v90_monitor(client):
                 v90_close(t, bid, "FIXED_TP_MONITORED", now_ms)
             elif t["variant"] in V93_TP_TARGETS and bid >= t["entry_price"] * (1 + V93_TP_TARGETS[t["variant"]] / 100):
                 v90_close(t, bid, "FIXED_TP_MONITORED", now_ms)
-            elif bid <= t["stop_price"]:
+            elif t["variant"] != C_OBS120 and bid <= t["stop_price"]:
                 v90_close(t, bid, ("TRAIL5_MONITORED" if t["variant"] in V97_TRAIL_MODELS and t.get("trail_active")
                                   else "TRAIL15_MONITORED" if t["variant"] in ("V913_PULLBACK_TRAIL15", "C_TRAIL") and t.get("trail_active")
                                   else "STOP_MONITORED"), now_ms)
@@ -420,6 +422,16 @@ async def v90_monitor(client):
     closed_now = [t for t in active if t["status"] == "CLOSED_SHADOW" and not t.get("telegram_exit_attempted")]
     for t in closed_now:
         t["telegram_exit_attempted"] = True
+        if t["variant"] == C_OBS120:
+            high_pct = (t.get("max_bid", t["entry_price"]) / t["entry_price"] - 1) * 100
+            low_pct = (t.get("min_bid", t["entry_price"]) / t["entry_price"] - 1) * 100
+            msg = (f"C_OBS120 PAPER GOZLEM SONU\n{t['symbol']} | C_TREND ayni giris\n"
+                   f"120dk net: {t['net_pct']:+.3f}% | Sure: {t.get('hold_minutes', 0):.1f}dk\n"
+                   f"En yuksek: {high_pct:+.3f}% | En dusuk: {low_pct:+.3f}%\n"
+                   f"Giris: {t['entry_price']:.10g} | Cikis: {t['exit_price']:.10g}\n"
+                   "STOPS UYGULANMADI | PAPER ONLY | GERCEK EMIR YOK")
+            await v902_notify(msg, "EXIT_" + C_OBS120, t["symbol"])
+            continue
         msg = (f"ALT V90.3 PAPER CIKIS\n{t['symbol']} | Model {t['variant']}\n"
                f"Net: {t['net_pct']:+.3f}% | Neden: {t['exit_reason']}\n"
                f"Giris: {t['entry_price']:.10g} | Cikis: {t['exit_price']:.10g}\n"
@@ -673,6 +685,17 @@ async def v90_scan_once():
                                 "chase_pct":round(chase,5),"max_bid":ask,"min_bid":ask,
                                 "tp1_done":False,"trail_active":False,"research_only":True,"be_armed":False})
                             active_by_model[variant].add(sym)
+                            if variant == "C_TREND":
+                                # Independent, stopless 120-minute observation at identical entry.
+                                # Not in active model list; no independent entry filters or signals.
+                                V90_STATE["trades"].append({**c, "variant": C_OBS120,
+                                    "status": "OPEN_SHADOW", "entry_utc": utc_now(),
+                                    "entry_ms": entry_ms, "entry_price": ask,
+                                    "stop_price": 0.0, "spread_pct": round(spread, 5),
+                                    "chase_pct": round(chase, 5), "max_bid": ask,
+                                    "min_bid": ask, "tp1_done": False,
+                                    "trail_active": False, "research_only": True,
+                                    "be_armed": False, "mirror_of": "C_TREND"})
                         # V96: baseline C trade records which V95 pauses would have skipped it.
                         if "C" in selected:
                             for trade in reversed(V90_STATE["trades"]):
@@ -688,6 +711,11 @@ async def v90_scan_once():
                                f"Momentum60: {c['ret60_pct']:+.2f}% | Hacim: {c['volume_ratio']:.2f}x\n"
                                "PAPER ONLY | GERCEK EMIR YOK")
                         await v902_notify(msg, "ENTRY", sym)
+                        if "C_TREND" in selected:
+                            obs_msg = (f"C_OBS120 PAPER GOZLEM BASLADI\n{sym} | C_TREND ayni giris\n"
+                                       f"Giris: {ask:.10g} | Sure: 120dk\n"
+                                       "STOP YOK | TP YOK | PAPER ONLY | GERCEK EMIR YOK")
+                            await v902_notify(obs_msg, "ENTRY_" + C_OBS120, sym)
                         v903_save_state()
                     except Exception as exc:
                         scan["errors"]+=1
@@ -745,13 +773,29 @@ async def v90_status():
              "frozen_models":list(dict.fromkeys(V91_FROZEN + V92_RETIRED + V96_RETIRED +
                  tuple(m for m in (V91_MODELS + tuple(V93_TP_TARGETS) + V93_RISK_MODELS) if m not in V93_ALL_ACTIVE))),
              "active_models":list(V93_ALL_ACTIVE),
+            "observation_models": [C_OBS120],
             "variants":{v:v90_stats([t for t in V90_STATE["trades"] if t["variant"]==v])
-                        for v in dict.fromkeys((*V91_FROZEN, *V92_ALL_MODELS, *V93_TP_TARGETS, *V93_RISK_MODELS, *V94_MODELS, *V95_MODELS, *V97_TRAIL_MODELS))},
+                        for v in dict.fromkeys((*V91_FROZEN, *V92_ALL_MODELS, *V93_TP_TARGETS, *V93_RISK_MODELS, *V94_MODELS, *V95_MODELS, *V97_TRAIL_MODELS, C_OBS120))},
             "recent_trades":V90_STATE["trades"][-24:],
             "limitations":["Checkpoint persistence requires a writable persistent mount and successful saves", "5-minute scan can miss signals", 
                            "Stop/TP monitored by quotes every 5 minutes; gaps and slippage possible",
                            "V91/V91.3 models use exploratory entry filters, not validated strategies", "Trailing stop is sampled every 5 minutes and may exceed the threshold on gaps",
                            "No real fills, no real orders", "Experimental thresholds not validated"]}
+
+
+@app.get("/c-obs120")
+async def c_obs120_status():
+    rows = [t for t in V90_STATE["trades"] if t.get("variant") == C_OBS120]
+    closed = [t for t in rows if t.get("status") == "CLOSED_SHADOW"]
+    return {"model": C_OBS120, "paper_only": True,
+            "source": "C_TREND", "no_stop": True, "no_take_profit": True,
+            "max_hold_minutes": 120, "scan_seconds": V90_SCAN_SECONDS,
+            "stats": v90_stats(rows),
+            "closed_observations": [{"symbol": t["symbol"], "entry_utc": t["entry_utc"],
+                "entry_price": t["entry_price"], "exit_price": t.get("exit_price"),
+                "net_pct": t.get("net_pct"), "max_bid": t.get("max_bid"),
+                "min_bid": t.get("min_bid"), "hold_minutes": t.get("hold_minutes")}
+                for t in closed[-100:]], "open_observations": [t for t in rows if t.get("status") == "OPEN_SHADOW"]}
 
 
 @app.get("/v90-filter-analysis")
