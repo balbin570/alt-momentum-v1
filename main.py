@@ -218,9 +218,9 @@ V95_MODELS = ("V95_EARLY5", "V95_EARLY10")
 V96_RETIRED = V94_MODELS  # no NEW V94 entries; historical open trades still monitored
 V97_TRAIL_MODELS = ("C_SL5_TRAIL5", "C_SL10_TRAIL5")
 V97_TRAIL_STOPS = {"C_SL5_TRAIL5": 0.95, "C_SL10_TRAIL5": 0.90}
-# Only these seven models may open NEW paper trades.
-# Previously opened trades from retired models are still monitored to closure.
-V93_ALL_ACTIVE = ("C", "C_SL2", "C_TREND", *V95_MODELS, *V97_TRAIL_MODELS)
+# Only C_TREND and C_BE may open NEW paper trades.
+# Previously opened trades from all retired models are still monitored to closure.
+V93_ALL_ACTIVE = ("C_TREND", "C_BE")
 V92_RETIRED = ("V91_PULLBACK", "V91_MOMENTUM", "V91_REGIME", "V913_PULLBACK_MARKET", "V913_PULLBACK_TRAIL15")
 V92_ALL_MODELS = V91_MODELS + V92_RETIRED
 V91_FROZEN = ("A", "B")
@@ -935,7 +935,7 @@ async def v92_c_family():
                          "exit_reasons": {k: v90_stats(v) for k, v in reasons.items()}}
     return {**MODE_INFO, "status": "OK", "version": "V92_C_FAMILY_PAPER",
             "reference_model": "C", "c_rules_unchanged": True,
-            "active_models": list(V93_ALL_ACTIVE), "retired_no_new_entries": list(V92_RETIRED),
+            "active_models": list(V93_ALL_ACTIVE), "retired_no_new_entries": list(dict.fromkeys(V92_RETIRED + tuple(m for m in (V91_MODELS + V93_RISK_MODELS + V94_MODELS + V95_MODELS + V97_TRAIL_MODELS) if m not in V93_ALL_ACTIVE))),
             "by_model": models, "note": "Paper only; same symbols can be shared across models; no real orders."}
 
 
@@ -1110,7 +1110,7 @@ async def v96_opportunity_report():
     return {**MODE_INFO, "version":"V96_OPPORTUNITY_PAPER", "paper_only":True,
             "c_rules_unchanged":True, "c_sl2_rules_unchanged":True,
              "retired_no_new_entries":list(dict.fromkeys(V96_RETIRED +
-                 tuple(m for m in (V91_MODELS + tuple(V93_TP_TARGETS) + V93_RISK_MODELS) if m not in V93_ALL_ACTIVE))),
+                 tuple(m for m in (V91_MODELS + tuple(V93_TP_TARGETS) + V93_RISK_MODELS + V94_MODELS + V95_MODELS + V97_TRAIL_MODELS) if m not in V93_ALL_ACTIVE))),
             "active_models":list(V93_ALL_ACTIVE),
             "baseline_C":v90_stats(c), "comparison":result,
             "limitations":["Only actual baseline C entries after V96 deployment are evaluated; not all possible candidate signals.",
