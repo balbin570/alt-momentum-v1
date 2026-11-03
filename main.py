@@ -223,6 +223,7 @@ V97_TRAIL_STOPS = {"C_SL5_TRAIL5": 0.95, "C_SL10_TRAIL5": 0.90}
 V93_ALL_ACTIVE = ("C_TREND", "C_BE")
 # Passive mirror of C_TREND entries; not an active signal model.
 C_OBS120 = "C_OBS120"
+C_CONFIRM1 = "C_CONFIRM1"  # Independent 15-minute +1% confirmation research arm
 V92_RETIRED = ("V91_PULLBACK", "V91_MOMENTUM", "V91_REGIME", "V913_PULLBACK_MARKET", "V913_PULLBACK_TRAIL15")
 V92_ALL_MODELS = V91_MODELS + V92_RETIRED
 V91_FROZEN = ("A", "B")
@@ -414,7 +415,7 @@ async def v90_monitor(client):
                 v90_close(t, bid, ("TRAIL5_MONITORED" if t["variant"] in V97_TRAIL_MODELS and t.get("trail_active")
                                   else "TRAIL15_MONITORED" if t["variant"] in ("V913_PULLBACK_TRAIL15", "C_TRAIL") and t.get("trail_active")
                                   else "STOP_MONITORED"), now_ms)
-            elif now_ms >= t["entry_ms"] + (60 if t["variant"] == "C_TIME60" else 120)*60000:
+            elif now_ms >= (t.get("confirm1_original_deadline_ms", t["entry_ms"] + (60 if t["variant"] == "C_TIME60" else 120)*60000)):
                 v90_close(t, bid, "TIME60" if t["variant"] == "C_TIME60" else "TIME120", now_ms)
             if t["status"] == "CLOSED_SHADOW" and (t["variant"] in V92_ALL_MODELS or t["variant"] in ("C_SL2", "C_SL25", "C_BE", *V94_MODELS, *V95_MODELS)) and t.get("tp1_done"):
                 t["net_pct"] = round(((((t["tp1_price"]/t["entry_price"])-1)*100)*0.5 +
@@ -531,6 +532,7 @@ async def v90_scan_once():
         try:
             async with httpx.AsyncClient(timeout=30.0, limits=httpx.Limits(max_connections=4, max_keepalive_connections=2)) as client:
                 await v90_monitor(client)
+                await cconfirm1_monitor(client)
                 universe = (await build_universe(client))[:100]
                 # Only one network scan, three paper valuation models.
                 semaphore = asyncio.Semaphore(3)
@@ -696,6 +698,16 @@ async def v90_scan_once():
                                     "min_bid": ask, "tp1_done": False,
                                     "trail_active": False, "research_only": True,
                                     "be_armed": False, "mirror_of": "C_TREND"})
+                        if "C_TREND" in selected:
+                            # Passive, independent confirmation candidate. Never blocks C_TREND/C_BE.
+                            V90_STATE["trades"].append({**c, "variant": C_CONFIRM1,
+                                "status": "PENDING_CONFIRM", "research_only": True,
+                                "source_model": "C_TREND", "signal_entry_ms": entry_ms,
+                                "signal_entry_utc": utc_now(), "signal_entry_price": ask,
+                                "confirmation_deadline_ms": entry_ms + 15 * 60000,
+                                "time_exit_ms": entry_ms + 120 * 60000,
+                                "confirmation_target_bid": ask * 1.01,
+                                "last_bid": bid, "confirmation_checks": 0})
                         # V96: baseline C trade records which V95 pauses would have skipped it.
                         if "C" in selected:
                             for trade in reversed(V90_STATE["trades"]):
@@ -773,7 +785,7 @@ async def v90_status():
              "frozen_models":list(dict.fromkeys(V91_FROZEN + V92_RETIRED + V96_RETIRED +
                  tuple(m for m in (V91_MODELS + tuple(V93_TP_TARGETS) + V93_RISK_MODELS) if m not in V93_ALL_ACTIVE))),
              "active_models":list(V93_ALL_ACTIVE),
-            "observation_models": [C_OBS120],
+            "observation_models": [C_OBS120, C_CONFIRM1],
             "variants":{v:v90_stats([t for t in V90_STATE["trades"] if t["variant"]==v])
                         for v in dict.fromkeys((*V91_FROZEN, *V92_ALL_MODELS, *V93_TP_TARGETS, *V93_RISK_MODELS, *V94_MODELS, *V95_MODELS, *V97_TRAIL_MODELS, C_OBS120))},
             "recent_trades":V90_STATE["trades"][-24:],
@@ -1180,3 +1192,84 @@ async def v97_trailing_report():
                             "A price jump can cause fills beyond the nominal stop",
                             "Same C entry rules; no retroactive historical positions",
                             "Paper only; no real exchange orders"]}
+
+
+async def cconfirm1_monitor(client):
+    """Independent forward paper study; observe book bid on existing 5m scans.
+
+    A confirmation requires an observed executable-side bid >= original ask * 1.01
+    within 15m of the C_TREND entry. Paper entry uses the observed ask, not the
+    original ask or the threshold, so a jump is not assumed to fill at +1%.
+    """
+    now_ms = int(time.time() * 1000)
+    pending = [t for t in V90_STATE["trades"] if t.get("variant") == C_CONFIRM1
+               and t.get("status") == "PENDING_CONFIRM"]
+    if not pending:
+        return
+    changed = False
+    for sym in set(t["symbol"] for t in pending):
+        candidates = [t for t in pending if t["symbol"] == sym]
+        # Expired candidates never receive an after-deadline confirmation.
+        valid = [t for t in candidates if now_ms <= t["confirmation_deadline_ms"]]
+        for t in candidates:
+            if t not in valid:
+                t["status"] = "EXPIRED_NO_CONFIRM"
+                t["expired_utc"] = utc_now()
+                changed = True
+        if not valid:
+            continue
+        try:
+            quote = await get_json(client, "/api/v3/ticker/bookTicker", {"symbol": sym})
+            bid, ask = float(quote["bidPrice"]), float(quote["askPrice"])
+            if bid <= 0 or ask <= 0 or ask < bid:
+                continue
+        except Exception as exc:
+            V90_STATE["last_error"] = "confirm quote " + sym + ": " + str(exc)[:120]
+            continue
+        for t in valid:
+            t["confirmation_checks"] += 1
+            t["last_bid"] = bid
+            changed = True
+            if bid < t["confirmation_target_bid"]:
+                continue
+            t["status"] = "OPEN_SHADOW"
+            t["confirmation_utc"] = utc_now()
+            t["confirmation_ms"] = now_ms
+            t["confirmation_delay_minutes"] = round((now_ms - t["signal_entry_ms"]) / 60000, 3)
+            t["entry_utc"] = utc_now()
+            t["entry_ms"] = now_ms
+            t["entry_price"] = ask
+            t["stop_price"] = ask * 0.97
+            t["spread_pct"] = round((ask - bid) / ask * 100, 5)
+            t["max_bid"] = bid
+            t["min_bid"] = bid
+            t["tp1_done"] = False
+            t["trail_active"] = False
+            t["be_armed"] = False
+            # Existing v90_monitor handles the -3% stop, but its generic TIME120
+            # is measured from paper entry. Override the time exit independently.
+            t["confirm1_original_deadline_ms"] = t["time_exit_ms"]
+            print(f"C_CONFIRM1 PAPER CONFIRMED symbol={sym} delay_min={t['confirmation_delay_minutes']}", flush=True)
+    if changed:
+        v903_save_state()
+
+
+@app.get("/c-confirm1")
+async def cconfirm1_report():
+    rows = [t for t in V90_STATE["trades"] if t.get("variant") == C_CONFIRM1]
+    closed = [t for t in rows if t.get("status") == "CLOSED_SHADOW"]
+    return {**MODE_INFO, "status": "OK", "model": C_CONFIRM1,
+            "source_model": "C_TREND", "paper_only": True,
+            "c_trend_unchanged": True, "c_be_unchanged": True,
+            "confirmation": "+1% observed bid versus original ask within 15 minutes",
+            "confirmation_sampling_seconds": V90_SCAN_SECONDS,
+            "stop_loss_pct": -3, "time_exit_minutes_from_original_entry": 120,
+            "assumed_round_trip_cost_pct": V90_COST_PCT,
+            "pending": sum(t.get("status") == "PENDING_CONFIRM" for t in rows),
+            "expired_no_confirm": sum(t.get("status") == "EXPIRED_NO_CONFIRM" for t in rows),
+            "stats": v90_stats(rows), "recent_closed": closed[-30:],
+            "recent_pending": [t for t in rows if t.get("status") == "PENDING_CONFIRM"][-15:],
+            "limitations": ["5-minute sampled bid may miss intrabar +1% moves",
+                            "Paper entry uses observed ask; no actual execution",
+                            "Time exit is from original C_TREND entry, not confirmation",
+                            "No historical backfill; only new C_TREND entries are tracked"]}
