@@ -220,7 +220,9 @@ V97_TRAIL_MODELS = ("C_SL5_TRAIL5", "C_SL10_TRAIL5")
 V97_TRAIL_STOPS = {"C_SL5_TRAIL5": 0.95, "C_SL10_TRAIL5": 0.90}
 # Only C_TREND and C_BE may open NEW paper trades.
 # Previously opened trades from all retired models are still monitored to closure.
-V93_ALL_ACTIVE = ("C_TREND", "C_BE")
+V93_ALL_ACTIVE = ("C_TREND",)
+C_NEW_VARIANTS = ("C_LADDER3", "C_LADDER4", "C_PROTECT", "C_TRAIL_PRO", "C_TIME_ADAPT")
+C_FROZEN_VARIANTS = ("C_BE", "C_OBS120", "C_CONFIRM1")
 # Passive mirror of C_TREND entries; not an active signal model.
 C_OBS120 = "C_OBS120"
 C_CONFIRM1 = "C_CONFIRM1"  # Independent 15-minute +1% confirmation research arm
@@ -361,6 +363,67 @@ def v90_stats(rows):
             "sum_trade_returns_pct":round(sum(vals),4) if vals else None}
 
 
+# Independent shadow exits. Original C_TREND and its +3% half-profit are untouched.
+C_LADDER_RULES = {
+    "C_LADDER3": ((1.5, .30), (3.0, .30), (5.0, .40)),
+    "C_LADDER4": ((1.0, .20), (2.0, .25), (3.5, .25), (5.0, .30)),
+    "C_PROTECT": ((1.5, .30), (3.0, .30), (5.0, .40)),
+    "C_TRAIL_PRO": ((1.5, .25), (3.0, .25)),
+    "C_TIME_ADAPT": ((1.5, .30), (3.0, .30), (5.0, .40)),
+}
+
+def c_new_close(t, bid, reason, now_ms):
+    remaining = max(0., float(t.get("remaining_fraction", 1.)))
+    realized = float(t.get("realized_gross_pct", 0.))
+    gross = realized + remaining * pct_change(t["entry_price"], bid)
+    v90_close(t, bid, reason, now_ms)
+    t["net_pct"] = round(gross - V90_COST_PCT, 5)
+    t["remaining_fraction"] = 0.
+    t["realized_gross_pct"] = round(gross, 7)
+
+def c_new_monitor(t, bid, now_ms):
+    variant = t["variant"]
+    entry = t["entry_price"]
+    elapsed = (now_ms - t["entry_ms"]) / 60000
+    # Price checks are snapshots, not exchange resting orders. Stop takes precedence.
+    if bid <= t["stop_price"]:
+        c_new_close(t, bid, "STOP_MONITORED", now_ms)
+        return
+    if variant == "C_TIME_ADAPT":
+        if elapsed >= 60 and t.get("time_60_checked") is not True:
+            t["time_60_checked"] = True
+            if t.get("max_bid", entry) < entry * 1.01:
+                c_new_close(t, bid, "TIME60_NO_PLUS1", now_ms)
+                return
+        if elapsed >= 90 and t.get("time_90_checked") is not True:
+            t["time_90_checked"] = True
+            # Momentum proxy: last observed bid vs previous sampled bid.
+            prev = t.get("previous_observed_bid")
+            if prev is None or bid <= prev:
+                c_new_close(t, bid, "TIME90_NO_MOMENTUM", now_ms)
+                return
+    # TP targets checked at observed bid. Multiple levels can fill at the same quote.
+    for i, (target, fraction) in enumerate(C_LADDER_RULES[variant]):
+        if i in t.get("filled_steps", []):
+            continue
+        if bid >= entry * (1 + target / 100):
+            actual = min(fraction, t.get("remaining_fraction", 1.))
+            t["realized_gross_pct"] = t.get("realized_gross_pct", 0.) + actual * pct_change(entry, bid)
+            t["remaining_fraction"] = max(0., t.get("remaining_fraction", 1.) - actual)
+            t.setdefault("filled_steps", []).append(i)
+            t.setdefault("partial_exits", []).append({"target_pct": target, "fraction": actual,
+                "observed_price": bid, "utc": utc_now()})
+            if variant == "C_PROTECT" and i == 0:
+                t["stop_price"] = max(t["stop_price"], entry)
+    if variant == "C_TRAIL_PRO" and t.get("filled_steps"):
+        t["trail_active"] = True
+        t["stop_price"] = max(t["stop_price"], t["max_bid"] * .985)
+    if t.get("remaining_fraction", 1.) < 1e-8:
+        c_new_close(t, bid, "LADDER_COMPLETE", now_ms)
+    elif now_ms >= t["entry_ms"] + 120 * 60000:
+        c_new_close(t, bid, "TIME120", now_ms)
+    t["previous_observed_bid"] = bid
+
 async def v90_monitor(client):
     now_ms = int(time.time()*1000)
     active = [t for t in V90_STATE["trades"] if t["status"] == "OPEN_SHADOW"]
@@ -377,6 +440,9 @@ async def v90_monitor(client):
             t["max_bid"] = max(t.get("max_bid",t["entry_price"]), bid)
             t["min_bid"] = min(t.get("min_bid",t["entry_price"]), bid)
             t["last_bid"] = bid
+            if t["variant"] in C_NEW_VARIANTS:
+                c_new_monitor(t, bid, now_ms)
+                continue
             # V95: snapshot earliest available monitored bid at/after 5m and 10m.
             # Capture from baseline C only, without modifying its exits.
             if t["variant"] == "C":
@@ -532,7 +598,7 @@ async def v90_scan_once():
         try:
             async with httpx.AsyncClient(timeout=30.0, limits=httpx.Limits(max_connections=4, max_keepalive_connections=2)) as client:
                 await v90_monitor(client)
-                await cconfirm1_monitor(client)
+                await cconfirm1_monitor(client)  # finish existing pending confirmations; no new ones
                 universe = (await build_universe(client))[:100]
                 # Only one network scan, three paper valuation models.
                 semaphore = asyncio.Semaphore(3)
@@ -688,26 +754,17 @@ async def v90_scan_once():
                                 "tp1_done":False,"trail_active":False,"research_only":True,"be_armed":False})
                             active_by_model[variant].add(sym)
                             if variant == "C_TREND":
-                                # Independent, stopless 120-minute observation at identical entry.
-                                # Not in active model list; no independent entry filters or signals.
-                                V90_STATE["trades"].append({**c, "variant": C_OBS120,
-                                    "status": "OPEN_SHADOW", "entry_utc": utc_now(),
-                                    "entry_ms": entry_ms, "entry_price": ask,
-                                    "stop_price": 0.0, "spread_pct": round(spread, 5),
-                                    "chase_pct": round(chase, 5), "max_bid": ask,
-                                    "min_bid": ask, "tp1_done": False,
-                                    "trail_active": False, "research_only": True,
-                                    "be_armed": False, "mirror_of": "C_TREND"})
-                        if "C_TREND" in selected:
-                            # Passive, independent confirmation candidate. Never blocks C_TREND/C_BE.
-                            V90_STATE["trades"].append({**c, "variant": C_CONFIRM1,
-                                "status": "PENDING_CONFIRM", "research_only": True,
-                                "source_model": "C_TREND", "signal_entry_ms": entry_ms,
-                                "signal_entry_utc": utc_now(), "signal_entry_price": ask,
-                                "confirmation_deadline_ms": entry_ms + 15 * 60000,
-                                "time_exit_ms": entry_ms + 120 * 60000,
-                                "confirmation_target_bid": ask * 1.01,
-                                "last_bid": bid, "confirmation_checks": 0})
+                                # Five independent shadow exits; entry and stop match C_TREND.
+                                for arm in C_NEW_VARIANTS:
+                                    V90_STATE["trades"].append({**c, "variant": arm,
+                                        "status": "OPEN_SHADOW", "entry_utc": utc_now(),
+                                        "entry_ms": entry_ms, "entry_price": ask,
+                                        "stop_price": ask * .97, "spread_pct": round(spread, 5),
+                                        "chase_pct": round(chase, 5), "max_bid": ask,
+                                        "min_bid": ask, "tp1_done": False, "trail_active": False,
+                                        "research_only": True, "be_armed": False,
+                                        "source_model": "C_TREND", "remaining_fraction": 1.,
+                                        "realized_gross_pct": 0., "filled_steps": [], "partial_exits": []})
                         # V96: baseline C trade records which V95 pauses would have skipped it.
                         if "C" in selected:
                             for trade in reversed(V90_STATE["trades"]):
@@ -723,11 +780,6 @@ async def v90_scan_once():
                                f"Momentum60: {c['ret60_pct']:+.2f}% | Hacim: {c['volume_ratio']:.2f}x\n"
                                "PAPER ONLY | GERCEK EMIR YOK")
                         await v902_notify(msg, "ENTRY", sym)
-                        if "C_TREND" in selected:
-                            obs_msg = (f"C_OBS120 PAPER GOZLEM BASLADI\n{sym} | C_TREND ayni giris\n"
-                                       f"Giris: {ask:.10g} | Sure: 120dk\n"
-                                       "STOP YOK | TP YOK | PAPER ONLY | GERCEK EMIR YOK")
-                            await v902_notify(obs_msg, "ENTRY_" + C_OBS120, sym)
                         v903_save_state()
                     except Exception as exc:
                         scan["errors"]+=1
@@ -783,11 +835,12 @@ async def v90_status():
             "memory_peak_mb":v903_memory_mb(), "checkpoint_path":str(V90_STATE_PATH),
             "frozen_legacy":V90_STATE["frozen_legacy"],
              "frozen_models":list(dict.fromkeys(V91_FROZEN + V92_RETIRED + V96_RETIRED +
-                 tuple(m for m in (V91_MODELS + tuple(V93_TP_TARGETS) + V93_RISK_MODELS) if m not in V93_ALL_ACTIVE))),
+                 tuple(m for m in (V91_MODELS + tuple(V93_TP_TARGETS) + V93_RISK_MODELS) if m not in V93_ALL_ACTIVE) + C_FROZEN_VARIANTS)),
              "active_models":list(V93_ALL_ACTIVE),
-            "observation_models": [C_OBS120, C_CONFIRM1],
+            "observation_models": list(C_NEW_VARIANTS),
+             "frozen_no_new_entries": list(C_FROZEN_VARIANTS),
             "variants":{v:v90_stats([t for t in V90_STATE["trades"] if t["variant"]==v])
-                        for v in dict.fromkeys((*V91_FROZEN, *V92_ALL_MODELS, *V93_TP_TARGETS, *V93_RISK_MODELS, *V94_MODELS, *V95_MODELS, *V97_TRAIL_MODELS, C_OBS120))},
+                        for v in dict.fromkeys((*V91_FROZEN, *V92_ALL_MODELS, *V93_TP_TARGETS, *V93_RISK_MODELS, *V94_MODELS, *V95_MODELS, *V97_TRAIL_MODELS, C_OBS120, C_CONFIRM1, *C_NEW_VARIANTS))},
             "recent_trades":V90_STATE["trades"][-24:],
             "limitations":["Checkpoint persistence requires a writable persistent mount and successful saves", "5-minute scan can miss signals", 
                            "Stop/TP monitored by quotes every 5 minutes; gaps and slippage possible",
@@ -1273,3 +1326,23 @@ async def cconfirm1_report():
                             "Paper entry uses observed ask; no actual execution",
                             "Time exit is from original C_TREND entry, not confirmation",
                             "No historical backfill; only new C_TREND entries are tracked"]}
+
+
+@app.get("/c-new-variants")
+async def c_new_variants_report():
+    rows = V90_STATE["trades"]
+    return {**MODE_INFO, "status": "OK", "version": "C_TREND_EXIT_RESEARCH_V1",
+            "reference": "C_TREND", "active_signal_models": list(V93_ALL_ACTIVE),
+            "frozen_no_new_entries": list(C_FROZEN_VARIANTS),
+            "shadow_models": list(C_NEW_VARIANTS),
+            "rules": {k: [{"target_gross_pct": p, "fraction_of_original": f}
+                           for p, f in v] for k, v in C_LADDER_RULES.items()},
+            "by_model": {m: {"summary": v90_stats([t for t in rows if t.get("variant") == m]),
+                             "recent_closed": [t for t in rows if t.get("variant") == m and
+                                               t.get("status") == "CLOSED_SHADOW"][-10:]}
+                         for m in ("C_TREND", *C_NEW_VARIANTS)},
+            "limitations": ["New variants start only after deployment; no backfill",
+                            "Observed 5-minute bids can miss target/stop touches",
+                            "Multiple TP targets reached between scans fill at one observed bid",
+                            "One 0.15% round-trip cost applied to position-weighted gross return",
+                            "Paper only; no orders or real execution"]}
