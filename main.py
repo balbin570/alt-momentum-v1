@@ -746,6 +746,11 @@ async def v90_scan_once():
                                     model_rejected[cm]["c_spread"] += 1
                         if not selected:continue
                         entry_ms=int(time.time()*1000)
+                        # Entry-time market regime snapshot, identical for matched shadow arms.
+                        c = {**c, "entry_btc_ret60_pct": btc_ret60,
+                             "entry_alt_positive_breadth": round(breadth, 4) if breadth is not None else None,
+                             "entry_breadth_sample": len(market_returns),
+                             "entry_market_context_utc": scan["utc"]}
                         for variant in selected:
                             V90_STATE["trades"].append({**c,"variant":variant,"status":"OPEN_SHADOW",
                                 "entry_utc":utc_now(),"entry_ms":entry_ms,"entry_price":ask,
@@ -1346,3 +1351,71 @@ async def c_new_variants_report():
                             "Multiple TP targets reached between scans fill at one observed bid",
                             "One 0.15% round-trip cost applied to position-weighted gross return",
                             "Paper only; no orders or real execution"]}
+
+
+# Read-only, forward-only market regime study. No entry/exit rules are changed.
+def c_market_regime_bucket_btc(value):
+    if value is None:
+        return "UNKNOWN_HISTORICAL"
+    if value < -1.0:
+        return "BTC_BELOW_MINUS_1"
+    if value < 0:
+        return "BTC_MINUS_1_TO_0"
+    return "BTC_NONNEGATIVE"
+
+
+def c_market_regime_bucket_breadth(value):
+    if value is None:
+        return "UNKNOWN_HISTORICAL"
+    if value < 0.20:
+        return "BREADTH_BELOW_20PCT"
+    if value <= 0.50:
+        return "BREADTH_20_TO_50PCT"
+    return "BREADTH_ABOVE_50PCT"
+
+
+def c_market_regime_summary(rows):
+    stats = v90_stats(rows)
+    vals = [float(t["net_pct"]) for t in rows]
+    stats["positive_count"] = sum(v > 0 for v in vals)
+    stats["negative_count"] = sum(v < 0 for v in vals)
+    stats["zero_count"] = sum(v == 0 for v in vals)
+    return stats
+
+
+@app.get("/c-market-regime-analysis")
+async def c_market_regime_analysis():
+    all_closed = [t for t in V90_STATE["trades"]
+                  if t.get("variant") == "C_TREND" and t.get("status") == "CLOSED_SHADOW"]
+    with_context = [t for t in all_closed if
+                    isinstance(t.get("entry_btc_ret60_pct"), (int, float)) and
+                    isinstance(t.get("entry_alt_positive_breadth"), (int, float))]
+    by_btc, by_breadth, by_combination = {}, {}, {}
+    for t in with_context:
+        b = c_market_regime_bucket_btc(t["entry_btc_ret60_pct"])
+        a = c_market_regime_bucket_breadth(t["entry_alt_positive_breadth"])
+        by_btc.setdefault(b, []).append(t)
+        by_breadth.setdefault(a, []).append(t)
+        by_combination.setdefault(b + "__" + a, []).append(t)
+    return {**MODE_INFO, "status": "OK", "version": "C_MARKET_REGIME_FORWARD_V1",
+            "reference_model": "C_TREND", "paper_only": True,
+            "entry_exit_rules_unchanged": True,
+            "closed_total_retained": len(all_closed),
+            "closed_with_entry_market_context": len(with_context),
+            "closed_missing_entry_market_context": len(all_closed) - len(with_context),
+            "overall_retained": c_market_regime_summary(all_closed),
+            "context_cohort": c_market_regime_summary(with_context),
+            "by_btc_60m": {k: c_market_regime_summary(v) for k, v in sorted(by_btc.items())},
+            "by_alt_breadth": {k: c_market_regime_summary(v) for k, v in sorted(by_breadth.items())},
+            "by_combination": {k: c_market_regime_summary(v) for k, v in sorted(by_combination.items())},
+            "recent_context_trades": [{"symbol": t.get("symbol"), "entry_utc": t.get("entry_utc"),
+                "net_pct": t.get("net_pct"), "btc_ret60_pct": t.get("entry_btc_ret60_pct"),
+                "alt_positive_breadth": t.get("entry_alt_positive_breadth"),
+                "exit_reason": t.get("exit_reason")}
+                for t in with_context[-30:]],
+            "limitations": ["Forward-only: old trades without an entry market snapshot are not assigned a regime",
+                            "Regime metrics use last completed 5-minute candles, not tick-perfect entry-time values",
+                            "Breadth uses the sampled top-100 universe, not every altcoin",
+                            "Groups are descriptive; small samples and correlated trades limit statistical inference",
+                            "Paper-only quotes and sampled exits are not executable fills",
+                            "Trade history is bounded by existing checkpoint retention"]}
