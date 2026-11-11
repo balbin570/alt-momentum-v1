@@ -166,8 +166,7 @@ class Top20Scalper:
         symbols = list(daily)
         self.report["universe"] = len(symbols)
         if not symbols:
-            self.report["last_error"] = "NO_ELIGIBLE_SPOT_PAIRS"
-            return
+            raise ValueError("NO_ELIGIBLE_SPOT_PAIRS")
         five, ten = await asyncio.gather(
             self.rolling(core, client, symbols, "5m"),
             self.rolling(core, client, symbols, "10m"))
@@ -272,8 +271,12 @@ class Top20Scalper:
             async with httpx.AsyncClient(timeout=30.0,
                     limits=httpx.Limits(max_connections=8, max_keepalive_connections=5)) as client:
                 await self.monitor(core, client)
+                if core.V915_STORAGE.get("last_save_ok") is False:
+                    self.report["last_error"] = "CHECKPOINT_SAVE_FAILED_ON_EXIT"
+                    return
                 await self.scan(core, client)
-            self.report["last_error"] = None
+            self.report["last_error"] = (None if core.V915_STORAGE.get("last_save_ok")
+                                         else "CHECKPOINT_SAVE_FAILED_ON_ENTRY")
         except asyncio.CancelledError:
             raise
         except Exception as exc:
