@@ -722,7 +722,7 @@ async def v90_scan_once():
                 scan["v95_regime"] = early_regimes
                 active_by_model = {v:{t["symbol"] for t in V90_STATE["trades"]
                                       if t["status"]=="OPEN_SHADOW" and t["variant"]==v}
-                                   for v in C_ENTRY_MODELS
+                                   for v in C_ENTRY_MODELS}
                 for c in sorted(candidates,key=lambda r:r["ret60_pct"],reverse=True):
                     sym=c["symbol"]
                     key=f'{sym}:{c["signal_ms"]}'
@@ -866,7 +866,7 @@ async def v90_scan_once():
                     "rejected":dict(model_rejected[m]),
                     "new_positions":sum(t["variant"]==m and t["entry_ms"] >= scan_started_ms for t in V90_STATE["trades"]),
                     "post_filter_rejections":sum(n for reason,n in model_rejected[m].items() if reason in ("spread_too_wide", "price_chase", "invalid_quote", "c_spread", "entry_exception", "already_seen_or_open", "max_open_positions"))}
-                    for m in C_ENTRY_MODELS
+                    for m in C_ENTRY_MODELS}
                 # Preserve all historical paper records; monitor disk/RAM before deployment.
                 cutoff=int(time.time()*1000)-7*86400000
                 V90_STATE["seen"]={k:v for k,v in V90_STATE["seen"].items() if v>cutoff}
