@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 import httpx
 from fastapi import FastAPI
 from paper_store import SupabasePaperStore
+from top20_scalp import Top20Scalper, MODEL as TOP20_MODEL, SCAN_SECONDS as TOP20_SCAN_SECONDS
 
 app = FastAPI(title="ALT-MOMENTUM-V90")
 BINANCE = "https://data-api.binance.vision"
@@ -210,6 +211,8 @@ V90_STATE = {"started_utc": None, "last_scan": None, "last_error": None,
              "frozen_legacy": ["V32", "V32.2", "V32.3-B", "V89.4", "V89-100", "BIG_MOVE_V5"]}
 V90_TASK = None
 C_MONITOR_TASK = None
+TOP20_TASK = None
+TOP20_SCALPER = Top20Scalper()
 C_MONITOR_SECONDS = 60
 C_FORWARD_VERSION = "C_FORWARD_SAFETY_V1"
 C_MONITOR_STATE = {"last_check_utc": None, "checks": 0, "last_error": None}
@@ -474,6 +477,7 @@ def c_new_monitor(t, bid, now_ms):
 async def v90_monitor(client, fast_only=False):
     now_ms = int(time.time()*1000)
     active = [t for t in V90_STATE["trades"] if t["status"] == "OPEN_SHADOW"
+              and t.get("variant") != TOP20_MODEL
               and (not fast_only or (t.get("variant") in ("C", *C_SHADOW_MODELS) and
                    t.get("c_forward_version") == C_FORWARD_VERSION))]
     for sym in set(t["symbol"] for t in active):
@@ -889,9 +893,16 @@ async def v90_loop():
         await asyncio.sleep(V90_SCAN_SECONDS)
 
 
+async def top20_scalp_loop():
+    while True:
+        started = time.monotonic()
+        await TOP20_SCALPER.cycle(__import__(__name__))
+        await asyncio.sleep(max(1, TOP20_SCAN_SECONDS - (time.monotonic() - started)))
+
+
 @app.on_event("startup")
 async def v90_startup():
-    global V90_TASK, C_MONITOR_TASK
+    global V90_TASK, C_MONITOR_TASK, TOP20_TASK
     V90_STATE["started_utc"]=utc_now()
     v903_load_state()
     # Never run a scanner from a missing/corrupt/unwritable historical checkpoint.
@@ -904,6 +915,13 @@ async def v90_startup():
         V90_TASK = asyncio.create_task(v90_loop())
     if C_MONITOR_TASK is None or C_MONITOR_TASK.done():
         C_MONITOR_TASK = asyncio.create_task(c_fast_monitor_loop())
+    if TOP20_TASK is None or TOP20_TASK.done():
+        TOP20_TASK = asyncio.create_task(top20_scalp_loop())
+
+
+@app.get("/top20-scalp-status")
+async def top20_scalp_status():
+    return TOP20_SCALPER.status(__import__(__name__), bool(TOP20_TASK and not TOP20_TASK.done()))
 
 
 @app.get("/c-shadow-mom1-status")
@@ -1719,7 +1737,7 @@ async def c_fast_monitor_loop():
 
 @app.on_event("shutdown")
 async def c_paper_shutdown():
-    tasks = [task for task in (V90_TASK, C_MONITOR_TASK) if task is not None]
+    tasks = [task for task in (V90_TASK, C_MONITOR_TASK, TOP20_TASK) if task is not None]
     for task in tasks:
         task.cancel()
     if tasks:
