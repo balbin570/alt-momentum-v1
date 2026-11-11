@@ -228,6 +228,9 @@ V97_TRAIL_STOPS = {"C_SL5_TRAIL5": 0.95, "C_SL10_TRAIL5": 0.90}
 # Only baseline C may open NEW paper trades (user-selected research reference).
 # Previously opened trades from all retired models are still monitored to closure.
 V93_ALL_ACTIVE = ("C",)
+# New independent forward-only paper research model. Baseline C stays untouched.
+C_SHADOW_MODELS = ("C_SHADOW_MOM1",)
+C_ENTRY_MODELS = V93_ALL_ACTIVE + C_SHADOW_MODELS
 C_NEW_VARIANTS = ("C_LADDER3", "C_LADDER4", "C_PROTECT", "C_TRAIL_PRO", "C_TIME_ADAPT")
 C_FROZEN_VARIANTS = ("C_TREND", "C_BE", "C_OBS120", "C_CONFIRM1", *C_NEW_VARIANTS)
 # Passive mirror of C_TREND entries; not an active signal model.
@@ -471,7 +474,7 @@ def c_new_monitor(t, bid, now_ms):
 async def v90_monitor(client, fast_only=False):
     now_ms = int(time.time()*1000)
     active = [t for t in V90_STATE["trades"] if t["status"] == "OPEN_SHADOW"
-              and (not fast_only or (t.get("variant") == "C" and
+              and (not fast_only or (t.get("variant") in ("C", *C_SHADOW_MODELS) and
                    t.get("c_forward_version") == C_FORWARD_VERSION))]
     for sym in set(t["symbol"] for t in active):
         try:
@@ -654,8 +657,8 @@ async def v90_scan_once():
                 rejected = Counter()
                 near_misses = []
                 market_returns = []
-                model_rejected = {m: Counter() for m in V93_ALL_ACTIVE}
-                model_passed = {m: 0 for m in V93_ALL_ACTIVE}
+                model_rejected = {m: Counter() for m in C_ENTRY_MODELS}
+                model_passed = {m: 0 for m in C_ENTRY_MODELS}
                 # BTC is fetched once per scan for the regime research arm.
                 btc_candles = await get_completed_5m_candles(client, "BTCUSDT", limit=25)
                 btc_closes = [x["close"] for x in btc_candles]
@@ -719,15 +722,21 @@ async def v90_scan_once():
                 scan["v95_regime"] = early_regimes
                 active_by_model = {v:{t["symbol"] for t in V90_STATE["trades"]
                                       if t["status"]=="OPEN_SHADOW" and t["variant"]==v}
-                                   for v in V93_ALL_ACTIVE}
+                                   for v in C_ENTRY_MODELS}
                 for c in sorted(candidates,key=lambda r:r["ret60_pct"],reverse=True):
                     sym=c["symbol"]
                     key=f'{sym}:{c["signal_ms"]}'
                     selected = []
-                    for model in V93_ALL_ACTIVE:
+                    for model in C_ENTRY_MODELS:
                         reason = None
                         ret, vol, z, breakout = c["ret60_pct"], c["volume_ratio"], c["z"], c["breakout_pct"]
-                        if model in ("C", "C_TRAIL", "C_TIME60", "C_MARKET", "C_TREND", *V93_TP_TARGETS, *V93_RISK_MODELS, *V94_MODELS, *V95_MODELS, *V97_TRAIL_MODELS):
+                        if model in C_SHADOW_MODELS:
+                            # Shadow follows the same C volume/z/breakout gates, only momentum starts at +1%.
+                            if not 1.0 <= ret <= 8.0: reason = "momentum_range"
+                            elif not 1.2 <= vol < 3.5: reason = "volume_range"
+                            elif z >= 3.5: reason = "z_extreme"
+                            elif not 0.2 <= breakout <= 1.5: reason = "breakout_range"
+                        elif model in ("C", "C_TRAIL", "C_TIME60", "C_MARKET", "C_TREND", *V93_TP_TARGETS, *V93_RISK_MODELS, *V94_MODELS, *V95_MODELS, *V97_TRAIL_MODELS):
                              if model == "C_MARKET" and (btc_ret60 is None or btc_ret60 < 0 or breadth is None or breadth < 0.50):
                                  reason = "market_regime"
                              if model == "C_TREND" and not 3.0 <= ret <= 7.0:
@@ -794,7 +803,7 @@ async def v90_scan_once():
                                 model_rejected[model]["spread_too_wide" if spread>0.15 else "price_chase"] += 1
                             continue
                         if spread > 0.12:
-                            for cm in ("C", *V93_TP_TARGETS, *V93_RISK_MODELS, *V94_MODELS, *V95_MODELS, *V97_TRAIL_MODELS):
+                            for cm in ("C", *C_SHADOW_MODELS, *V93_TP_TARGETS, *V93_RISK_MODELS, *V94_MODELS, *V95_MODELS, *V97_TRAIL_MODELS):
                                 if cm in selected:
                                     selected.remove(cm)
                                     model_rejected[cm]["c_spread"] += 1
@@ -806,11 +815,16 @@ async def v90_scan_once():
                              "entry_breadth_sample": len(market_returns),
                              "entry_market_context_utc": scan["utc"]}
                         for variant in selected:
-                            V90_STATE["trades"].append({**c,"variant":variant,"status":"OPEN_SHADOW",
+                            entry_record = {**c,"variant":variant,"status":"OPEN_SHADOW",
                                 "entry_utc":utc_now(),"entry_ms":entry_ms,"entry_price":ask,
-                                 "stop_price":ask*V97_TRAIL_STOPS.get(variant, V93_RISK_STOPS.get(variant, 0.97)),"spread_pct":round(spread,5),
+                                "stop_price":ask*V97_TRAIL_STOPS.get(variant, V93_RISK_STOPS.get(variant, 0.97)),"spread_pct":round(spread,5),
                                 "chase_pct":round(chase,5),"max_bid":ask,"min_bid":ask,
-                                "tp1_done":False,"trail_active":False,"research_only":True,"be_armed":False})
+                                "tp1_done":False,"trail_active":False,"research_only":True,"be_armed":False}
+                            if variant in C_SHADOW_MODELS:
+                                entry_record.update(c_forward_version=C_FORWARD_VERSION,
+                                    exit_monitor_seconds=C_MONITOR_SECONDS,
+                                    shadow_entry_version="C_SHADOW_MOM1_FORWARD_V1")
+                            V90_STATE["trades"].append(entry_record)
                             active_by_model[variant].add(sym)
                             if variant == "C_TREND":
                                 # Five independent shadow exits; entry and stop match C_TREND.
@@ -852,7 +866,7 @@ async def v90_scan_once():
                     "rejected":dict(model_rejected[m]),
                     "new_positions":sum(t["variant"]==m and t["entry_ms"] >= scan_started_ms for t in V90_STATE["trades"]),
                     "post_filter_rejections":sum(n for reason,n in model_rejected[m].items() if reason in ("spread_too_wide", "price_chase", "invalid_quote", "c_spread", "entry_exception", "already_seen_or_open", "max_open_positions"))}
-                    for m in V93_ALL_ACTIVE}
+                    for m in C_ENTRY_MODELS}
                 # Preserve all historical paper records; monitor disk/RAM before deployment.
                 cutoff=int(time.time()*1000)-7*86400000
                 V90_STATE["seen"]={k:v for k,v in V90_STATE["seen"].items() if v>cutoff}
@@ -892,6 +906,32 @@ async def v90_startup():
         C_MONITOR_TASK = asyncio.create_task(c_fast_monitor_loop())
 
 
+@app.get("/c-shadow-mom1-status")
+async def c_shadow_mom1_status():
+    """Read-only independent forward paper cohort; never modifies the reference C."""
+    rows = [t for t in V90_STATE["trades"] if t.get("variant") == "C_SHADOW_MOM1"]
+    last = V90_STATE.get("last_scan") or {}
+    return {**MODE_INFO, "status": "OK", "version": "C_SHADOW_MOM1_FORWARD_V1",
+            "paper_only": True, "active_shadow_model": "C_SHADOW_MOM1",
+            "reference_model_unchanged": "C",
+            "entry_momentum_60m_pct": [1.0, 8.0],
+            "entry_volume_ratio": [1.2, 3.5],
+            "entry_z_max_exclusive": 3.5,
+            "entry_breakout_pct": [0.2, 1.5],
+            "max_spread_pct": 0.12, "max_price_chase_pct": 0.5,
+            "stop_loss_pct": -3.0, "time_exit_minutes": 120,
+            "assumed_round_trip_cost_pct": V90_COST_PCT,
+            "scan_interval_seconds": V90_SCAN_SECONDS,
+            "exit_monitor_seconds": C_MONITOR_SECONDS,
+            "stats": v90_stats(rows),
+            "open_positions": [{"symbol": t["symbol"], "entry_utc": t.get("entry_utc"),
+                                "entry_price": t.get("entry_price")} for t in rows
+                               if t.get("status") == "OPEN_SHADOW"],
+            "last_scan_utc": last.get("utc"),
+            "last_scan_filters": (last.get("model_filters") or {}).get("C_SHADOW_MOM1"),
+            "note": "Forward-only independent paper entries; alternatives are not proof of profitability."}
+
+
 @app.get("/v90-status")
 async def v90_status():
     return {**MODE_INFO,"status":"OK","strategy":"V90_HYBRID_MOMENTUM", "diagnostic_version":"V93_C_RISK_FAMILY_PAPER",
@@ -906,8 +946,9 @@ async def v90_status():
             "frozen_legacy":V90_STATE["frozen_legacy"],
              "frozen_models":list(dict.fromkeys(V91_FROZEN + V92_RETIRED + V96_RETIRED +
                  tuple(m for m in (V91_MODELS + tuple(V93_TP_TARGETS) + V93_RISK_MODELS) if m not in V93_ALL_ACTIVE) + C_FROZEN_VARIANTS)),
-             "active_models":list(V93_ALL_ACTIVE),
+             "active_models":list(C_ENTRY_MODELS),
             "observation_models": [],
+            "independent_shadow_models":list(C_SHADOW_MODELS),
             "retained_exit_observation_models": list(C_NEW_VARIANTS),
              "frozen_no_new_entries": list(C_FROZEN_VARIANTS),
             "variants":{v:v90_stats([t for t in V90_STATE["trades"] if t["variant"]==v])
@@ -1655,7 +1696,7 @@ async def c_fast_monitor_once():
     if V90_LOCK is None:
         V90_LOCK = asyncio.Lock()
     async with V90_LOCK:
-        if not any(t.get("status") == "OPEN_SHADOW" and t.get("variant") == "C"
+        if not any(t.get("status") == "OPEN_SHADOW" and t.get("variant") in ("C", *C_SHADOW_MODELS)
                    and t.get("c_forward_version") == C_FORWARD_VERSION for t in V90_STATE["trades"]):
             return
         async with httpx.AsyncClient(timeout=20.) as client:

@@ -143,7 +143,7 @@ class PaperSafetyTests(unittest.IsolatedAsyncioTestCase):
              patch.object(app, 'v902_notify', AsyncMock()):
             result = await app.v90_scan_once()
         self.assertEqual(1, result['new_coins'], result)
-        self.assertEqual({'C'},
+        self.assertEqual({'C', 'C_SHADOW_MOM1'},
                          {t['variant'] for t in app.V90_STATE['trades']})
         for trade in app.V90_STATE['trades']:
             self.assertEqual(4., round(trade['entry_btc_ret60_pct'], 6))
@@ -289,6 +289,51 @@ class PaperSafetyTests(unittest.IsolatedAsyncioTestCase):
         app.v903_save_state()
         self.assertEqual(original, app.V90_STATE_PATH.read_bytes())
         self.assertTrue(app.V915_STORAGE['last_restore_status'].startswith('ERROR:'))
+
+
+    async def test_shadow_mom1_opens_independently_below_C_momentum_floor(self):
+        now = int(time.time() * 1000)
+        candles = [dict(close=100. + i * .1, high=100. + i * .1,
+                        volume=10., close_time=now - 1000) for i in range(24)]
+        for c in candles[:11]:
+            c['close'] = 90.
+        candles[-13]['close'] = 100.
+        candles[-1].update(close=101.5, volume=20.)
+        for c in candles[-7:-1]:
+            c['high'] = 101.5 / 1.005
+        with patch.object(app, 'build_universe', AsyncMock(return_value=[{'symbol': 'TESTUSDT'}])), \
+             patch.object(app, 'get_completed_5m_candles', AsyncMock(return_value=candles)), \
+             patch.object(app, 'get_json', AsyncMock(return_value={'askPrice': '101.5', 'bidPrice': '101.45'})), \
+             patch.object(app, 'v902_notify', AsyncMock()):
+            first = await app.v90_scan_once()
+            second = await app.v90_scan_once()
+        rows = app.V90_STATE['trades']
+        self.assertEqual(1, len(rows), rows)
+        self.assertEqual('C_SHADOW_MOM1', rows[0]['variant'])
+        self.assertEqual(app.C_FORWARD_VERSION, rows[0]['c_forward_version'])
+        self.assertEqual(60, rows[0]['exit_monitor_seconds'])
+        self.assertEqual(1, first['model_filters']['C_SHADOW_MOM1']['new_positions'])
+        self.assertEqual(0, first['model_filters']['C']['passed_entry_filters'])
+        self.assertEqual(0, second['model_filters']['C_SHADOW_MOM1']['new_positions'])
+        status = await app.c_shadow_mom1_status()
+        self.assertEqual(1, status['stats']['open'])
+        self.assertFalse(status['orders'])
+
+        with patch.object(app, 'get_json', AsyncMock(return_value={'bidPrice': '97'})), \
+             patch.object(app, 'v902_notify', AsyncMock()):
+            await app.c_fast_monitor_once()
+        self.assertEqual('CLOSED_SHADOW', rows[0]['status'])
+        self.assertEqual('STOP_MONITORED', rows[0]['exit_reason'])
+
+    async def test_shadow_cohort_does_not_contaminate_C_summary(self):
+        app.V90_STATE['trades'] = [
+            dict(variant='C', status='CLOSED_SHADOW', net_pct=1.0),
+            dict(variant='C_SHADOW_MOM1', status='CLOSED_SHADOW', net_pct=-2.0)]
+        shadow = await app.c_shadow_mom1_status()
+        self.assertEqual(-2., shadow['stats']['mean_net_pct'])
+        self.assertEqual(('C',), app.V93_ALL_ACTIVE)
+        self.assertEqual(1, app.v90_stats([t for t in app.V90_STATE['trades']
+                                           if t['variant'] == 'C'])['mean_net_pct'])
 
 
 if __name__ == '__main__':
