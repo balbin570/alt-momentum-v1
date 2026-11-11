@@ -1,3 +1,4 @@
+import asyncio
 import contextlib
 import copy
 import io
@@ -22,12 +23,15 @@ class PaperSafetyTests(unittest.IsolatedAsyncioTestCase):
         app.V90_STATE.update(trades=[], seen={}, signals=0, last_scan=None,
                              filter_observations={})
         app.V915_STORAGE['last_restore_status'] = 'NOT_ATTEMPTED'
+        self.lock_patch = patch.object(app, 'V90_LOCK', None)
+        self.lock_patch.start()
 
     def tearDown(self):
         app.V90_STATE.clear()
         app.V90_STATE.update(self.original_state)
         app.V915_STORAGE.clear()
         app.V915_STORAGE.update(self.original_storage)
+        self.lock_patch.stop()
         self.path_patch.stop()
         self.temp.cleanup()
 
@@ -185,6 +189,106 @@ class PaperSafetyTests(unittest.IsolatedAsyncioTestCase):
             await app.v90_monitor(None)
         self.assertTrue(all(t['status'] == 'CLOSED_SHADOW' for t in app.V90_STATE['trades']))
         self.assertTrue(all(t['exit_reason'] == 'STOP_MONITORED' for t in app.V90_STATE['trades']))
+
+
+
+
+
+    async def test_fast_monitor_only_changes_new_forward_C_and_sends_one_exit(self):
+        now = int(time.time()*1000)
+        base = dict(symbol='TESTUSDT', variant='C', status='OPEN_SHADOW',
+                    entry_price=100., entry_ms=now-60000, stop_price=97.,
+                    max_bid=100., min_bid=100., tp1_done=False)
+        old = dict(base)
+        new = dict(base, c_forward_version=app.C_FORWARD_VERSION)
+        app.V90_STATE['trades'] = [old, new]
+        notify = AsyncMock()
+        with patch.object(app, 'get_json', AsyncMock(return_value={'bidPrice':'96'})), \
+             patch.object(app, 'v902_notify', notify):
+            await app.c_fast_monitor_once()
+        self.assertEqual('OPEN_SHADOW', old['status'])
+        self.assertEqual('CLOSED_SHADOW', new['status'])
+        self.assertEqual(1, notify.await_count)
+        self.assertTrue(app.V90_STATE_PATH.exists())
+
+    async def test_startup_refuses_missing_checkpoint_and_does_not_start_tasks(self):
+        with patch.object(app, 'V90_TASK', None), patch.object(app, 'C_MONITOR_TASK', None), \
+             patch.object(app.os.path, 'ismount', return_value=False):
+            await app.v90_startup()
+            self.assertIsNone(app.V90_TASK)
+            self.assertIsNone(app.C_MONITOR_TASK)
+        self.assertEqual('MISSING_CHECKPOINT_STOPPED', app.V915_STORAGE['last_restore_status'])
+        app.v903_save_state()
+        self.assertFalse(app.V90_STATE_PATH.exists())
+
+    async def test_startup_and_shutdown_run_both_loops_from_safe_checkpoint(self):
+        app.V90_STATE_PATH.write_text(json.dumps(dict(trades=[], seen={}, signals=0)))
+        async def wait_forever():
+            await asyncio.Event().wait()
+        with patch.object(app, 'V90_TASK', None), patch.object(app, 'C_MONITOR_TASK', None), \
+             patch.object(app, 'v90_loop', wait_forever), \
+             patch.object(app, 'c_fast_monitor_loop', wait_forever):
+            await app.v90_startup()
+            self.assertIsNotNone(app.V90_TASK)
+            self.assertIsNotNone(app.C_MONITOR_TASK)
+            await app.c_paper_shutdown()
+            self.assertTrue(app.V90_TASK.done())
+            self.assertTrue(app.C_MONITOR_TASK.done())
+        self.assertTrue(app.V915_STORAGE['last_save_ok'])
+
+    async def test_loss_analysis_separates_old_and_new_monitor_cadence(self):
+        app.V90_STATE['trades'] = [dict(variant='C', status='CLOSED_SHADOW', net_pct=-1.),
+            dict(variant='C', status='CLOSED_SHADOW', net_pct=2.,
+                 c_forward_version=app.C_FORWARD_VERSION)]
+        result = await app.c_loss_analysis()
+        self.assertEqual(-1., result['historical_C']['mean_net_pct'])
+        self.assertEqual(2., result['forward_C']['mean_net_pct'])
+        self.assertEqual(60, result['new_C_exit_monitor_seconds'])
+
+    async def test_remote_restore_and_save_never_touch_disk(self):
+        from unittest.mock import Mock
+        store = Mock()
+        store.load.return_value = dict(trades=[], seen={}, signals=0)
+        store.revision = 12
+        store.save.return_value = dict(revision=13, compressed_bytes=100)
+        with patch.object(app, 'C_REMOTE_STORE', store):
+            app.v903_load_state()
+            app.v903_save_state()
+            result = await app.v915_storage_status()
+        self.assertEqual('SUPABASE', result['backend'])
+        self.assertEqual(13, result['storage']['remote_revision'])
+        self.assertFalse(app.V90_STATE_PATH.exists())
+
+    async def test_remote_restore_failure_never_starts_empty_scanner(self):
+        from unittest.mock import Mock
+        store = Mock()
+        store.load.side_effect = RuntimeError('offline')
+        with patch.object(app, 'C_REMOTE_STORE', store), \
+             patch.object(app, 'V90_TASK', None), patch.object(app, 'C_MONITOR_TASK', None):
+            await app.v90_startup()
+            self.assertIsNone(app.V90_TASK)
+            self.assertIsNone(app.C_MONITOR_TASK)
+            app.v903_save_state()
+        store.save.assert_not_called()
+
+    def test_original_checkpoint_backup_is_byte_exact(self):
+        original = b'{"trades": [], "seen": {}, "signals": 3}'
+        app.V90_STATE_PATH.write_bytes(original)
+        app.v903_load_state()
+        backup = Path(app.V915_STORAGE['backup_path'])
+        self.assertEqual(original, backup.read_bytes())
+        app.v903_save_state()
+        self.assertEqual(original, backup.read_bytes())
+
+    def test_corrupted_existing_backup_blocks_restore_and_save(self):
+        original = b'{"trades": [], "seen": {}, "signals": 3}'
+        app.V90_STATE_PATH.write_bytes(original)
+        backup = app.c_backup_checkpoint(original)
+        backup.write_bytes(b'broken backup')
+        app.v903_load_state()
+        app.v903_save_state()
+        self.assertEqual(original, app.V90_STATE_PATH.read_bytes())
+        self.assertTrue(app.V915_STORAGE['last_restore_status'].startswith('ERROR:'))
 
 
 if __name__ == '__main__':

@@ -1,0 +1,3 @@
+[functions.alt-momentum-paper-state]
+# The function performs its own high-entropy token authentication before any database access.
+verify_jwt = false

@@ -1,5 +1,6 @@
 """V90.2 standalone paper research scanner. No order endpoints or API keys."""
 import asyncio
+import hashlib
 import json
 import gc
 import resource
@@ -11,6 +12,7 @@ import time
 from datetime import datetime, timezone
 import httpx
 from fastapi import FastAPI
+from paper_store import SupabasePaperStore
 
 app = FastAPI(title="ALT-MOMENTUM-V90")
 BINANCE = "https://data-api.binance.vision"
@@ -203,10 +205,14 @@ async def v22_telegram_send(message):
 
 V90_STATE = {"started_utc": None, "last_scan": None, "last_error": None,
              "scans": 0, "signals": 0, "seen": {}, "trades": [],
-             "filter_observations": {},
+             "filter_observations": {}, "recovery_metadata": {},
              "telegram": {"configured": bool(V22_TG_TOKEN and V22_TG_CHAT_ID), "sent": 0, "failed": 0, "last": None},
              "frozen_legacy": ["V32", "V32.2", "V32.3-B", "V89.4", "V89-100", "BIG_MOVE_V5"]}
 V90_TASK = None
+C_MONITOR_TASK = None
+C_MONITOR_SECONDS = 60
+C_FORWARD_VERSION = "C_FORWARD_SAFETY_V1"
+C_MONITOR_STATE = {"last_check_utc": None, "checks": 0, "last_error": None}
 V90_LOCK = None
 # Historical paper trades are never automatically pruned.
 V91_MODELS = ("C", "C_TREND", "C_TRAIL", "C_TIME60", "C_MARKET")
@@ -234,6 +240,7 @@ V90_SCAN_SECONDS = 300
 V90_COST_PCT = 0.15
 V90_DELAY_SECONDS = 300
 V90_STATE_PATH = Path(os.getenv("V90_STATE_PATH", "/tmp/v90_state.json"))
+C_REMOTE_STORE = SupabasePaperStore.from_environment()
 
 
 def v903_memory_mb():
@@ -248,14 +255,22 @@ V915_STORAGE = {"last_save_utc": None, "last_save_ok": None, "last_save_error": 
 
 def v903_save_state():
     """Atomic checkpoint to configured disk; errors exposed in storage status."""
-    if V915_STORAGE["last_restore_status"].startswith("ERROR:"):
+    if V915_STORAGE["last_restore_status"].startswith(("ERROR:", "MISSING_CHECKPOINT")):
         V915_STORAGE["last_save_ok"] = False
         V915_STORAGE["last_save_error"] = "SAVE_BLOCKED_AFTER_RESTORE_ERROR"
         return
     tmp = None
     try:
+        if C_REMOTE_STORE is not None:
+            payload = {k: V90_STATE[k] for k in ("trades", "seen", "signals", "telegram", "filter_observations", "recovery_metadata")}
+            result = C_REMOTE_STORE.save(payload)
+            V915_STORAGE.update(last_save_utc=utc_now(), last_save_ok=True,
+                last_save_error=None, remote_revision=result["revision"],
+                compressed_checkpoint_bytes=result["compressed_bytes"])
+            V915_STORAGE["save_count_since_start"] += 1
+            return
         V90_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        payload = {k: V90_STATE[k] for k in ("trades", "seen", "signals", "telegram", "filter_observations")}
+        payload = {k: V90_STATE[k] for k in ("trades", "seen", "signals", "telegram", "filter_observations", "recovery_metadata")}
         # Same-directory temp file ensures atomic rename on the mounted disk.
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=str(V90_STATE_PATH.parent),
                                          prefix=".v90-checkpoint-", suffix=".tmp", delete=False) as f:
@@ -285,12 +300,22 @@ def v903_save_state():
 def v903_load_state():
     V915_STORAGE["last_restore_utc"] = utc_now()
     try:
-        if not V90_STATE_PATH.is_file():
-            V915_STORAGE["last_restore_status"] = "NO_CHECKPOINT_YET"
-            return
-        saved = json.loads(V90_STATE_PATH.read_text(encoding="utf-8"))
-        if not isinstance(saved, dict) or not isinstance(saved.get("trades"), list) or not isinstance(saved.get("seen"), dict):
-            raise ValueError("checkpoint structure invalid")
+        if C_REMOTE_STORE is not None:
+            saved = C_REMOTE_STORE.load()
+            V915_STORAGE["remote_revision"] = C_REMOTE_STORE.revision
+            V915_STORAGE["backup_path"] = "supabase:alt_momentum_v1_recovery_backup"
+        else:
+            if not V90_STATE_PATH.is_file():
+                V915_STORAGE["last_restore_status"] = "MISSING_CHECKPOINT_STOPPED"
+                return
+            raw = V90_STATE_PATH.read_bytes()
+            saved = json.loads(raw)
+            if not isinstance(saved, dict) or not isinstance(saved.get("trades"), list) or not isinstance(saved.get("seen"), dict):
+                raise ValueError("checkpoint structure invalid")
+            backup = c_backup_checkpoint(raw)
+            V915_STORAGE["backup_path"] = str(backup)
+            V915_STORAGE["loaded_checkpoint_sha256"] = hashlib.sha256(raw).hexdigest()
+        V90_STATE["recovery_metadata"] = saved.get("recovery_metadata", {})
         for k in ("trades", "seen", "signals"):
             if k in saved:
                 V90_STATE[k] = saved[k]
@@ -313,6 +338,14 @@ def v903_load_state():
 @app.get("/v915-storage-status")
 async def v915_storage_status():
     """Read-only disk diagnostics: never alters the checkpoint."""
+    if C_REMOTE_STORE is not None:
+        return {**MODE_INFO, "status": "OK" if V915_STORAGE["last_save_ok"] else "STORAGE_ERROR",
+            "version": "C_SUPABASE_PERSISTENCE_V1", "backend": "SUPABASE",
+            "checkpoint_path": "supabase:alt_momentum_v1_checkpoint",
+            "checkpoint_exists": V915_STORAGE["last_restore_status"] == "RESTORED",
+            "storage": dict(V915_STORAGE), "current_trades_in_memory": len(V90_STATE["trades"]),
+            "recovery_metadata": V90_STATE["recovery_metadata"],
+            "note": "Read-only diagnostics; no credentials or checkpoint contents returned."}
     path = V90_STATE_PATH
     try:
         exists = path.is_file()
@@ -435,9 +468,11 @@ def c_new_monitor(t, bid, now_ms):
         c_new_close(t, bid, "TIME120", now_ms)
     t["previous_observed_bid"] = bid
 
-async def v90_monitor(client):
+async def v90_monitor(client, fast_only=False):
     now_ms = int(time.time()*1000)
-    active = [t for t in V90_STATE["trades"] if t["status"] == "OPEN_SHADOW"]
+    active = [t for t in V90_STATE["trades"] if t["status"] == "OPEN_SHADOW"
+              and (not fast_only or (t.get("variant") == "C" and
+                   t.get("c_forward_version") == C_FORWARD_VERSION))]
     for sym in set(t["symbol"] for t in active):
         try:
             quote = await get_json(client, "/api/v3/ticker/bookTicker", {"symbol":sym})
@@ -498,6 +533,8 @@ async def v90_monitor(client):
                 t["net_pct"] = round(((((t["tp1_price"]/t["entry_price"])-1)*100)*0.5 +
                                       (((t["exit_price"]/t["entry_price"])-1)*100)*0.5 - V90_COST_PCT),5)
     closed_now = [t for t in active if t["status"] == "CLOSED_SHADOW" and not t.get("telegram_exit_attempted")]
+    if closed_now:
+        v903_save_state()  # Persist exits before best-effort Telegram delivery.
     for t in closed_now:
         t["telegram_exit_attempted"] = True
         if t["variant"] == C_OBS120:
@@ -740,6 +777,10 @@ async def v90_scan_once():
                             else:
                                 selected.append(model)
                     if not selected:continue
+                    if V915_STORAGE["last_save_ok"] is False:
+                        for model in selected:
+                            model_rejected[model]["storage_unavailable"] += 1
+                        continue
                     try:
                         q=await get_json(client,"/api/v3/ticker/bookTicker",{"symbol":sym})
                         ask=float(q["askPrice"]);bid=float(q["bidPrice"])
@@ -787,6 +828,8 @@ async def v90_scan_once():
                         if "C" in selected:
                             for trade in reversed(V90_STATE["trades"]):
                                 if trade.get("variant") == "C" and trade.get("entry_ms") == entry_ms and trade.get("symbol") == sym:
+                                    trade["c_forward_version"] = C_FORWARD_VERSION
+                                    trade["exit_monitor_seconds"] = C_MONITOR_SECONDS
                                     trade["c_loss_observation_v1"] = c_loss_entry_flags(trade)
                                     trade["v96_early_decisions"] = {m: {"mode": early_regimes[m]["mode"], "would_block": early_regimes[m]["mode"] == "PAUSE"} for m in V95_MODELS}
                                     break
@@ -798,6 +841,7 @@ async def v90_scan_once():
                                f"Giris: {ask:.10g} | Stop: {ask*0.97:.10g}\n"
                                f"Momentum60: {c['ret60_pct']:+.2f}% | Hacim: {c['volume_ratio']:.2f}x\n"
                                "PAPER ONLY | GERCEK EMIR YOK")
+                        v903_save_state()
                         await v902_notify(msg, "ENTRY", sym)
                         v903_save_state()
                     except Exception as exc:
@@ -833,11 +877,19 @@ async def v90_loop():
 
 @app.on_event("startup")
 async def v90_startup():
-    global V90_TASK
+    global V90_TASK, C_MONITOR_TASK
     V90_STATE["started_utc"]=utc_now()
     v903_load_state()
-    # Keep historical A/B trades for reporting and finish any still-open A/B positions.
-    if V90_TASK is None or V90_TASK.done():V90_TASK=asyncio.create_task(v90_loop())
+    # Never run a scanner from a missing/corrupt/unwritable historical checkpoint.
+    if V915_STORAGE["last_restore_status"] != "RESTORED":
+        return
+    v903_save_state()
+    if not V915_STORAGE["last_save_ok"]:
+        return
+    if V90_TASK is None or V90_TASK.done():
+        V90_TASK = asyncio.create_task(v90_loop())
+    if C_MONITOR_TASK is None or C_MONITOR_TASK.done():
+        C_MONITOR_TASK = asyncio.create_task(c_fast_monitor_loop())
 
 
 @app.get("/v90-status")
@@ -845,9 +897,12 @@ async def v90_status():
     return {**MODE_INFO,"status":"OK","strategy":"V90_HYBRID_MOMENTUM", "diagnostic_version":"V93_C_RISK_FAMILY_PAPER",
             "paper_only":True,"orders":False,"auto_running":bool(V90_TASK and not V90_TASK.done()),
             "scan_interval_seconds":V90_SCAN_SECONDS,"last_scan":V90_STATE["last_scan"],
+            "forward_version": C_FORWARD_VERSION, "new_C_exit_monitor_seconds": C_MONITOR_SECONDS,
+            "fast_monitor_running": bool(C_MONITOR_TASK and not C_MONITOR_TASK.done()),
+            "fast_monitor": dict(C_MONITOR_STATE), "recovery_metadata": V90_STATE["recovery_metadata"],
             "last_error":V90_STATE["last_error"],"total_signals":V90_STATE["signals"],
             "signal_delay_limit_seconds":V90_DELAY_SECONDS,"telegram":V90_STATE["telegram"],
-            "memory_peak_mb":v903_memory_mb(), "checkpoint_path":str(V90_STATE_PATH),
+            "memory_peak_mb":v903_memory_mb(), "checkpoint_path":("supabase:alt_momentum_v1_checkpoint" if C_REMOTE_STORE else str(V90_STATE_PATH)),
             "frozen_legacy":V90_STATE["frozen_legacy"],
              "frozen_models":list(dict.fromkeys(V91_FROZEN + V92_RETIRED + V96_RETIRED +
                  tuple(m for m in (V91_MODELS + tuple(V93_TP_TARGETS) + V93_RISK_MODELS) if m not in V93_ALL_ACTIVE) + C_FROZEN_VARIANTS)),
@@ -1497,7 +1552,7 @@ C_LOSS_HYPOTHESES = {
     "breadth_below_half": ("entry_alt_positive_breadth", "below", .5),
     "chase_above_quarter_pct": ("chase_pct", "above", .25),
     "spread_above_tenth_pct": ("spread_pct", "above", .1),
-    "z_above_2_5": ("z", "above", 2.5),
+    "z_at_most_2_5": ("z", "at_most", 2.5),
 }
 
 
@@ -1506,7 +1561,9 @@ def c_loss_entry_flags(trade):
     for name, (field, direction, threshold) in C_LOSS_HYPOTHESES.items():
         value = trade.get(field)
         known = isinstance(value, (int, float)) and not isinstance(value, bool)
-        flags[name] = (value < threshold if direction == "below" else value > threshold) if known else None
+        flags[name] = ((value < threshold if direction == "below" else
+                        value <= threshold if direction == "at_most" else
+                        value > threshold) if known else None)
     return {"version": "C_LOSS_OBSERVATION_V1", "recorded_utc": utc_now(),
             "would_skip": flags}
 
@@ -1545,8 +1602,11 @@ async def c_loss_analysis():
             groups.setdefault(v914_bucket(t.get(field), bounds), []).append(t)
         breakdowns[field] = {k: v90_stats(v) for k, v in groups.items()}
     return {**MODE_INFO, "reference_model": "C", "paper_only": True,
-        "version": "C_LOSS_OBSERVATION_V1", "entry_exit_rules_unchanged": True,
+        "version": "C_LOSS_OBSERVATION_V1", "entry_thresholds_and_exit_levels_unchanged": True,
+        "new_C_exit_monitor_seconds": C_MONITOR_SECONDS,
         "automatic_entry_blocking": False, "summary": v90_stats(rows),
+        "historical_C": v90_stats([t for t in rows if t.get("c_forward_version") != C_FORWARD_VERSION]),
+        "forward_C": v90_stats([t for t in rows if t.get("c_forward_version") == C_FORWARD_VERSION]),
         "loss_count": sum(t["net_pct"] < 0 for t in closed),
         "exit_reasons": {k: v90_stats(v) for k, v in reasons.items()},
         "historical_descriptive_breakdowns": breakdowns,
@@ -1560,4 +1620,77 @@ async def c_loss_analysis():
             "Skipped returns omit capacity effects and alternative entries; not portfolio returns",
             "Hypotheses overlap; avoided returns must not be added across hypotheses",
             "Overlapping symbols and entry times are correlated; sufficient forward data required",
-            "No hypothesis changes baseline C entries or exits"]}
+            "No hypothesis gates C entries; new forward C exits are checked approximately every 60 seconds"]}
+
+
+
+
+def c_fsync_directory(folder):
+    fd = os.open(str(folder), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+
+
+def c_backup_checkpoint(raw):
+    digest = hashlib.sha256(raw).hexdigest()
+    backup = V90_STATE_PATH.with_name(V90_STATE_PATH.name + ".before-c-forward-" + digest[:16] + ".bak")
+    if backup.exists():
+        if hashlib.sha256(backup.read_bytes()).hexdigest() != digest:
+            raise ValueError("checkpoint backup checksum mismatch")
+        return backup
+    with backup.open("xb") as f:
+        f.write(raw)
+        f.flush()
+        os.fsync(f.fileno())
+    c_fsync_directory(backup.parent)
+    return backup
+
+
+async def c_fast_monitor_once():
+    global V90_LOCK
+    if V90_LOCK is None:
+        V90_LOCK = asyncio.Lock()
+    async with V90_LOCK:
+        if not any(t.get("status") == "OPEN_SHADOW" and t.get("variant") == "C"
+                   and t.get("c_forward_version") == C_FORWARD_VERSION for t in V90_STATE["trades"]):
+            return
+        async with httpx.AsyncClient(timeout=20.) as client:
+            await v90_monitor(client, fast_only=True)
+        v903_save_state()  # Also persist partial-profit and extrema updates.
+        C_MONITOR_STATE["last_check_utc"] = utc_now()
+        C_MONITOR_STATE["checks"] += 1
+
+
+async def c_fast_monitor_loop():
+    while True:
+        try:
+            await c_fast_monitor_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            C_MONITOR_STATE["last_error"] = type(exc).__name__
+        await asyncio.sleep(C_MONITOR_SECONDS)
+
+
+@app.on_event("shutdown")
+async def c_paper_shutdown():
+    tasks = [task for task in (V90_TASK, C_MONITOR_TASK) if task is not None]
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    if V915_STORAGE["last_restore_status"] == "RESTORED":
+        v903_save_state()
+
+
+@app.get("/paper-records")
+async def c_paper_records(limit: int = 250, offset: int = 0):
+    """Read-only export of every retained status, never Telegram credentials."""
+    limit, offset = max(1, min(limit, 500)), max(0, offset)
+    return {**MODE_INFO, "total": len(V90_STATE["trades"]), "limit": limit,
+        "offset": offset, "trades": V90_STATE["trades"][offset:offset + limit],
+        "recovery_metadata": V90_STATE["recovery_metadata"]}
