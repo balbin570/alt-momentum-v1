@@ -203,11 +203,12 @@ async def v22_telegram_send(message):
 
 V90_STATE = {"started_utc": None, "last_scan": None, "last_error": None,
              "scans": 0, "signals": 0, "seen": {}, "trades": [],
+             "filter_observations": {},
              "telegram": {"configured": bool(V22_TG_TOKEN and V22_TG_CHAT_ID), "sent": 0, "failed": 0, "last": None},
              "frozen_legacy": ["V32", "V32.2", "V32.3-B", "V89.4", "V89-100", "BIG_MOVE_V5"]}
 V90_TASK = None
 V90_LOCK = None
-V90_MAX_TRADES = 1200
+# Historical paper trades are never automatically pruned.
 V91_MODELS = ("C", "C_TREND", "C_TRAIL", "C_TIME60", "C_MARKET")
 V93_TP_TARGETS = {"C_TP1": 1.0, "C_TP2": 2.0, "C_TP3": 3.0, "C_TP4": 4.0}
 # V93 risk research arms: C itself and all previous models remain unchanged.
@@ -218,11 +219,11 @@ V95_MODELS = ("V95_EARLY5", "V95_EARLY10")
 V96_RETIRED = V94_MODELS  # no NEW V94 entries; historical open trades still monitored
 V97_TRAIL_MODELS = ("C_SL5_TRAIL5", "C_SL10_TRAIL5")
 V97_TRAIL_STOPS = {"C_SL5_TRAIL5": 0.95, "C_SL10_TRAIL5": 0.90}
-# Only C_TREND and C_BE may open NEW paper trades.
+# Only baseline C may open NEW paper trades (user-selected research reference).
 # Previously opened trades from all retired models are still monitored to closure.
-V93_ALL_ACTIVE = ("C_TREND",)
+V93_ALL_ACTIVE = ("C",)
 C_NEW_VARIANTS = ("C_LADDER3", "C_LADDER4", "C_PROTECT", "C_TRAIL_PRO", "C_TIME_ADAPT")
-C_FROZEN_VARIANTS = ("C_BE", "C_OBS120", "C_CONFIRM1")
+C_FROZEN_VARIANTS = ("C_TREND", "C_BE", "C_OBS120", "C_CONFIRM1", *C_NEW_VARIANTS)
 # Passive mirror of C_TREND entries; not an active signal model.
 C_OBS120 = "C_OBS120"
 C_CONFIRM1 = "C_CONFIRM1"  # Independent 15-minute +1% confirmation research arm
@@ -247,10 +248,14 @@ V915_STORAGE = {"last_save_utc": None, "last_save_ok": None, "last_save_error": 
 
 def v903_save_state():
     """Atomic checkpoint to configured disk; errors exposed in storage status."""
+    if V915_STORAGE["last_restore_status"].startswith("ERROR:"):
+        V915_STORAGE["last_save_ok"] = False
+        V915_STORAGE["last_save_error"] = "SAVE_BLOCKED_AFTER_RESTORE_ERROR"
+        return
     tmp = None
     try:
         V90_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        payload = {k: V90_STATE[k] for k in ("trades", "seen", "signals", "telegram")}
+        payload = {k: V90_STATE[k] for k in ("trades", "seen", "signals", "telegram", "filter_observations")}
         # Same-directory temp file ensures atomic rename on the mounted disk.
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=str(V90_STATE_PATH.parent),
                                          prefix=".v90-checkpoint-", suffix=".tmp", delete=False) as f:
@@ -289,6 +294,9 @@ def v903_load_state():
         for k in ("trades", "seen", "signals"):
             if k in saved:
                 V90_STATE[k] = saved[k]
+        observations = saved.get("filter_observations", {})
+        if isinstance(observations, dict):
+            V90_STATE["filter_observations"] = observations
         tg = saved.get("telegram", {})
         if isinstance(tg, dict):
             for k in ("sent", "failed", "last"):
@@ -331,7 +339,10 @@ async def v902_notify(message, event, symbol):
         reason = result.get("reason") if not ok else None
     except Exception as exc:
         ok = False
-        reason = f"{type(exc).__name__}: {str(exc)[:180]}"
+        # HTTP exception text can contain the Telegram token in its request URL.
+        reason = type(exc).__name__
+        if isinstance(exc, httpx.HTTPStatusError):
+            reason += f" HTTP_{exc.response.status_code}"
     state = V90_STATE["telegram"]
     state["sent" if ok else "failed"] += 1
     state["last"] = {"utc": utc_now(), "event": event, "symbol": symbol,
@@ -663,6 +674,8 @@ async def v90_scan_once():
                 scan["market_context"] = {"btc_ret60_pct":btc_ret60,
                                            "alt_positive_breadth":round(breadth,4) if breadth is not None else None,
                                            "breadth_sample":len(market_returns)}
+                # Counts only: no quotes, orders, positions, or strategy decisions.
+                c_observe_filter_ranges(candidates, scan)
                 regimes = v94_regime(scan_started_ms)
                 scan["v94_regime"] = regimes
                 early_regimes = v95_regime(scan_started_ms)
@@ -774,6 +787,7 @@ async def v90_scan_once():
                         if "C" in selected:
                             for trade in reversed(V90_STATE["trades"]):
                                 if trade.get("variant") == "C" and trade.get("entry_ms") == entry_ms and trade.get("symbol") == sym:
+                                    trade["c_loss_observation_v1"] = c_loss_entry_flags(trade)
                                     trade["v96_early_decisions"] = {m: {"mode": early_regimes[m]["mode"], "would_block": early_regimes[m]["mode"] == "PAUSE"} for m in V95_MODELS}
                                     break
                         for variant in selected:
@@ -795,11 +809,7 @@ async def v90_scan_once():
                     "new_positions":sum(t["variant"]==m and t["entry_ms"] >= scan_started_ms for t in V90_STATE["trades"]),
                     "post_filter_rejections":sum(n for reason,n in model_rejected[m].items() if reason in ("spread_too_wide", "price_chase", "invalid_quote", "c_spread", "entry_exception", "already_seen_or_open", "max_open_positions"))}
                     for m in V93_ALL_ACTIVE}
-                # Keep completed results for review, bounded RAM.
-                if len(V90_STATE["trades"])>V90_MAX_TRADES:
-                    closed=[t for t in V90_STATE["trades"] if t["status"]=="CLOSED_SHADOW"]
-                    keep=set(id(t) for t in closed[:max(0,len(V90_STATE["trades"])-V90_MAX_TRADES)])
-                    V90_STATE["trades"]=[t for t in V90_STATE["trades"] if id(t) not in keep]
+                # Preserve all historical paper records; monitor disk/RAM before deployment.
                 cutoff=int(time.time()*1000)-7*86400000
                 V90_STATE["seen"]={k:v for k,v in V90_STATE["seen"].items() if v>cutoff}
             V90_STATE["last_scan"]=scan
@@ -842,7 +852,8 @@ async def v90_status():
              "frozen_models":list(dict.fromkeys(V91_FROZEN + V92_RETIRED + V96_RETIRED +
                  tuple(m for m in (V91_MODELS + tuple(V93_TP_TARGETS) + V93_RISK_MODELS) if m not in V93_ALL_ACTIVE) + C_FROZEN_VARIANTS)),
              "active_models":list(V93_ALL_ACTIVE),
-            "observation_models": list(C_NEW_VARIANTS),
+            "observation_models": [],
+            "retained_exit_observation_models": list(C_NEW_VARIANTS),
              "frozen_no_new_entries": list(C_FROZEN_VARIANTS),
             "variants":{v:v90_stats([t for t in V90_STATE["trades"] if t["variant"]==v])
                         for v in dict.fromkeys((*V91_FROZEN, *V92_ALL_MODELS, *V93_TP_TARGETS, *V93_RISK_MODELS, *V94_MODELS, *V95_MODELS, *V97_TRAIL_MODELS, C_OBS120, C_CONFIRM1, *C_NEW_VARIANTS))},
@@ -878,7 +889,7 @@ async def v90_filter_analysis():
             "candidates":last.get("candidates"), "new_coins":last.get("new_coins"),
             "errors":last.get("errors"), "filter_counts":last.get("filter_counts",{}),
             "near_misses":last.get("near_misses",[]), "model_filters":last.get("model_filters",{}),
-            "note":"Independent first-failed filter per model; exploratory thresholds; paper only."}
+            "note":"See /c-entry-diagnostics for independent baseline C failures. Historical C_TREND labels gave volume precedence over momentum."}
 
 
 V902_TEST_LAST_MONO = 0.0
@@ -1339,7 +1350,7 @@ async def c_new_variants_report():
     return {**MODE_INFO, "status": "OK", "version": "C_TREND_EXIT_RESEARCH_V1",
             "reference": "C_TREND", "active_signal_models": list(V93_ALL_ACTIVE),
             "frozen_no_new_entries": list(C_FROZEN_VARIANTS),
-            "shadow_models": list(C_NEW_VARIANTS),
+            "shadow_models": [], "frozen_exit_models": list(C_NEW_VARIANTS),
             "rules": {k: [{"target_gross_pct": p, "fraction_of_original": f}
                            for p, f in v] for k, v in C_LADDER_RULES.items()},
             "by_model": {m: {"summary": v90_stats([t for t in rows if t.get("variant") == m]),
@@ -1418,4 +1429,135 @@ async def c_market_regime_analysis():
                             "Breadth uses the sampled top-100 universe, not every altcoin",
                             "Groups are descriptive; small samples and correlated trades limit statistical inference",
                             "Paper-only quotes and sampled exits are not executable fills",
-                            "Trade history is bounded by existing checkpoint retention"]}
+                            "Only retained checkpoint history is available; previously pruned trades cannot be reconstructed"]}
+
+
+# Observation ranges are research counters, never active entry models.
+C_OBSERVATION_MOMENTUM_RANGES = ((1., 8.), (2., 8.), (2.5, 8.))
+C_OBSERVATION_VOLUME_RANGES = ((1., 3.5), (1.2, 3.5), (1.5, 3.5))
+
+
+def c_observe_filter_ranges(candidates, scan):
+    """Observe existing candle snapshots only, without additional network requests."""
+    failures = {k: 0 for k in ("momentum", "volume", "z", "breakout")}
+    for c in candidates:
+        failures["momentum"] += not 2.5 <= c["ret60_pct"] <= 8.
+        failures["volume"] += not 1.2 <= c["volume_ratio"] < 3.5
+        failures["z"] += c["z"] >= 3.5
+        failures["breakout"] += not .2 <= c["breakout_pct"] <= 1.5
+    counts = {}
+    for lo, hi in C_OBSERVATION_MOMENTUM_RANGES:
+        for vlo, vhi in C_OBSERVATION_VOLUME_RANGES:
+            key = f"momentum_{lo:g}_{hi:g}__volume_{vlo:g}_{vhi:g}"
+            matching = [c for c in candidates if lo <= c["ret60_pct"] <= hi
+                        and vlo <= c["volume_ratio"] < vhi]
+            counts[key] = {"momentum_volume_matches": len(matching),
+                "with_other_candle_filters": sum(c["z"] < 3.5 and
+                    .2 <= c["breakout_pct"] <= 1.5 for c in matching)}
+    state = V90_STATE["filter_observations"]
+    state.setdefault("started_utc", scan["utc"])
+    state["scans"] = state.get("scans", 0) + 1
+    state["candidate_observations"] = state.get("candidate_observations", 0) + len(candidates)
+    totals = state.setdefault("range_totals", {})
+    for key, counts_for_range in counts.items():
+        total = totals.setdefault(key, {name: 0 for name in counts_for_range})
+        for name, value in counts_for_range.items():
+            total[name] += value
+    state["last_scan"] = {"utc": scan["utc"], "candidate_count": len(candidates),
+        "independent_failures": failures, "ranges": counts,
+        "market_context": dict(scan.get("market_context", {}))}
+
+
+@app.get("/c-entry-diagnostics")
+async def c_entry_diagnostics():
+    """Read-only diagnostics; does not scan, notify, or write a checkpoint."""
+    rows = [t for t in V90_STATE["trades"] if t.get("variant") == "C"]
+    latest = max(rows, key=lambda t: t.get("entry_ms", 0), default=None)
+    fields = ("entry_btc_ret60_pct", "entry_alt_positive_breadth", "ret60_pct",
+              "volume_ratio", "spread_pct", "entry_utc")
+    return {**MODE_INFO, "paper_only": True, "version": "C_ENTRY_OBSERVATION_V1",
+        "active_models": list(V93_ALL_ACTIVE), "frozen_no_new_entries": list(C_FROZEN_VARIANTS),
+        "last_retained_entry": ({k: latest.get(k) for k in
+            ("symbol", "entry_ms", *fields)} if latest else None),
+        "entry_field_coverage": {field: sum(t.get(field) is not None for t in rows)
+                                 for field in fields},
+        "reference_model": "C", "c_trades_retained": len(rows),
+        "observations": V90_STATE["filter_observations"],
+        "limitations": ["Counts are candidate-scan observations, not unique signals or paper trades",
+            "Spread, price chase, deduplication and capacity are not checked for alternatives",
+            "Independent failure counts overlap; counts use baseline C candle filters",
+            "Alternatives have no measured returns; counts do not establish profitability",
+            "No historical backfill; counters start with deployment",
+            "Entry market context reflects completed candles from the scan, not tick-time data"]}
+
+
+# Explicit, entry-time hypotheses. These flags NEVER gate baseline C entries.
+C_LOSS_HYPOTHESES = {
+    "btc_negative": ("entry_btc_ret60_pct", "below", 0.),
+    "breadth_below_half": ("entry_alt_positive_breadth", "below", .5),
+    "chase_above_quarter_pct": ("chase_pct", "above", .25),
+    "spread_above_tenth_pct": ("spread_pct", "above", .1),
+    "z_above_2_5": ("z", "above", 2.5),
+}
+
+
+def c_loss_entry_flags(trade):
+    flags = {}
+    for name, (field, direction, threshold) in C_LOSS_HYPOTHESES.items():
+        value = trade.get(field)
+        known = isinstance(value, (int, float)) and not isinstance(value, bool)
+        flags[name] = (value < threshold if direction == "below" else value > threshold) if known else None
+    return {"version": "C_LOSS_OBSERVATION_V1", "recorded_utc": utc_now(),
+            "would_skip": flags}
+
+
+def c_loss_comparison(rows, flag):
+    eligible = [t for t in rows if isinstance(
+        t.get("c_loss_observation_v1", {}).get("would_skip", {}).get(flag), bool)]
+    skipped = [t for t in eligible if t["c_loss_observation_v1"]["would_skip"][flag]]
+    kept = [t for t in eligible if not t["c_loss_observation_v1"]["would_skip"][flag]]
+    delta = -sum(t["net_pct"] for t in skipped)
+    return {"eligible_closed": len(eligible), "unknown_closed": len(rows) - len(eligible),
+        "would_skip": v90_stats(skipped), "would_keep": v90_stats(kept),
+        "losers_avoided": sum(t["net_pct"] < 0 for t in skipped),
+        "winners_missed": sum(t["net_pct"] > 0 for t in skipped),
+        "hypothetical_change_sum_return_pct_points": round(delta, 5) if eligible else None,
+        "evidence_status": "OBSERVATION_ONLY_NOT_VALIDATED"}
+
+
+@app.get("/c-loss-analysis")
+async def c_loss_analysis():
+    """Baseline C only. No inferred historical entry context or new orders."""
+    rows = [t for t in V90_STATE["trades"] if t.get("variant") == "C"]
+    closed = sorted([t for t in rows if t.get("status") == "CLOSED_SHADOW"],
+                    key=lambda t: t.get("exit_utc", ""))
+    reasons = {}
+    for t in closed:
+        reasons.setdefault(t.get("exit_reason", "UNKNOWN"), []).append(t)
+    breakdowns = {}
+    dimensions = {"ret60_pct": [2.5, 3, 4, 5, 6, 8],
+        "volume_ratio": [1.2, 1.5, 2, 2.5, 3, 3.5], "z": [0, 1, 2, 2.5, 3, 3.5],
+        "breakout_pct": [.2, .5, 1, 1.5], "spread_pct": [.05, .1, .12],
+        "chase_pct": [0, .1, .25, .5]}
+    for field, bounds in dimensions.items():
+        groups = {}
+        for t in closed:
+            groups.setdefault(v914_bucket(t.get(field), bounds), []).append(t)
+        breakdowns[field] = {k: v90_stats(v) for k, v in groups.items()}
+    return {**MODE_INFO, "reference_model": "C", "paper_only": True,
+        "version": "C_LOSS_OBSERVATION_V1", "entry_exit_rules_unchanged": True,
+        "automatic_entry_blocking": False, "summary": v90_stats(rows),
+        "loss_count": sum(t["net_pct"] < 0 for t in closed),
+        "exit_reasons": {k: v90_stats(v) for k, v in reasons.items()},
+        "historical_descriptive_breakdowns": breakdowns,
+        "recent_20_closed": v90_stats(closed[-20:]),
+        "hypotheses": {name: {"field": field, "comparison": direction, "threshold": threshold,
+            **c_loss_comparison(closed, name)}
+            for name, (field, direction, threshold) in C_LOSS_HYPOTHESES.items()},
+        "limitations": ["Only baseline C records are included; C_TREND, V97 and V13 are not pooled",
+            "Historical breakdowns describe association, not causes or validated filters",
+            "Forward comparisons use only flags recorded at entry after deployment; no backfill",
+            "Skipped returns omit capacity effects and alternative entries; not portfolio returns",
+            "Hypotheses overlap; avoided returns must not be added across hypotheses",
+            "Overlapping symbols and entry times are correlated; sufficient forward data required",
+            "No hypothesis changes baseline C entries or exits"]}
