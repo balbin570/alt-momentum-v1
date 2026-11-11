@@ -897,6 +897,10 @@ async def top20_scalp_loop():
     while True:
         started = time.monotonic()
         await TOP20_SCALPER.cycle(__import__(__name__))
+        report = TOP20_SCALPER.report
+        print(f"TOP20_SCALP_CYCLE universe={report['universe']} leaders={len(report['leaders'])} "
+              f"new_positions={report['new_positions']} errors={report['last_error']} "
+              f"duration_s={report['last_scan_duration_seconds']}", flush=True)
         await asyncio.sleep(max(1, TOP20_SCAN_SECONDS - (time.monotonic() - started)))
 
 
