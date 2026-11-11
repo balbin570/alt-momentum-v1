@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.env
+.env.*
+.venv/
+work/
+v90_state*.json
+*.bak

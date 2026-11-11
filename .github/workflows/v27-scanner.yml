@@ -1,4 +1,4 @@
-name: V27 Forward Paper Scanner
+name: C Forward Paper Service Health
 
 on:
   schedule:
@@ -6,15 +6,14 @@ on:
   workflow_dispatch:
 
 jobs:
-  scan:
+  health:
     runs-on: ubuntu-latest
-    timeout-minutes: 4
-
+    timeout-minutes: 2
     steps:
-      - name: Wake Render and run V27 paper scan
+      - name: Check internal paper scanner without starting another scan
         run: |
           curl --fail --show-error --silent \
-            --max-time 180 \
-            --retry 2 \
-            --retry-delay 10 \
-            "https://alt-momentum-v1.onrender.com/v22-scan-now"
+            --max-time 60 \
+            --retry 1 \
+            "https://alt-momentum-v1.onrender.com/v90-status" \
+            | python -c 'import json,sys; s=json.load(sys.stdin); assert s["orders"] is False and s["trading"] is False and s["auto_running"] and s["active_models"] == ["C"], "Paper scanner health check failed"; print("C paper scanner running; real orders disabled")'
