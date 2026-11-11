@@ -895,8 +895,9 @@ async def v90_loop():
 
 async def top20_scalp_loop():
     while True:
+        started = time.monotonic()
         await TOP20_SCALPER.cycle(__import__(__name__))
-        await asyncio.sleep(TOP20_SCAN_SECONDS)
+        await asyncio.sleep(max(1, TOP20_SCAN_SECONDS - (time.monotonic() - started)))
 
 
 @app.on_event("startup")
