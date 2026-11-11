@@ -161,7 +161,10 @@ class Top20Scalper:
 
     async def scan(self, core, client):
         universe = [x for x in await core.build_universe(client)
-                    if float(x.get("quote_volume_24h", 0)) >= MIN_DAILY_USDT][:MAX_UNIVERSE]
+                    if float(x.get("quote_volume_24h", 0)) >= MIN_DAILY_USDT
+                    and isinstance(x.get("symbol"), str)
+                    and x["symbol"].isascii() and x["symbol"].isalnum()
+                    and x["symbol"].endswith("USDT")][:MAX_UNIVERSE]
         daily = {x["symbol"]: float(x["quote_volume_24h"]) for x in universe}
         symbols = list(daily)
         self.report["universe"] = len(symbols)
