@@ -187,8 +187,15 @@ class Top20Scalper:
                     break
                 previous = [t for t in reversed(core.V90_STATE["trades"])
                             if t.get("variant") == MODEL and t.get("symbol") == symbol]
+                previous_event_ms = previous[0]["entry_ms"] if previous else 0
+                if previous and previous[0].get("exit_utc"):
+                    try:
+                        previous_event_ms = int(datetime.fromisoformat(
+                            previous[0]["exit_utc"].replace("Z", "+00:00")).timestamp() * 1000)
+                    except (ValueError, TypeError):
+                        pass
                 if (any(t["symbol"] == symbol for t in open_rows) or
-                    (previous and int(time.time() * 1000) - previous[0]["entry_ms"]
+                    (previous and int(time.time() * 1000) - previous_event_ms
                      < COOLDOWN_SECONDS * 1000)):
                     rejects["already_open_or_cooldown"] += 1
                     continue
@@ -296,7 +303,7 @@ class Top20Scalper:
             "tp_gross_pct": TP_GROSS_PCT, "sl_gross_pct": SL_GROSS_PCT,
             "time_exit_minutes": TIME_EXIT_MINUTES,
             "assumed_round_trip_cost_pct": COST_PCT,
-            "minimum_spread_safety": MAX_SPREAD_PCT, "exit_monitor_seconds": SCAN_SECONDS,
+            "max_spread_pct": MAX_SPREAD_PCT, "exit_monitor_seconds": SCAN_SECONDS,
             "stats": core.v90_stats(rows),
             "open_positions": [{"symbol": t["symbol"], "entry_utc": t["entry_utc"],
                                 "entry_price": t["entry_price"], "take_profit_price": t["take_profit_price"],
