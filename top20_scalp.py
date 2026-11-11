@@ -286,6 +286,15 @@ class Top20Scalper:
                                          else "CHECKPOINT_SAVE_FAILED_ON_ENTRY")
         except asyncio.CancelledError:
             raise
+        except httpx.HTTPStatusError as exc:
+            try:
+                body = exc.response.json()
+                code = body.get("code") if isinstance(body, dict) else None
+            except (ValueError, TypeError):
+                code = None
+            self.report["last_error"] = (
+                f"BINANCE_HTTP_{exc.response.status_code}_CODE_{code}"
+                f"_PATH_{exc.request.url.path}")
         except Exception as exc:
             self.report["last_error"] = type(exc).__name__
         finally:
