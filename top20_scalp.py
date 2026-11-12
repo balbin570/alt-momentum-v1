@@ -77,7 +77,7 @@ def confirm_pullback(raw, now_ms):
         return None
     dip = change_pct(recent_high, prev_close)
     bounce = change_pct(prev_close, last_close)
-    if not (-0.85 <= dip <= -0.12 and bounce >= 0.10 and last_close > float(last[1]) and last_close > float(prev[2])):
+    if not (-0.85 <= dip <= -0.12 and bounce >= 0.06 and last_close > float(last[1])):
         return None
     if last_close > recent_high * 1.0015:
         return None
@@ -219,7 +219,7 @@ class Top20Scalper:
                     continue
                 spread = (ask - bid) / ask * 100
                 chase = change_pct(signal["signal_price"], ask)
-                if spread > MAX_SPREAD_PCT or chase > MAX_CHASE_PCT or chase < -0.75:
+                if spread > MAX_SPREAD_PCT or chase > MAX_CHASE_PCT or chase < -0.10:
                     rejects["price_or_spread"] += 1
                     continue
             except Exception:
