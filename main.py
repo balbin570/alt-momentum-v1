@@ -212,6 +212,7 @@ V90_STATE = {"started_utc": None, "last_scan": None, "last_error": None,
 V90_TASK = None
 C_MONITOR_TASK = None
 TOP20_TASK = None
+TOP20_MONITOR_TASK = None
 TOP20_SCALPER = Top20Scalper()
 C_MONITOR_SECONDS = 60
 C_FORWARD_VERSION = "C_FORWARD_SAFETY_V1"
@@ -906,7 +907,7 @@ async def top20_scalp_loop():
 
 @app.on_event("startup")
 async def v90_startup():
-    global V90_TASK, C_MONITOR_TASK, TOP20_TASK
+    global V90_TASK, C_MONITOR_TASK, TOP20_TASK, TOP20_MONITOR_TASK
     V90_STATE["started_utc"]=utc_now()
     v903_load_state()
     # Never run a scanner from a missing/corrupt/unwritable historical checkpoint.
@@ -921,11 +922,13 @@ async def v90_startup():
         C_MONITOR_TASK = asyncio.create_task(c_fast_monitor_loop())
     if TOP20_TASK is None or TOP20_TASK.done():
         TOP20_TASK = asyncio.create_task(top20_scalp_loop())
+    if TOP20_MONITOR_TASK is None or TOP20_MONITOR_TASK.done():
+        TOP20_MONITOR_TASK = asyncio.create_task(TOP20_SCALPER.monitor_loop(__import__(__name__)))
 
 
 @app.get("/top20-scalp-status")
 async def top20_scalp_status():
-    return TOP20_SCALPER.status(__import__(__name__), bool(TOP20_TASK and not TOP20_TASK.done()))
+    return TOP20_SCALPER.status(__import__(__name__), bool(TOP20_TASK and not TOP20_TASK.done() and TOP20_MONITOR_TASK and not TOP20_MONITOR_TASK.done()))
 
 
 @app.get("/c-shadow-mom1-status")
@@ -1741,7 +1744,7 @@ async def c_fast_monitor_loop():
 
 @app.on_event("shutdown")
 async def c_paper_shutdown():
-    tasks = [task for task in (V90_TASK, C_MONITOR_TASK, TOP20_TASK) if task is not None]
+    tasks = [task for task in (V90_TASK, C_MONITOR_TASK, TOP20_TASK, TOP20_MONITOR_TASK) if task is not None]
     for task in tasks:
         task.cancel()
     if tasks:
