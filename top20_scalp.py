@@ -6,14 +6,16 @@ from datetime import datetime, timezone
 
 import httpx
 
-MODEL = "TOP20_SCALP_V1"
+MODEL = "TOP20_SCALP_V2"
+LEGACY_MODEL = "TOP20_SCALP_V1"
+MONITOR_SECONDS = 10
 SCAN_SECONDS = 60
 MAX_OPEN = 5
 MAX_UNIVERSE = 400
 MIN_DAILY_USDT = 1_000_000
 TP_GROSS_PCT = 0.60
 SL_GROSS_PCT = -0.40
-TIME_EXIT_MINUTES = 15
+TIME_EXIT_MINUTES = 10
 COST_PCT = 0.15
 MAX_SPREAD_PCT = 0.06
 MAX_CHASE_PCT = 0.12
@@ -75,7 +77,7 @@ def confirm_pullback(raw, now_ms):
         return None
     dip = change_pct(recent_high, prev_close)
     bounce = change_pct(prev_close, last_close)
-    if not (-0.85 <= dip <= -0.12 and bounce >= 0.06):
+    if not (-0.85 <= dip <= -0.12 and bounce >= 0.10 and last_close > float(last[1]) and last_close > float(prev[2])):
         return None
     if last_close > recent_high * 1.0015:
         return None
@@ -111,7 +113,7 @@ class Top20Scalper:
             core.V90_LOCK = asyncio.Lock()
         async with core.V90_LOCK:
             open_symbols = list({t["symbol"] for t in core.V90_STATE["trades"]
-                if t.get("variant") == MODEL and t.get("status") == "OPEN_SHADOW"})
+                if t.get("variant") in (MODEL, LEGACY_MODEL) and t.get("status") == "OPEN_SHADOW"})
         self.report["monitor_checks"] += 1
         self.report["last_monitor_utc"] = core.utc_now()
         if not open_symbols:
@@ -126,7 +128,7 @@ class Top20Scalper:
         closed = []
         async with core.V90_LOCK:
             for t in core.V90_STATE["trades"]:
-                if t.get("variant") != MODEL or t.get("status") != "OPEN_SHADOW":
+                if t.get("variant") not in (MODEL, LEGACY_MODEL) or t.get("status") != "OPEN_SHADOW":
                     continue
                 bid = quotes.get(t["symbol"])
                 if bid is None:
@@ -139,7 +141,7 @@ class Top20Scalper:
                 elif bid >= t["take_profit_price"]:
                     reason = "TAKE_PROFIT_MONITORED"
                 elif now_ms >= t["entry_ms"] + TIME_EXIT_MINUTES * 60_000:
-                    reason = "TIME15"
+                    reason = "TIME10"
                 else:
                     continue
                 core.v90_close(t, bid, reason, now_ms)
@@ -152,7 +154,7 @@ class Top20Scalper:
                     return
         for trade in closed:
             await core.v902_notify(
-                f"TOP20 SCALP PAPER CIKIS\n{trade['symbol']} | "
+                f"{trade['variant']} PAPER CIKIS\n{trade['symbol']} | "
                 f"Net: {trade['net_pct']:+.3f}% | {trade['exit_reason']}\n"
                 "GERCEK EMIR YOK", "EXIT_" + MODEL, trade["symbol"])
         if closed:
@@ -189,7 +191,7 @@ class Top20Scalper:
                     rejects["max_open"] += 1
                     break
                 previous = [t for t in reversed(core.V90_STATE["trades"])
-                            if t.get("variant") == MODEL and t.get("symbol") == symbol]
+                            if t.get("variant") in (MODEL, LEGACY_MODEL) and t.get("symbol") == symbol]
                 previous_event_ms = previous[0]["entry_ms"] if previous else 0
                 if previous and previous[0].get("exit_utc"):
                     try:
@@ -248,7 +250,7 @@ class Top20Scalper:
                     "research_only": True, "orders": False,
                     "paper_notional_usdt": 100,
                     "assumed_cost_pct": COST_PCT,
-                    "exit_monitor_seconds": SCAN_SECONDS,
+                    "exit_monitor_seconds": MONITOR_SECONDS,
                     "telegram_exit_attempted": False}
                 core.V90_STATE["trades"].append(new_trade)
                 core.V90_STATE["seen"][seen_key] = entry_ms
@@ -261,7 +263,7 @@ class Top20Scalper:
             if new_trade is not None:
                 self.report["new_positions"] += 1
                 await core.v902_notify(
-                    f"TOP20 SCALP PAPER GIRIS\n{symbol}\n"
+                    f"TOP20 SCALP V2 PAPER GIRIS\n{symbol}\n"
                     f"5dk: {candidate['ret5_pct']:+.2f}% | 10dk: {candidate['ret10_pct']:+.2f}%\n"
                     f"Giris: {ask:.10g} | TP: +{TP_GROSS_PCT:.2f}% | "
                     f"SL: {SL_GROSS_PCT:.2f}%\nPAPER ONLY | GERCEK EMIR YOK",
@@ -269,6 +271,21 @@ class Top20Scalper:
                 async with core.V90_LOCK:
                     core.v903_save_state()
         self.report["last_scan_rejections"] = rejects
+
+    async def monitor_loop(self, core):
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            while True:
+                started = time.monotonic()
+                try:
+                    if core.V915_STORAGE.get("last_restore_status") == "RESTORED" and core.V915_STORAGE.get("last_save_ok") is not False:
+                        await self.monitor(core, client)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    self.report["last_monitor_error"] = type(exc).__name__
+                else:
+                    self.report["last_monitor_error"] = None
+                await asyncio.sleep(max(0.1, MONITOR_SECONDS - (time.monotonic() - started)))
 
     async def cycle(self, core):
         start = time.monotonic()
@@ -280,10 +297,6 @@ class Top20Scalper:
         try:
             async with httpx.AsyncClient(timeout=30.0,
                     limits=httpx.Limits(max_connections=8, max_keepalive_connections=5)) as client:
-                await self.monitor(core, client)
-                if core.V915_STORAGE.get("last_save_ok") is False:
-                    self.report["last_error"] = "CHECKPOINT_SAVE_FAILED_ON_EXIT"
-                    return
                 await self.scan(core, client)
             self.report["last_error"] = (None if core.V915_STORAGE.get("last_save_ok")
                                          else "CHECKPOINT_SAVE_FAILED_ON_ENTRY")
@@ -306,6 +319,7 @@ class Top20Scalper:
 
     def status(self, core, running):
         rows = [t for t in core.V90_STATE["trades"] if t.get("variant") == MODEL]
+        open_rows = [t for t in core.V90_STATE["trades"] if t.get("variant") in (MODEL, LEGACY_MODEL) and t.get("status") == "OPEN_SHADOW"]
         return {**core.MODE_INFO, "status": "OK" if self.report["last_error"] is None else "DEGRADED",
             "model_name": MODEL, "paper_only": True, "auto_running": running,
             "scan_interval_seconds": SCAN_SECONDS, "max_open": MAX_OPEN,
@@ -315,11 +329,10 @@ class Top20Scalper:
             "tp_gross_pct": TP_GROSS_PCT, "sl_gross_pct": SL_GROSS_PCT,
             "time_exit_minutes": TIME_EXIT_MINUTES,
             "assumed_round_trip_cost_pct": COST_PCT,
-            "max_spread_pct": MAX_SPREAD_PCT, "exit_monitor_seconds": SCAN_SECONDS,
+            "max_spread_pct": MAX_SPREAD_PCT, "exit_monitor_seconds": MONITOR_SECONDS,
             "stats": core.v90_stats(rows),
             "open_positions": [{"symbol": t["symbol"], "entry_utc": t["entry_utc"],
                                 "entry_price": t["entry_price"], "take_profit_price": t["take_profit_price"],
-                                "stop_price": t["stop_price"]} for t in rows
-                               if t.get("status") == "OPEN_SHADOW"],
+                                "stop_price": t["stop_price"]} for t in open_rows],
             "last_report": dict(self.report),
             "note": "Sampled paper exits; no guaranteed fills. Ranking covers at most 400 liquid spot USDT coins."}
