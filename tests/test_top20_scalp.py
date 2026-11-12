@@ -3,7 +3,7 @@ import time
 import unittest
 
 from top20_scalp import (MODEL, Top20Scalper, change_pct, select_leaders,
-                         confirm_pullback, MAX_OPEN)
+                         confirm_pullback, MAX_OPEN, LEGACY_MODEL, MONITOR_SECONDS)
 
 
 def bars_for_rebound():
@@ -104,6 +104,8 @@ class Top20Tests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("OPEN_SHADOW", trade["status"])
         self.assertFalse(trade["orders"])
         self.assertEqual(100, trade["paper_notional_usdt"])
+        self.assertEqual(10, trade["exit_monitor_seconds"])
+        self.assertEqual("TOP20_SCALP_V2", MODEL)
         self.assertEqual(1, strategy.status(core, True)["stats"]["open"])
         self.assertEqual(1, len(core.notifications))
         await strategy.cycle(core)
@@ -144,6 +146,45 @@ class Top20Tests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([], core.V90_STATE["trades"])
         self.assertEqual({}, core.V90_STATE["seen"])
         self.assertEqual([], core.notifications)
+
+    def test_weak_rebound_and_weak_close_rejected(self):
+        candles = bars_for_rebound()
+        candles[-1][4] = "100.56"
+        self.assertIsNone(confirm_pullback(candles, int(time.time() * 1000)))
+        candles = bars_for_rebound()
+        candles[-1][1] = "100.60"
+        self.assertIsNone(confirm_pullback(candles, int(time.time() * 1000)))
+
+    async def test_v1_drains_without_new_v1_entries_and_keeps_history(self):
+        core = FakeCore()
+        strategy = Top20Scalper()
+        await strategy.cycle(core)
+        old = core.V90_STATE["trades"][0]
+        old["variant"] = LEGACY_MODEL
+        core.bid = 101.4
+        await strategy.monitor_cycle(core)
+        self.assertEqual("CLOSED_SHADOW", old["status"])
+        self.assertEqual(LEGACY_MODEL, old["variant"])
+        self.assertEqual("EXIT_" + LEGACY_MODEL, core.notifications[-1][0])
+        await strategy.cycle(core, include_monitor=False)
+        self.assertEqual(1, len(core.V90_STATE["trades"]))
+        self.assertFalse(strategy.status(core, True)["legacy_v1_new_entries"])
+        self.assertEqual(0, strategy.status(core, True)["stats"]["closed"])
+        self.assertEqual(1, strategy.status(core, True)["legacy_v1_stats"]["closed"])
+
+    async def test_monitor_does_not_wait_for_c_scan_lock(self):
+        core = FakeCore()
+        strategy = Top20Scalper()
+        await strategy.cycle(core)
+        core.V90_LOCK = asyncio.Lock()
+        await core.V90_LOCK.acquire()
+        core.bid = 100.1
+        try:
+            await asyncio.wait_for(strategy.monitor_cycle(core), timeout=2)
+        finally:
+            core.V90_LOCK.release()
+        self.assertEqual("CLOSED_SHADOW", core.V90_STATE["trades"][0]["status"])
+        self.assertEqual(10, MONITOR_SECONDS)
 
     async def test_existing_history_and_other_models_untouched(self):
         core = FakeCore()
