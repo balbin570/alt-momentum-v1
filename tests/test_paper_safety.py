@@ -227,13 +227,18 @@ class PaperSafetyTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.Event().wait()
         with patch.object(app, 'V90_TASK', None), patch.object(app, 'C_MONITOR_TASK', None), \
              patch.object(app, 'v90_loop', wait_forever), \
-             patch.object(app, 'c_fast_monitor_loop', wait_forever):
+             patch.object(app, 'c_fast_monitor_loop', wait_forever), \
+             patch.object(app, 'TOP20_TASK', None), patch.object(app, 'TOP20_MONITOR_TASK', None), \
+             patch.object(app, 'top20_scalp_loop', wait_forever), \
+             patch.object(app, 'top20_fast_monitor_loop', wait_forever):
             await app.v90_startup()
             self.assertIsNotNone(app.V90_TASK)
             self.assertIsNotNone(app.C_MONITOR_TASK)
             await app.c_paper_shutdown()
             self.assertTrue(app.V90_TASK.done())
             self.assertTrue(app.C_MONITOR_TASK.done())
+            self.assertTrue(app.TOP20_TASK.done())
+            self.assertTrue(app.TOP20_MONITOR_TASK.done())
         self.assertTrue(app.V915_STORAGE['last_save_ok'])
 
     async def test_loss_analysis_separates_old_and_new_monitor_cadence(self):

@@ -6,8 +6,15 @@ from datetime import datetime, timezone
 
 import httpx
 
-MODEL = "TOP20_SCALP_V1"
+MODEL = "TOP20_SCALP_V2"
+LEGACY_MODEL = "TOP20_SCALP_V1"
+TOP20_MODELS = (MODEL, LEGACY_MODEL)
 SCAN_SECONDS = 60
+MONITOR_SECONDS = 10
+MIN_REBOUND_PCT = 0.12
+MIN_CLOSE_LOCATION = 0.60
+MIN_BODY_FRACTION = 0.35
+MIN_CHASE_PCT = -0.05
 MAX_OPEN = 5
 MAX_UNIVERSE = 400
 MIN_DAILY_USDT = 1_000_000
@@ -75,21 +82,36 @@ def confirm_pullback(raw, now_ms):
         return None
     dip = change_pct(recent_high, prev_close)
     bounce = change_pct(prev_close, last_close)
-    if not (-0.85 <= dip <= -0.12 and bounce >= 0.06):
+    if not (-0.85 <= dip <= -0.12 and bounce >= MIN_REBOUND_PCT):
+        return None
+    last_open, last_high, last_low = float(last[1]), float(last[2]), float(last[3])
+    span = last_high - last_low
+    if span <= 0 or last_close <= last_open:
+        return None
+    close_location = (last_close - last_low) / span
+    body_fraction = (last_close - last_open) / span
+    if close_location < MIN_CLOSE_LOCATION or body_fraction < MIN_BODY_FRACTION:
         return None
     if last_close > recent_high * 1.0015:
         return None
     return {"signal_ms": int(last[6]), "signal_price": last_close,
-            "pullback_pct": round(dip, 5), "rebound_pct": round(bounce, 5)}
+            "pullback_pct": round(dip, 5), "rebound_pct": round(bounce, 5),
+            "rebound_close_location": round(close_location, 5),
+            "rebound_body_fraction": round(body_fraction, 5)}
 
 
 class Top20Scalper:
     def __init__(self):
+        # TOP20 has its own lock: C holds V90_LOCK across network scans.
+        # Shared checkpoint writes are synchronous, with no await inside mutations.
+        self.lock = asyncio.Lock()
         self.report = {
             "last_scan_utc": None, "last_monitor_utc": None, "scans": 0,
             "monitor_checks": 0, "universe": 0, "leaders": [],
             "new_positions": 0, "last_scan_rejections": {},
             "last_error": None, "last_scan_duration_seconds": None,
+            "last_monitor_error": None, "last_monitor_duration_seconds": None,
+            "last_monitor_gap_seconds": None, "monitor_quote_errors": 0,
         }
 
     async def rolling(self, core, client, symbols, window):
@@ -106,27 +128,29 @@ class Top20Scalper:
         return [x for batch in results for x in batch]
 
     async def monitor(self, core, client):
-        """Paper TP/SL/time at observed bid; not a live exchange resting stop."""
-        if core.V90_LOCK is None:
-            core.V90_LOCK = asyncio.Lock()
-        async with core.V90_LOCK:
-            open_symbols = list({t["symbol"] for t in core.V90_STATE["trades"]
-                if t.get("variant") == MODEL and t.get("status") == "OPEN_SHADOW"})
-        self.report["monitor_checks"] += 1
-        self.report["last_monitor_utc"] = core.utc_now()
-        if not open_symbols:
+        """Sample bids for V2 and drain existing V1 positions; no V1 entries."""
+        async with self.lock:
+            snapshot = [t for t in core.V90_STATE["trades"]
+                        if t.get("variant") in TOP20_MODELS and t.get("status") == "OPEN_SHADOW"]
+        if not snapshot:
+            self.report["monitor_quote_errors"] = 0
             return
-        quotes = {}
-        for symbol in open_symbols:
-            q = await core.get_json(client, "/api/v3/ticker/bookTicker", {"symbol": symbol})
-            price = float(q["bidPrice"])
-            if price > 0:
-                quotes[symbol] = price
+        async def get_bid(symbol):
+            try:
+                q = await asyncio.wait_for(core.get_json(client, "/api/v3/ticker/bookTicker",
+                                                        {"symbol": symbol}), timeout=6)
+                bid = float(q["bidPrice"])
+                return symbol, bid if bid > 0 else None
+            except Exception:
+                return symbol, None
+        quotes = dict(await asyncio.gather(*(get_bid(s) for s in {t["symbol"] for t in snapshot})))
+        self.report["monitor_quote_errors"] = sum(bid is None for bid in quotes.values())
         now_ms = int(time.time() * 1000)
         closed = []
-        async with core.V90_LOCK:
-            for t in core.V90_STATE["trades"]:
-                if t.get("variant") != MODEL or t.get("status") != "OPEN_SHADOW":
+        async with self.lock:
+            # Only act on positions present when quotes were requested.
+            for t in snapshot:
+                if t.get("status") != "OPEN_SHADOW":
                     continue
                 bid = quotes.get(t["symbol"])
                 if bid is None:
@@ -142,22 +166,51 @@ class Top20Scalper:
                     reason = "TIME15"
                 else:
                     continue
+                before = dict(t)
                 core.v90_close(t, bid, reason, now_ms)
                 t["telegram_exit_attempted"] = True
-                closed.append(t)
+                closed.append((t, before))
             if closed:
                 core.v903_save_state()
                 if not core.V915_STORAGE["last_save_ok"]:
-                    self.report["last_error"] = "CHECKPOINT_SAVE_FAILED_ON_EXIT"
-                    return
-        for trade in closed:
+                    for trade, before in closed:
+                        trade.clear()
+                        trade.update(before)
+                    raise RuntimeError("CHECKPOINT_SAVE_FAILED_ON_EXIT")
+        for trade, _ in closed:
             await core.v902_notify(
-                f"TOP20 SCALP PAPER CIKIS\n{trade['symbol']} | "
+                f"{trade['variant']} PAPER CIKIS\n{trade['symbol']} | "
                 f"Net: {trade['net_pct']:+.3f}% | {trade['exit_reason']}\n"
-                "GERCEK EMIR YOK", "EXIT_" + MODEL, trade["symbol"])
+                "GERCEK EMIR YOK", "EXIT_" + trade["variant"], trade["symbol"])
         if closed:
-            async with core.V90_LOCK:
+            async with self.lock:
                 core.v903_save_state()
+
+    async def monitor_cycle(self, core):
+        started = time.monotonic()
+        previous = self.report["last_monitor_utc"]
+        self.report["monitor_checks"] += 1
+        try:
+            if core.V915_STORAGE.get("last_restore_status") != "RESTORED":
+                self.report["last_monitor_error"] = "CHECKPOINT_NOT_READY"
+                return
+            async with httpx.AsyncClient(timeout=8.0,
+                    limits=httpx.Limits(max_connections=5, max_keepalive_connections=5)) as client:
+                await self.monitor(core, client)
+            self.report["last_monitor_error"] = (
+                "QUOTE_ERRORS" if self.report["monitor_quote_errors"] else
+                "CHECKPOINT_SAVE_FAILED" if not core.V915_STORAGE.get("last_save_ok") else None)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.report["last_monitor_error"] = str(exc) if str(exc) == "CHECKPOINT_SAVE_FAILED_ON_EXIT" else type(exc).__name__
+        finally:
+            self.report["last_monitor_utc"] = core.utc_now()
+            self.report["last_monitor_duration_seconds"] = round(time.monotonic() - started, 2)
+            if previous:
+                self.report["last_monitor_gap_seconds"] = round(
+                    (datetime.fromisoformat(self.report["last_monitor_utc"]) -
+                     datetime.fromisoformat(previous)).total_seconds(), 2)
 
     async def scan(self, core, client):
         universe = [x for x in await core.build_universe(client)
@@ -180,16 +233,14 @@ class Top20Scalper:
         self.report["new_positions"] = 0
         for candidate in leaders:
             symbol = candidate["symbol"]
-            if core.V90_LOCK is None:
-                core.V90_LOCK = asyncio.Lock()
-            async with core.V90_LOCK:
+            async with self.lock:
                 open_rows = [t for t in core.V90_STATE["trades"]
-                             if t.get("variant") == MODEL and t.get("status") == "OPEN_SHADOW"]
+                             if t.get("variant") in TOP20_MODELS and t.get("status") == "OPEN_SHADOW"]
                 if len(open_rows) >= MAX_OPEN:
                     rejects["max_open"] += 1
                     break
                 previous = [t for t in reversed(core.V90_STATE["trades"])
-                            if t.get("variant") == MODEL and t.get("symbol") == symbol]
+                            if t.get("variant") in TOP20_MODELS and t.get("symbol") == symbol]
                 previous_event_ms = previous[0]["entry_ms"] if previous else 0
                 if previous and previous[0].get("exit_utc"):
                     try:
@@ -217,16 +268,17 @@ class Top20Scalper:
                     continue
                 spread = (ask - bid) / ask * 100
                 chase = change_pct(signal["signal_price"], ask)
-                if spread > MAX_SPREAD_PCT or chase > MAX_CHASE_PCT or chase < -0.75:
+                if (spread > MAX_SPREAD_PCT or chase > MAX_CHASE_PCT or chase < MIN_CHASE_PCT
+                    or change_pct(signal["signal_price"], bid) < MIN_CHASE_PCT):
                     rejects["price_or_spread"] += 1
                     continue
             except Exception:
                 rejects["data_error"] += 1
                 continue
             new_trade = None
-            async with core.V90_LOCK:
+            async with self.lock:
                 open_rows = [t for t in core.V90_STATE["trades"]
-                             if t.get("variant") == MODEL and t.get("status") == "OPEN_SHADOW"]
+                             if t.get("variant") in TOP20_MODELS and t.get("status") == "OPEN_SHADOW"]
                 seen_key = f"{MODEL}:{symbol}:{signal['signal_ms']}"
                 if (len(open_rows) >= MAX_OPEN or
                     any(t["symbol"] == symbol for t in open_rows) or
@@ -248,7 +300,7 @@ class Top20Scalper:
                     "research_only": True, "orders": False,
                     "paper_notional_usdt": 100,
                     "assumed_cost_pct": COST_PCT,
-                    "exit_monitor_seconds": SCAN_SECONDS,
+                    "exit_monitor_seconds": MONITOR_SECONDS,
                     "telegram_exit_attempted": False}
                 core.V90_STATE["trades"].append(new_trade)
                 core.V90_STATE["seen"][seen_key] = entry_ms
@@ -261,16 +313,16 @@ class Top20Scalper:
             if new_trade is not None:
                 self.report["new_positions"] += 1
                 await core.v902_notify(
-                    f"TOP20 SCALP PAPER GIRIS\n{symbol}\n"
+                    f"{MODEL} PAPER GIRIS\n{symbol}\n"
                     f"5dk: {candidate['ret5_pct']:+.2f}% | 10dk: {candidate['ret10_pct']:+.2f}%\n"
                     f"Giris: {ask:.10g} | TP: +{TP_GROSS_PCT:.2f}% | "
                     f"SL: {SL_GROSS_PCT:.2f}%\nPAPER ONLY | GERCEK EMIR YOK",
                     "ENTRY_" + MODEL, symbol)
-                async with core.V90_LOCK:
+                async with self.lock:
                     core.v903_save_state()
         self.report["last_scan_rejections"] = rejects
 
-    async def cycle(self, core):
+    async def cycle(self, core, include_monitor=True):
         start = time.monotonic()
         self.report["scans"] += 1
         if (core.V915_STORAGE.get("last_restore_status") != "RESTORED"
@@ -280,7 +332,8 @@ class Top20Scalper:
         try:
             async with httpx.AsyncClient(timeout=30.0,
                     limits=httpx.Limits(max_connections=8, max_keepalive_connections=5)) as client:
-                await self.monitor(core, client)
+                if include_monitor:
+                    await self.monitor_cycle(core)
                 if core.V915_STORAGE.get("last_save_ok") is False:
                     self.report["last_error"] = "CHECKPOINT_SAVE_FAILED_ON_EXIT"
                     return
@@ -304,9 +357,10 @@ class Top20Scalper:
             self.report["last_scan_utc"] = core.utc_now()
             self.report["last_scan_duration_seconds"] = round(time.monotonic() - start, 2)
 
-    def status(self, core, running):
+    def status(self, core, running, monitor_running=True):
         rows = [t for t in core.V90_STATE["trades"] if t.get("variant") == MODEL]
-        return {**core.MODE_INFO, "status": "OK" if self.report["last_error"] is None else "DEGRADED",
+        legacy = [t for t in core.V90_STATE["trades"] if t.get("variant") == LEGACY_MODEL]
+        return {**core.MODE_INFO, "status": "OK" if running and monitor_running and self.report["last_error"] is None and self.report["last_monitor_error"] is None else "DEGRADED",
             "model_name": MODEL, "paper_only": True, "auto_running": running,
             "scan_interval_seconds": SCAN_SECONDS, "max_open": MAX_OPEN,
             "universe_limit": MAX_UNIVERSE, "min_24h_quote_volume_usdt": MIN_DAILY_USDT,
@@ -315,11 +369,17 @@ class Top20Scalper:
             "tp_gross_pct": TP_GROSS_PCT, "sl_gross_pct": SL_GROSS_PCT,
             "time_exit_minutes": TIME_EXIT_MINUTES,
             "assumed_round_trip_cost_pct": COST_PCT,
-            "max_spread_pct": MAX_SPREAD_PCT, "exit_monitor_seconds": SCAN_SECONDS,
+            "max_spread_pct": MAX_SPREAD_PCT, "exit_monitor_seconds": MONITOR_SECONDS,
+            "exit_monitor_running": monitor_running,
+            "entry_confirmation": {"min_rebound_pct": MIN_REBOUND_PCT,
+                "min_close_location": MIN_CLOSE_LOCATION, "min_body_fraction": MIN_BODY_FRACTION,
+                "min_price_chase_pct": MIN_CHASE_PCT, "max_price_chase_pct": MAX_CHASE_PCT},
+            "legacy_v1_new_entries": False, "legacy_v1_stats": core.v90_stats(legacy),
+            "legacy_v1_open_positions": [t["symbol"] for t in legacy if t.get("status") == "OPEN_SHADOW"],
             "stats": core.v90_stats(rows),
             "open_positions": [{"symbol": t["symbol"], "entry_utc": t["entry_utc"],
                                 "entry_price": t["entry_price"], "take_profit_price": t["take_profit_price"],
                                 "stop_price": t["stop_price"]} for t in rows
                                if t.get("status") == "OPEN_SHADOW"],
             "last_report": dict(self.report),
-            "note": "Sampled paper exits; no guaranteed fills. Ranking covers at most 400 liquid spot USDT coins."}
+            "note": "V2 replaces V1 entries; existing V1 positions drain using original targets. Sampled 10s exits, not guaranteed fills. Ranking covers at most 400 liquid spot USDT coins."}
