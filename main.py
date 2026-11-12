@@ -477,7 +477,7 @@ def c_new_monitor(t, bid, now_ms):
 async def v90_monitor(client, fast_only=False):
     now_ms = int(time.time()*1000)
     active = [t for t in V90_STATE["trades"] if t["status"] == "OPEN_SHADOW"
-              and t.get("variant") != TOP20_MODEL
+              and t.get("variant") not in (TOP20_MODEL, "TOP20_SCALP_V1")
               and (not fast_only or (t.get("variant") in ("C", *C_SHADOW_MODELS) and
                    t.get("c_forward_version") == C_FORWARD_VERSION))]
     for sym in set(t["symbol"] for t in active):
