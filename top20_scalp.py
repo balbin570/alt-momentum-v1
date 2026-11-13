@@ -247,6 +247,102 @@ class Top20Scalper:
                 async with core.V90_LOCK:
                     core.v903_save_state()
         self.report["last_scan_rejections"] = rejects
+        await self.scan_hybrid(core, client, leaders)
+ 
+    async def scan_hybrid(self, core, client, leaders):
+        hybrid_model = "C_SHADOW_V4_C_EXIT"
+        hybrid_models = (hybrid_model, "C_SHADOW_MOM1")
+        rejects = {"price_or_spread": 0, "already_open_or_cooldown": 0,
+                   "max_open": 0, "data_error": 0, "storage_unavailable": 0}
+        self.report["hybrid_new_positions"] = 0
+        for candidate in leaders:
+            symbol = candidate["symbol"]
+            if core.V90_LOCK is None:
+                core.V90_LOCK = asyncio.Lock()
+            async with core.V90_LOCK:
+                open_rows = [t for t in core.V90_STATE["trades"]
+                             if t.get("variant") in hybrid_models and t.get("status") == "OPEN_SHADOW"]
+                if len(open_rows) >= MAX_OPEN:
+                    rejects["max_open"] += 1
+                    break
+                previous = [t for t in reversed(core.V90_STATE["trades"])
+                            if t.get("variant") in hybrid_models and t.get("symbol") == symbol]
+                previous_event_ms = previous[0]["entry_ms"] if previous else 0
+                if previous and previous[0].get("exit_utc"):
+                    try:
+                        previous_event_ms = int(datetime.fromisoformat(
+                            previous[0]["exit_utc"].replace("Z", "+00:00")).timestamp() * 1000)
+                    except (ValueError, TypeError):
+                        pass
+                if (any(t["symbol"] == symbol for t in open_rows) or
+                    (previous and int(time.time() * 1000) - previous_event_ms
+                     < COOLDOWN_SECONDS * 1000)):
+                    rejects["already_open_or_cooldown"] += 1
+                    continue
+            try:
+                signal = candidate
+                quote = await core.get_json(client, "/api/v3/ticker/bookTicker",
+                                            {"symbol": symbol})
+                bid, ask = float(quote["bidPrice"]), float(quote["askPrice"])
+                if bid <= 0 or ask <= 0 or ask < bid:
+                    rejects["price_or_spread"] += 1
+                    continue
+                spread = (ask - bid) / ask * 100
+                chase = change_pct(signal["signal_price"], ask)
+                if spread > MAX_SPREAD_PCT or chase > MAX_CHASE_PCT or chase < -0.10:
+                    rejects["price_or_spread"] += 1
+                    continue
+            except Exception:
+                rejects["data_error"] += 1
+                continue
+            new_trade = None
+            async with core.V90_LOCK:
+                open_rows = [t for t in core.V90_STATE["trades"]
+                             if t.get("variant") in hybrid_models and t.get("status") == "OPEN_SHADOW"]
+                seen_key = f"{hybrid_model}:{symbol}:{signal['signal_ms']}"
+                if (len(open_rows) >= MAX_OPEN or
+                    any(t["symbol"] == symbol for t in open_rows) or
+                    seen_key in core.V90_STATE["seen"]):
+                    rejects["already_open_or_cooldown"] += 1
+                    continue
+                if core.V915_STORAGE.get("last_save_ok") is False or \
+                   core.V915_STORAGE.get("last_restore_status") != "RESTORED":
+                    rejects["storage_unavailable"] += 1
+                    continue
+                entry_ms = int(time.time() * 1000)
+                new_trade = {**candidate, **signal, "variant": hybrid_model,
+                    "symbol": symbol, "status": "OPEN_SHADOW",
+                    "entry_ms": entry_ms, "entry_utc": core.utc_now(), "entry_price": ask,
+                    "stop_price": ask * 0.97,
+                    "tp1_done": False, "trail_active": False, "be_armed": False,
+                    "c_forward_version": core.C_FORWARD_VERSION,
+                    "shadow_entry_version": hybrid_model,
+                    "spread_pct": round(spread, 5), "chase_pct": round(chase, 5),
+                    "max_bid": ask, "min_bid": ask,
+                    "research_only": True, "orders": False,
+                    "paper_notional_usdt": 100,
+                    "assumed_cost_pct": COST_PCT,
+                    "exit_monitor_seconds": core.C_MONITOR_SECONDS,
+                    "telegram_exit_attempted": False}
+                core.V90_STATE["trades"].append(new_trade)
+                core.V90_STATE["seen"][seen_key] = entry_ms
+                core.v903_save_state()
+                if not core.V915_STORAGE["last_save_ok"]:
+                    core.V90_STATE["trades"].pop()
+                    core.V90_STATE["seen"].pop(seen_key, None)
+                    rejects["storage_unavailable"] += 1
+                    new_trade = None
+            if new_trade is not None:
+                self.report["hybrid_new_positions"] += 1
+                await core.v902_notify(
+                    f"C SHADOW V4 C EXIT PAPER GIRIS\n{symbol}\n"
+                    f"5dk: {candidate['ret5_pct']:+.2f}% | 10dk: {candidate['ret10_pct']:+.2f}%\n"
+                    f"Giris: {ask:.10g} | Yari TP: +3% | SL: -3% | 120dk\n"
+                    "PAPER ONLY | GERCEK EMIR YOK",
+                    "ENTRY_" + hybrid_model, symbol)
+                async with core.V90_LOCK:
+                    core.v903_save_state()
+        self.report["hybrid_rejections"] = rejects
 
     async def monitor_loop(self, core):
         async with httpx.AsyncClient(timeout=8.0) as client:
