@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 import httpx
 from fastapi import FastAPI
 from paper_store import SupabasePaperStore
-from top20_scalp import Top20Scalper, MODEL as TOP20_MODEL, SCAN_SECONDS as TOP20_SCAN_SECONDS
+from top20_scalp import Top20Scalper, MODEL as TOP20_MODEL, SCAN_SECONDS as TOP20_SCAN_SECONDS, ACTIVE_MODELS as TOP20_ACTIVE_MODELS
 
 app = FastAPI(title="ALT-MOMENTUM-V90")
 BINANCE = "https://data-api.binance.vision"
@@ -478,7 +478,7 @@ def c_new_monitor(t, bid, now_ms):
 async def v90_monitor(client, fast_only=False):
     now_ms = int(time.time()*1000)
     active = [t for t in V90_STATE["trades"] if t["status"] == "OPEN_SHADOW"
-              and t.get("variant") not in (TOP20_MODEL, "TOP20_SCALP_V1", "TOP20_SCALP_V2")
+              and t.get("variant") not in TOP20_ACTIVE_MODELS
               and (not fast_only or (t.get("variant") in ("C", *C_SHADOW_MODELS) and
                    t.get("c_forward_version") == C_FORWARD_VERSION))]
     for sym in set(t["symbol"] for t in active):
