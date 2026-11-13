@@ -6,8 +6,10 @@ from datetime import datetime, timezone
 
 import httpx
 
-MODEL = "TOP20_SCALP_V3"
-ACTIVE_MODELS = (MODEL, "TOP20_SCALP_V2", "TOP20_SCALP_V1")
+MODEL = "TOP20_SCALP_V4"
+ACTIVE_MODELS = (MODEL, "TOP20_SCALP_V3", "TOP20_SCALP_V2", "TOP20_SCALP_V1")
+MIN_RET10_PCT = 0.40
+MAX_RET10_PCT = 1.50
 MONITOR_SECONDS = 10
 SCAN_SECONDS = 60
 MAX_OPEN = 5
@@ -41,7 +43,7 @@ def confirm_early_momentum(raw, now_ms):
     baseline = sum(float(k[7]) for k in bars[-11:-1]) / 10
     ratio = float(last[7]) / baseline if baseline > 0 else 0
     if not (p1 >= 0.10 and p3 >= 0.20 and 0.15 <= p5 <= 0.80
-            and 0 < p10 <= 1.50 and ratio >= 1.5 and price > float(last[1])):
+            and MIN_RET10_PCT <= p10 <= MAX_RET10_PCT and ratio >= 1.5 and price > float(last[1])):
         return None
     return {"signal_ms": int(last[6]), "signal_price": price,
             "ret1_pct": round(p1,5), "ret3_pct": round(p3,5),
@@ -121,7 +123,7 @@ class Top20Scalper:
             await core.v902_notify(
                 f"{trade['variant']} PAPER CIKIS\n{trade['symbol']} | "
                 f"Net: {trade['net_pct']:+.3f}% | {trade['exit_reason']}\n"
-                "GERCEK EMIR YOK", "EXIT_" + MODEL, trade["symbol"])
+                "GERCEK EMIR YOK", "EXIT_" + trade["variant"], trade["symbol"])
         if closed:
             async with core.V90_LOCK:
                 core.v903_save_state()
@@ -237,7 +239,7 @@ class Top20Scalper:
             if new_trade is not None:
                 self.report["new_positions"] += 1
                 await core.v902_notify(
-                    f"TOP20 SCALP V3 EARLY MOMENTUM PAPER GIRIS\n{symbol}\n"
+                    f"TOP20 SCALP V4 EARLY MOMENTUM PAPER GIRIS\n{symbol}\n"
                     f"5dk: {candidate['ret5_pct']:+.2f}% | 10dk: {candidate['ret10_pct']:+.2f}%\n"
                     f"Giris: {ask:.10g} | TP: +{TP_GROSS_PCT:.2f}% | "
                     f"SL: {SL_GROSS_PCT:.2f}%\nPAPER ONLY | GERCEK EMIR YOK",
@@ -300,11 +302,13 @@ class Top20Scalper:
             "universe_limit": MAX_UNIVERSE, "min_24h_quote_volume_usdt": MIN_DAILY_USDT,
             "volume_spike_entry_required": True, "min_volume_ratio": 1.5,
             "momentum_windows_minutes": [1, 3, 5, 10],
+            "min_ret10_pct": MIN_RET10_PCT, "max_ret10_pct": MAX_RET10_PCT,
             "tp_gross_pct": TP_GROSS_PCT, "sl_gross_pct": SL_GROSS_PCT,
             "time_exit_minutes": TIME_EXIT_MINUTES,
             "assumed_round_trip_cost_pct": COST_PCT,
             "max_spread_pct": MAX_SPREAD_PCT, "exit_monitor_seconds": MONITOR_SECONDS,
             "stats": core.v90_stats(rows),
+            "ret10_high_band_stats": core.v90_stats([t for t in rows if 1.0 <= t.get("ret10_pct", 0) <= MAX_RET10_PCT]),
             "open_positions": [{"symbol": t["symbol"], "entry_utc": t["entry_utc"],
                                 "entry_price": t["entry_price"], "take_profit_price": t["take_profit_price"],
                                 "stop_price": t["stop_price"]} for t in open_rows],
