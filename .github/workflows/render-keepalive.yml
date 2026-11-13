@@ -1,0 +1,29 @@
+name: ALT Momentum Render Keepalive
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/render-keepalive.yml'
+permissions:
+  contents: read
+concurrency:
+  group: alt-momentum-keepalive
+  cancel-in-progress: false
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - name: Wake Render and verify paper scanner
+        run: |
+          curl --fail --silent --show-error --retry 2 --retry-delay 5 --connect-timeout 20 --max-time 65 https://alt-momentum-v1.onrender.com/top20-scalp-status -o status.json
+          python - <<'PY'
+          import json
+          with open("status.json") as f:
+              s = json.load(f)
+          print("Model:", s.get("model_name"), "Running:", s.get("auto_running"), "Status:", s.get("status"))
+          assert s.get("paper_only") is True and s.get("orders") is False
+          assert s.get("auto_running") is True and s.get("status") == "OK"
+          PY
