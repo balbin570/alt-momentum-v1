@@ -6,9 +6,9 @@ from datetime import datetime, timezone
 
 import httpx
 
-MODEL = "TOP20_SCALP_V4"
-ACTIVE_MODELS = (MODEL, "TOP20_SCALP_V3", "TOP20_SCALP_V2", "TOP20_SCALP_V1")
-MIN_RET10_PCT = 0.40
+MODEL = "TOP20_SCALP_V3"
+ACTIVE_MODELS = (MODEL, "TOP20_SCALP_V4", "TOP20_SCALP_V2", "TOP20_SCALP_V1")
+MIN_RET10_PCT = 0.0
 MAX_RET10_PCT = 1.50
 MONITOR_SECONDS = 10
 SCAN_SECONDS = 60
@@ -43,7 +43,7 @@ def confirm_early_momentum(raw, now_ms):
     baseline = sum(float(k[7]) for k in bars[-11:-1]) / 10
     ratio = float(last[7]) / baseline if baseline > 0 else 0
     if not (p1 >= 0.10 and p3 >= 0.20 and 0.15 <= p5 <= 0.80
-            and MIN_RET10_PCT <= p10 <= MAX_RET10_PCT and ratio >= 1.5 and price > float(last[1])):
+            and MIN_RET10_PCT < p10 <= MAX_RET10_PCT and ratio >= 1.5 and price > float(last[1])):
         return None
     return {"signal_ms": int(last[6]), "signal_price": price,
             "ret1_pct": round(p1,5), "ret3_pct": round(p3,5),
@@ -239,7 +239,7 @@ class Top20Scalper:
             if new_trade is not None:
                 self.report["new_positions"] += 1
                 await core.v902_notify(
-                    f"TOP20 SCALP V4 EARLY MOMENTUM PAPER GIRIS\n{symbol}\n"
+                    f"TOP20 SCALP V3 EARLY MOMENTUM PAPER GIRIS\n{symbol}\n"
                     f"5dk: {candidate['ret5_pct']:+.2f}% | 10dk: {candidate['ret10_pct']:+.2f}%\n"
                     f"Giris: {ask:.10g} | TP: +{TP_GROSS_PCT:.2f}% | "
                     f"SL: {SL_GROSS_PCT:.2f}%\nPAPER ONLY | GERCEK EMIR YOK",
@@ -247,7 +247,9 @@ class Top20Scalper:
                 async with core.V90_LOCK:
                     core.v903_save_state()
         self.report["last_scan_rejections"] = rejects
-        await self.scan_hybrid(core, client, leaders)
+        hybrid_leaders = sorted((x for x in results if x is not None and x["ret10_pct"] >= 0.40),
+                                key=lambda x: (-x["score"], x["symbol"]))[:20]
+        await self.scan_hybrid(core, client, hybrid_leaders)
  
     async def scan_hybrid(self, core, client, leaders):
         hybrid_model = "C_SHADOW_V4_C_EXIT"
