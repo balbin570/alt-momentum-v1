@@ -177,7 +177,10 @@ class Top20Scalper:
         # Keep the hybrid independent of scalp confirmation and exit rules.
         hybrid_leaders = sorted((x for x in results if x is not None and x["ret10_pct"] >= 0.40),
                                 key=lambda x: (-x["score"], x["symbol"]))[:20]
-        await self.scan_hybrid(core, client, hybrid_leaders)
+        # C SHADOW retired: existing positions remain under C exit monitoring.
+        self.report["hybrid_new_positions"] = 0
+        self.report["hybrid_rejections"] = {}
+        self.report["hybrid_entries_enabled"] = False
         rejects["confirmation_failed"] = 0
         async def confirmation_quote(candidate):
             async with semaphore:
