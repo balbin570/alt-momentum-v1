@@ -6,8 +6,8 @@ from datetime import datetime, timezone
 
 import httpx
 
-MODEL = "TOP20_SCALP_V3"
-ACTIVE_MODELS = (MODEL, "TOP20_SCALP_V4", "TOP20_SCALP_V2", "TOP20_SCALP_V1")
+MODEL = "TOP20_SCALP_V5"
+ACTIVE_MODELS = (MODEL, "TOP20_SCALP_V3", "TOP20_SCALP_V4", "TOP20_SCALP_V2", "TOP20_SCALP_V1")
 MIN_RET10_PCT = 0.0
 MAX_RET10_PCT = 1.50
 MONITOR_SECONDS = 10
@@ -15,9 +15,14 @@ SCAN_SECONDS = 60
 MAX_OPEN = 5
 MAX_UNIVERSE = 100
 MIN_DAILY_USDT = 1_000_000
-TP_GROSS_PCT = 0.60
-SL_GROSS_PCT = -0.40
-TIME_EXIT_MINUTES = 10
+TP_GROSS_PCT = 0.40
+SL_GROSS_PCT = -0.25
+TIME_EXIT_MINUTES = 5
+CONFIRM_SECONDS = 25
+CONFIRM_MIN_BID_RISE_PCT = 0.03
+EARLY_EXIT_SECONDS = 60
+EARLY_EXIT_LOSS_PCT = -0.10
+EARLY_EXIT_MAX_RISE_PCT = 0.15
 COST_PCT = 0.15
 MAX_SPREAD_PCT = 0.06
 MAX_CHASE_PCT = 0.12
@@ -103,12 +108,20 @@ class Top20Scalper:
                 t["last_bid"] = bid
                 t["max_bid"] = max(t.get("max_bid", t["entry_price"]), bid)
                 t["min_bid"] = min(t.get("min_bid", t["entry_price"]), bid)
+                age_ms = now_ms - t["entry_ms"]
+                is_v5 = t.get("variant") == MODEL
+                if is_v5:
+                    samples = t.setdefault("early_bid_samples", [])
+                    if age_ms <= 120_000:
+                        samples.append({"age_seconds": round(age_ms / 1000, 2), "bid": bid})
                 if bid <= t["stop_price"]:
                     reason = "STOP_MONITORED"
                 elif bid >= t["take_profit_price"]:
                     reason = "TAKE_PROFIT_MONITORED"
-                elif now_ms >= t["entry_ms"] + TIME_EXIT_MINUTES * 60_000:
-                    reason = "TIME10"
+                elif is_v5 and age_ms >= EARLY_EXIT_SECONDS * 1000 and change_pct(t["entry_price"], bid) <= EARLY_EXIT_LOSS_PCT and change_pct(t["entry_price"], t["max_bid"]) < EARLY_EXIT_MAX_RISE_PCT:
+                    reason = "MOMENTUM_LOST"
+                elif age_ms >= (TIME_EXIT_MINUTES if is_v5 else 10) * 60_000:
+                    reason = "TIME5" if is_v5 else "TIME10"
                 else:
                     continue
                 core.v90_close(t, bid, reason, now_ms)
@@ -161,7 +174,36 @@ class Top20Scalper:
                          key=lambda x: (-x["score"], x["symbol"]))[:20]
         self.report["leaders"] = leaders
         self.report["new_positions"] = 0
-        for candidate in leaders:
+        # Keep the hybrid independent of scalp confirmation and exit rules.
+        hybrid_leaders = sorted((x for x in results if x is not None and x["ret10_pct"] >= 0.40),
+                                key=lambda x: (-x["score"], x["symbol"]))[:20]
+        await self.scan_hybrid(core, client, hybrid_leaders)
+        rejects["confirmation_failed"] = 0
+        async def confirmation_quote(candidate):
+            async with semaphore:
+                try:
+                    q = await core.get_json(client, "/api/v3/ticker/bookTicker", {"symbol": candidate["symbol"]})
+                    bid, ask = float(q["bidPrice"]), float(q["askPrice"])
+                    if not (0 < bid <= ask) or (ask-bid)/ask*100 > MAX_SPREAD_PCT:
+                        return None
+                    return (bid, ask, time.monotonic())
+                except Exception:
+                    return None
+        first_quotes = await asyncio.gather(*(confirmation_quote(c) for c in leaders))
+        if any(q is not None for q in first_quotes):
+            await asyncio.sleep(CONFIRM_SECONDS)
+        second_quotes = await asyncio.gather(*(confirmation_quote(c) for c in leaders))
+        confirmed = []
+        for candidate, first, second in zip(leaders, first_quotes, second_quotes):
+            if first is None or second is None or second[2]-first[2] < CONFIRM_SECONDS or change_pct(first[0], second[0]) < CONFIRM_MIN_BID_RISE_PCT:
+                rejects["confirmation_failed"] += 1
+                continue
+            confirmed.append({**candidate, "confirmation_bid_start": first[0],
+                              "confirmation_bid_end": second[0],
+                              "confirmation_seconds": round(second[2]-first[2], 2),
+                              "confirmation_rise_pct": round(change_pct(first[0], second[0]), 5)})
+        self.report["confirmed_leaders"] = len(confirmed)
+        for candidate in confirmed:
             symbol = candidate["symbol"]
             if core.V90_LOCK is None:
                 core.V90_LOCK = asyncio.Lock()
@@ -193,6 +235,9 @@ class Top20Scalper:
                 if bid <= 0 or ask <= 0 or ask < bid:
                     rejects["price_or_spread"] += 1
                     continue
+                if bid < candidate["confirmation_bid_end"]:
+                    rejects["confirmation_failed"] += 1
+                    continue
                 spread = (ask - bid) / ask * 100
                 chase = change_pct(signal["signal_price"], ask)
                 if spread > MAX_SPREAD_PCT or chase > MAX_CHASE_PCT or chase < -0.10:
@@ -222,7 +267,7 @@ class Top20Scalper:
                     "stop_price": ask * (1 + SL_GROSS_PCT / 100),
                     "take_profit_price": ask * (1 + TP_GROSS_PCT / 100),
                     "spread_pct": round(spread, 5), "chase_pct": round(chase, 5),
-                    "max_bid": ask, "min_bid": ask,
+                    "max_bid": ask, "min_bid": ask, "early_bid_samples": [],
                     "research_only": True, "orders": False,
                     "paper_notional_usdt": 100,
                     "assumed_cost_pct": COST_PCT,
@@ -239,7 +284,7 @@ class Top20Scalper:
             if new_trade is not None:
                 self.report["new_positions"] += 1
                 await core.v902_notify(
-                    f"TOP20 SCALP V3 EARLY MOMENTUM PAPER GIRIS\n{symbol}\n"
+                    f"TOP20 SCALP V5 CONFIRMED MOMENTUM PAPER GIRIS\n{symbol}\n"
                     f"5dk: {candidate['ret5_pct']:+.2f}% | 10dk: {candidate['ret10_pct']:+.2f}%\n"
                     f"Giris: {ask:.10g} | TP: +{TP_GROSS_PCT:.2f}% | "
                     f"SL: {SL_GROSS_PCT:.2f}%\nPAPER ONLY | GERCEK EMIR YOK",
@@ -247,9 +292,6 @@ class Top20Scalper:
                 async with core.V90_LOCK:
                     core.v903_save_state()
         self.report["last_scan_rejections"] = rejects
-        hybrid_leaders = sorted((x for x in results if x is not None and x["ret10_pct"] >= 0.40),
-                                key=lambda x: (-x["score"], x["symbol"]))[:20]
-        await self.scan_hybrid(core, client, hybrid_leaders)
  
     async def scan_hybrid(self, core, client, leaders):
         hybrid_model = "C_SHADOW_V4_C_EXIT"
@@ -403,6 +445,9 @@ class Top20Scalper:
             "min_ret10_pct": MIN_RET10_PCT, "max_ret10_pct": MAX_RET10_PCT,
             "tp_gross_pct": TP_GROSS_PCT, "sl_gross_pct": SL_GROSS_PCT,
             "time_exit_minutes": TIME_EXIT_MINUTES,
+            "confirmation_seconds": CONFIRM_SECONDS, "confirmation_min_bid_rise_pct": CONFIRM_MIN_BID_RISE_PCT,
+            "early_exit_seconds": EARLY_EXIT_SECONDS, "early_exit_loss_pct": EARLY_EXIT_LOSS_PCT,
+            "early_exit_max_rise_pct": EARLY_EXIT_MAX_RISE_PCT,
             "assumed_round_trip_cost_pct": COST_PCT,
             "max_spread_pct": MAX_SPREAD_PCT, "exit_monitor_seconds": MONITOR_SECONDS,
             "stats": core.v90_stats(rows),
