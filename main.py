@@ -216,6 +216,8 @@ TOP20_MONITOR_TASK = None
 TOP20_SCALPER = Top20Scalper()
 C_MONITOR_SECONDS = 60
 C_FORWARD_VERSION = "C_FORWARD_SAFETY_V1"
+C_RULE_VERSION = "C_V2_PROTECT"
+C_MIN_MOMENTUM = 2.0
 C_MONITOR_STATE = {"last_check_utc": None, "checks": 0, "last_error": None}
 V90_LOCK = None
 # Historical paper trades are never automatically pruned.
@@ -511,6 +513,14 @@ async def v90_monitor(client, fast_only=False):
                 t["tp1_done"] = True
                 t["tp1_price"] = bid
                 t["tp1_utc"] = utc_now()
+            # New C entries only: protect gains, never alter legacy open trades.
+            if t["variant"] == "C" and t.get("c_rule_version") == C_RULE_VERSION:
+                if t["max_bid"] >= t["entry_price"] * 1.015:
+                    t["be_armed"] = True
+                    t["stop_price"] = max(t["stop_price"], t["entry_price"] * (1 + V90_COST_PCT / 100))
+                if t.get("tp1_done"):
+                    t["trail_active"] = True
+                    t["stop_price"] = max(t["stop_price"], t["max_bid"] * 0.985)
             # V91.3 trail arm: activate only after +1.5% gross gain; trail 1.5% below highest observed bid.
             # Preserve original -3% hard stop until activation. This is sampled every 5 minutes.
             if t["variant"] in ("V913_PULLBACK_TRAIL15", "C_TRAIL"):
@@ -534,6 +544,8 @@ async def v90_monitor(client, fast_only=False):
             elif t["variant"] != C_OBS120 and bid <= t["stop_price"]:
                 v90_close(t, bid, ("TRAIL5_MONITORED" if t["variant"] in V97_TRAIL_MODELS and t.get("trail_active")
                                   else "TRAIL15_MONITORED" if t["variant"] in ("V913_PULLBACK_TRAIL15", "C_TRAIL") and t.get("trail_active")
+                                  else "C_V2_TRAIL" if t.get("c_rule_version") == C_RULE_VERSION and t.get("trail_active")
+                                  else "C_V2_BE" if t.get("c_rule_version") == C_RULE_VERSION and t.get("be_armed")
                                   else "STOP_MONITORED"), now_ms)
             elif now_ms >= (t.get("confirm1_original_deadline_ms", t["entry_ms"] + (60 if t["variant"] == "C_TIME60" else 120)*60000)):
                 v90_close(t, bid, "TIME60" if t["variant"] == "C_TIME60" else "TIME120", now_ms)
@@ -749,7 +761,7 @@ async def v90_scan_once():
                              if model == "C_TREND" and not 1.5 <= vol < 3.5:
                                  reason = "volume_range"
                              if reason is None:
-                                 if not 2.5 <= ret <= 8.0: reason = "momentum_range"
+                                 if not (C_MIN_MOMENTUM if model == "C" else 2.5) <= ret <= 8.0: reason = "momentum_range"
                                  elif not 1.2 <= vol < 3.5: reason = "volume_range"
                                  elif z >= 3.5: reason = "z_extreme"
                                  elif not 0.2 <= breakout <= 1.5: reason = "breakout_range"
@@ -825,6 +837,9 @@ async def v90_scan_once():
                                 "stop_price":ask*V97_TRAIL_STOPS.get(variant, V93_RISK_STOPS.get(variant, 0.97)),"spread_pct":round(spread,5),
                                 "chase_pct":round(chase,5),"max_bid":ask,"min_bid":ask,
                                 "tp1_done":False,"trail_active":False,"research_only":True,"be_armed":False}
+                            if variant == "C":
+                                entry_record.update(c_rule_version=C_RULE_VERSION, stop_price=ask * 0.98,
+                                    paper_notional_usdt=100, assumed_cost_pct=V90_COST_PCT, orders=False)
                             if variant in C_SHADOW_MODELS:
                                 entry_record.update(c_forward_version=C_FORWARD_VERSION,
                                     exit_monitor_seconds=C_MONITOR_SECONDS,
@@ -857,7 +872,7 @@ async def v90_scan_once():
                         scan["new_coins"]+=1
                         V90_STATE["signals"]+=1
                         msg = (f"ALT V91 PAPER GIRIS\n{sym} | {', '.join(selected)}\n"
-                               f"Giris: {ask:.10g} | Stop: {ask*0.97:.10g}\n"
+                               f"Giris: {ask:.10g} | Stop: {ask*(0.98 if 'C' in selected else 0.97):.10g}\n"
                                f"Momentum60: {c['ret60_pct']:+.2f}% | Hacim: {c['volume_ratio']:.2f}x\n"
                                "PAPER ONLY | GERCEK EMIR YOK")
                         v903_save_state()
@@ -1665,7 +1680,10 @@ async def c_loss_analysis():
             groups.setdefault(v914_bucket(t.get(field), bounds), []).append(t)
         breakdowns[field] = {k: v90_stats(v) for k, v in groups.items()}
     return {**MODE_INFO, "reference_model": "C", "paper_only": True,
-        "version": "C_LOSS_OBSERVATION_V1", "entry_thresholds_and_exit_levels_unchanged": True,
+        "version": "C_LOSS_OBSERVATION_V1", "entry_thresholds_and_exit_levels_unchanged": False,
+        "active_c_rule_version": C_RULE_VERSION, "c_v2_stats": v90_stats([t for t in rows if t.get("c_rule_version") == C_RULE_VERSION]),
+        "c_legacy_stats": v90_stats([t for t in rows if t.get("c_rule_version") != C_RULE_VERSION]),
+        "c_v2_rules": {"min_ret60_pct": C_MIN_MOMENTUM, "initial_stop_pct": -2, "be_arm_pct": 1.5, "be_stop_pct": V90_COST_PCT, "partial_tp_pct": 3, "trailing_pct": 1.5, "max_hold_minutes": 120},
         "new_C_exit_monitor_seconds": C_MONITOR_SECONDS,
         "automatic_entry_blocking": False, "summary": v90_stats(rows),
         "historical_C": v90_stats([t for t in rows if t.get("c_forward_version") != C_FORWARD_VERSION]),
