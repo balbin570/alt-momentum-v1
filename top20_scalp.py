@@ -6,8 +6,8 @@ from datetime import datetime, timezone
 
 import httpx
 
-MODEL = "TOP20_SCALP_V5"
-ACTIVE_MODELS = (MODEL, "TOP20_SCALP_V3", "TOP20_SCALP_V4", "TOP20_SCALP_V2", "TOP20_SCALP_V1")
+MODEL = "TOP20_SCALP_V6"
+ACTIVE_MODELS = (MODEL, "TOP20_SCALP_V5", "TOP20_SCALP_V3", "TOP20_SCALP_V4", "TOP20_SCALP_V2", "TOP20_SCALP_V1")
 MIN_RET10_PCT = 0.0
 MAX_RET10_PCT = 1.50
 MONITOR_SECONDS = 10
@@ -17,7 +17,7 @@ MAX_UNIVERSE = 100
 MIN_DAILY_USDT = 1_000_000
 TP_GROSS_PCT = 0.40
 SL_GROSS_PCT = -0.25
-TIME_EXIT_MINUTES = 5
+TIME_EXIT_MINUTES = 4
 CONFIRM_SECONDS = 25
 CONFIRM_MIN_BID_RISE_PCT = 0.03
 EARLY_EXIT_SECONDS = 60
@@ -109,7 +109,10 @@ class Top20Scalper:
                 t["max_bid"] = max(t.get("max_bid", t["entry_price"]), bid)
                 t["min_bid"] = min(t.get("min_bid", t["entry_price"]), bid)
                 age_ms = now_ms - t["entry_ms"]
-                is_v5 = t.get("variant") == MODEL
+                # Keep the prior V5 profile for already-open positions.
+                is_v5 = t.get("variant") in ("TOP20_SCALP_V5", MODEL)
+                timeout_minutes = (TIME_EXIT_MINUTES if t.get("variant") == MODEL
+                                   else 5 if is_v5 else 10)
                 if is_v5:
                     samples = t.setdefault("early_bid_samples", [])
                     if age_ms <= 120_000:
@@ -120,8 +123,8 @@ class Top20Scalper:
                     reason = "TAKE_PROFIT_MONITORED"
                 elif is_v5 and age_ms >= EARLY_EXIT_SECONDS * 1000 and change_pct(t["entry_price"], bid) <= EARLY_EXIT_LOSS_PCT and change_pct(t["entry_price"], t["max_bid"]) < EARLY_EXIT_MAX_RISE_PCT:
                     reason = "MOMENTUM_LOST"
-                elif age_ms >= (TIME_EXIT_MINUTES if is_v5 else 10) * 60_000:
-                    reason = "TIME5" if is_v5 else "TIME10"
+                elif age_ms >= timeout_minutes * 60_000:
+                    reason = f"TIME{timeout_minutes}"
                 else:
                     continue
                 core.v90_close(t, bid, reason, now_ms)
@@ -275,6 +278,7 @@ class Top20Scalper:
                     "paper_notional_usdt": 100,
                     "assumed_cost_pct": COST_PCT,
                     "exit_monitor_seconds": MONITOR_SECONDS,
+                    "time_exit_minutes": TIME_EXIT_MINUTES,
                     "telegram_exit_attempted": False}
                 core.V90_STATE["trades"].append(new_trade)
                 core.V90_STATE["seen"][seen_key] = entry_ms
@@ -287,7 +291,7 @@ class Top20Scalper:
             if new_trade is not None:
                 self.report["new_positions"] += 1
                 await core.v902_notify(
-                    f"TOP20 SCALP V5 CONFIRMED MOMENTUM PAPER GIRIS\n{symbol}\n"
+                    f"{MODEL} CONFIRMED MOMENTUM PAPER GIRIS\n{symbol}\n"
                     f"5dk: {candidate['ret5_pct']:+.2f}% | 10dk: {candidate['ret10_pct']:+.2f}%\n"
                     f"Giris: {ask:.10g} | TP: +{TP_GROSS_PCT:.2f}% | "
                     f"SL: {SL_GROSS_PCT:.2f}%\nPAPER ONLY | GERCEK EMIR YOK",
@@ -454,9 +458,13 @@ class Top20Scalper:
             "assumed_round_trip_cost_pct": COST_PCT,
             "max_spread_pct": MAX_SPREAD_PCT, "exit_monitor_seconds": MONITOR_SECONDS,
             "stats": core.v90_stats(rows),
+            "baseline_v5_stats": core.v90_stats([t for t in core.V90_STATE["trades"]
+                                               if t.get("variant") == "TOP20_SCALP_V5"]),
+            "time_exit_minutes_by_model": {"TOP20_SCALP_V5": 5, MODEL: TIME_EXIT_MINUTES},
             "ret10_high_band_stats": core.v90_stats([t for t in rows if 1.0 <= t.get("ret10_pct", 0) <= MAX_RET10_PCT]),
             "open_positions": [{"symbol": t["symbol"], "entry_utc": t["entry_utc"],
                                 "entry_price": t["entry_price"], "take_profit_price": t["take_profit_price"],
                                 "stop_price": t["stop_price"]} for t in open_rows],
             "last_report": dict(self.report),
             "note": "Sampled paper exits; no guaranteed fills. Early momentum scans at most 100 liquid spot USDT coins."}
+
