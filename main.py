@@ -218,6 +218,8 @@ C_MONITOR_SECONDS = 60
 C_FORWARD_VERSION = "C_FORWARD_SAFETY_V1"
 C_RULE_VERSION = "C_V2_PROTECT"
 C_MIN_MOMENTUM = 2.0
+C_ENTRY_VERSION = "C_ENTRY_BREAKOUT050_V1"
+C_ENTRY_BREAKOUT_MAX_PCT = 0.50
 C_MONITOR_STATE = {"last_check_utc": None, "checks": 0, "last_error": None}
 V90_LOCK = None
 # Historical paper trades are never automatically pruned.
@@ -764,7 +766,7 @@ async def v90_scan_once():
                                  if not (C_MIN_MOMENTUM if model == "C" else 2.5) <= ret <= 8.0: reason = "momentum_range"
                                  elif not 1.2 <= vol < 3.5: reason = "volume_range"
                                  elif z >= 3.5: reason = "z_extreme"
-                                 elif not 0.2 <= breakout <= 1.5: reason = "breakout_range"
+                                 elif not 0.2 <= breakout <= (C_ENTRY_BREAKOUT_MAX_PCT if model == "C" else 1.5): reason = "breakout_range"
                         elif model in ("V91_PULLBACK", "V913_PULLBACK_MARKET", "V913_PULLBACK_TRAIL15"):
                             if model == "V913_PULLBACK_MARKET" and (btc_ret60 is None or btc_ret60 < 0 or breadth is None or breadth < 0.50):
                                 reason = "market_regime"
@@ -839,6 +841,8 @@ async def v90_scan_once():
                                 "tp1_done":False,"trail_active":False,"research_only":True,"be_armed":False}
                             if variant == "C":
                                 entry_record.update(c_rule_version=C_RULE_VERSION, stop_price=ask * 0.98,
+                                    c_entry_version=C_ENTRY_VERSION,
+                                    c_entry_breakout_max_pct=C_ENTRY_BREAKOUT_MAX_PCT,
                                     paper_notional_usdt=100, assumed_cost_pct=V90_COST_PCT, orders=False)
                             if variant in C_SHADOW_MODELS:
                                 entry_record.update(c_forward_version=C_FORWARD_VERSION,
@@ -1681,7 +1685,9 @@ async def c_loss_analysis():
         breakdowns[field] = {k: v90_stats(v) for k, v in groups.items()}
     return {**MODE_INFO, "reference_model": "C", "paper_only": True,
         "version": "C_LOSS_OBSERVATION_V1", "entry_thresholds_and_exit_levels_unchanged": False,
-        "active_c_rule_version": C_RULE_VERSION, "c_v2_stats": v90_stats([t for t in rows if t.get("c_rule_version") == C_RULE_VERSION]),
+        "active_c_rule_version": C_RULE_VERSION, "active_c_entry_version": C_ENTRY_VERSION,
+        "c_entry_cohorts": c_entry_experiment_cohorts(rows),
+        "c_v2_stats": v90_stats([t for t in rows if t.get("c_rule_version") == C_RULE_VERSION]),
         "c_legacy_stats": v90_stats([t for t in rows if t.get("c_rule_version") != C_RULE_VERSION]),
         "c_v2_rules": {"min_ret60_pct": C_MIN_MOMENTUM, "initial_stop_pct": -2, "be_arm_pct": 1.5, "be_stop_pct": V90_COST_PCT, "partial_tp_pct": 3, "trailing_pct": 1.5, "max_hold_minutes": 120},
         "new_C_exit_monitor_seconds": C_MONITOR_SECONDS,
@@ -1768,6 +1774,28 @@ async def c_paper_shutdown():
         v903_save_state()
 
 
+def c_entry_experiment_cohorts(rows):
+    """Separate the new entry trial from historical V2; never rewrite old rows."""
+    c_rows = [t for t in rows if t.get("variant") == "C"]
+    return {
+        "baseline_v2": v90_stats([t for t in c_rows
+            if t.get("c_rule_version") == C_RULE_VERSION and not t.get("c_entry_version")]),
+        C_ENTRY_VERSION: v90_stats([t for t in c_rows
+            if t.get("c_entry_version") == C_ENTRY_VERSION]),
+    }
+
+
+@app.get("/c-entry-experiment")
+async def c_entry_experiment():
+    """Read-only diagnostics for the user-authorized incremental paper trial."""
+    return {**MODE_INFO, "paper_only": True, "entry_version": C_ENTRY_VERSION,
+        "exit_rule_version": C_RULE_VERSION,
+        "breakout_range_pct": [0.2, C_ENTRY_BREAKOUT_MAX_PCT],
+        "cohorts": c_entry_experiment_cohorts(V90_STATE["trades"]),
+        "last_scan": V90_STATE.get("last_scan"),
+        "note": "Forward paper experiment, not validated profitable. Historical baseline is not a simultaneous control."}
+
+
 @app.get("/paper-records")
 async def c_paper_records(limit: int = 250, offset: int = 0):
     """Read-only export of every retained status, never Telegram credentials."""
@@ -1775,3 +1803,4 @@ async def c_paper_records(limit: int = 250, offset: int = 0):
     return {**MODE_INFO, "total": len(V90_STATE["trades"]), "limit": limit,
         "offset": offset, "trades": V90_STATE["trades"][offset:offset + limit],
         "recovery_metadata": V90_STATE["recovery_metadata"]}
+
