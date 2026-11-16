@@ -6,9 +6,9 @@ from datetime import datetime, timezone
 
 import httpx
 
-MODEL = "TOP20_SCALP_V6"
-ACTIVE_MODELS = (MODEL, "TOP20_SCALP_V5", "TOP20_SCALP_V3", "TOP20_SCALP_V4", "TOP20_SCALP_V2", "TOP20_SCALP_V1")
-MIN_RET10_PCT = 0.0
+MODEL = "TOP20_SCALP_V7"
+ACTIVE_MODELS = (MODEL, "TOP20_SCALP_V6", "TOP20_SCALP_V5", "TOP20_SCALP_V3", "TOP20_SCALP_V4", "TOP20_SCALP_V2", "TOP20_SCALP_V1")
+MIN_RET10_PCT = 0.20
 MAX_RET10_PCT = 1.50
 MONITOR_SECONDS = 10
 SCAN_SECONDS = 60
@@ -18,14 +18,14 @@ MIN_DAILY_USDT = 1_000_000
 TP_GROSS_PCT = 0.40
 SL_GROSS_PCT = -0.25
 TIME_EXIT_MINUTES = 4
-CONFIRM_SECONDS = 25
-CONFIRM_MIN_BID_RISE_PCT = 0.03
+CONFIRM_SECONDS = 35
+CONFIRM_MIN_BID_RISE_PCT = 0.10
 EARLY_EXIT_SECONDS = 60
 EARLY_EXIT_LOSS_PCT = -0.10
 EARLY_EXIT_MAX_RISE_PCT = 0.15
 COST_PCT = 0.15
-MAX_SPREAD_PCT = 0.06
-MAX_CHASE_PCT = 0.12
+MAX_SPREAD_PCT = 0.04
+MAX_CHASE_PCT = 0.08
 COOLDOWN_SECONDS = 180
 
 
@@ -48,7 +48,7 @@ def confirm_early_momentum(raw, now_ms):
     baseline = sum(float(k[7]) for k in bars[-11:-1]) / 10
     ratio = float(last[7]) / baseline if baseline > 0 else 0
     if not (p1 >= 0.10 and p3 >= 0.20 and 0.15 <= p5 <= 0.80
-            and MIN_RET10_PCT < p10 <= MAX_RET10_PCT and ratio >= 1.5 and price > float(last[1])):
+            and MIN_RET10_PCT < p10 <= MAX_RET10_PCT and ratio >= 2.0 and price > float(last[1])):
         return None
     return {"signal_ms": int(last[6]), "signal_price": price,
             "ret1_pct": round(p1,5), "ret3_pct": round(p3,5),
@@ -109,10 +109,12 @@ class Top20Scalper:
                 t["max_bid"] = max(t.get("max_bid", t["entry_price"]), bid)
                 t["min_bid"] = min(t.get("min_bid", t["entry_price"]), bid)
                 age_ms = now_ms - t["entry_ms"]
-                # Keep the prior V5 profile for already-open positions.
-                is_v5 = t.get("variant") in ("TOP20_SCALP_V5", MODEL)
-                timeout_minutes = (TIME_EXIT_MINUTES if t.get("variant") == MODEL
-                                   else 5 if is_v5 else 10)
+                # Preserve each legacy position's original exit clock and early-exit rules.
+                variant = t.get("variant")
+                is_v5 = variant in ("TOP20_SCALP_V5", "TOP20_SCALP_V6", MODEL)
+                timeout_minutes = (TIME_EXIT_MINUTES if variant == MODEL
+                                   else 4 if variant == "TOP20_SCALP_V6"
+                                   else 5 if variant == "TOP20_SCALP_V5" else 10)
                 if is_v5:
                     samples = t.setdefault("early_bid_samples", [])
                     if age_ms <= 120_000:
@@ -447,7 +449,7 @@ class Top20Scalper:
             "model_name": MODEL, "paper_only": True, "auto_running": running,
             "scan_interval_seconds": SCAN_SECONDS, "max_open": MAX_OPEN,
             "universe_limit": MAX_UNIVERSE, "min_24h_quote_volume_usdt": MIN_DAILY_USDT,
-            "volume_spike_entry_required": True, "min_volume_ratio": 1.5,
+            "volume_spike_entry_required": True, "min_volume_ratio": 2.0,
             "momentum_windows_minutes": [1, 3, 5, 10],
             "min_ret10_pct": MIN_RET10_PCT, "max_ret10_pct": MAX_RET10_PCT,
             "tp_gross_pct": TP_GROSS_PCT, "sl_gross_pct": SL_GROSS_PCT,
@@ -460,7 +462,7 @@ class Top20Scalper:
             "stats": core.v90_stats(rows),
             "baseline_v5_stats": core.v90_stats([t for t in core.V90_STATE["trades"]
                                                if t.get("variant") == "TOP20_SCALP_V5"]),
-            "time_exit_minutes_by_model": {"TOP20_SCALP_V5": 5, MODEL: TIME_EXIT_MINUTES},
+            "time_exit_minutes_by_model": {"TOP20_SCALP_V5": 5, "TOP20_SCALP_V6": 4, MODEL: TIME_EXIT_MINUTES},
             "ret10_high_band_stats": core.v90_stats([t for t in rows if 1.0 <= t.get("ret10_pct", 0) <= MAX_RET10_PCT]),
             "open_positions": [{"symbol": t["symbol"], "entry_utc": t["entry_utc"],
                                 "entry_price": t["entry_price"], "take_profit_price": t["take_profit_price"],
