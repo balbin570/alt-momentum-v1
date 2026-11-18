@@ -913,8 +913,13 @@ async def v90_loop():
         await asyncio.sleep(V90_SCAN_SECONDS)
 
 
+TOP20_NEW_ENTRIES_ENABLED = False  # User requested TOP20 pause; preserve C and existing TOP20 position monitoring.
+
 async def top20_scalp_loop():
     while True:
+        if not TOP20_NEW_ENTRIES_ENABLED:
+            await asyncio.sleep(TOP20_SCAN_SECONDS)
+            continue
         started = time.monotonic()
         await TOP20_SCALPER.cycle(__import__(__name__))
         report = TOP20_SCALPER.report
