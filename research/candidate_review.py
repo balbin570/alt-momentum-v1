@@ -14,6 +14,12 @@ CANDIDATES = {
     'TOP20_SPREAD_003_V1': ('TOP20_SCALP_V5', 'spread_pct', 0.03),
     'C_BREAKOUT_050_V1': ('C_V2_PROTECT', 'breakout_pct', 0.50),
     'HIZLI_RET30_100_V1': ('HIZLI_BASELINE_9a0e1d4', 'ret30', 1.0),
+    'C_ENTRY_SPREAD010_V1': ('C_ENTRY_BREAKOUT050_V1', 'spread_pct', 0.10),
+}
+# Each newly proposed hypothesis starts its own untouched forward period.
+# The older candidates keep their original cutoff and cohort definitions.
+FROZEN_AT_BY_CANDIDATE = {
+    'C_ENTRY_SPREAD010_V1': '2026-11-18T06:50:00+00:00',
 }
 
 
@@ -49,7 +55,8 @@ def metrics(rows, extra_cost_pct=0.0):
 
 
 def review(rows, candidate, as_of):
-    cutoff, end = timestamp(FROZEN_AT), timestamp(as_of)
+    frozen_at = FROZEN_AT_BY_CANDIDATE.get(candidate, FROZEN_AT)
+    cutoff, end = timestamp(frozen_at), timestamp(as_of)
     seen, development, forward, unknown = set(), [], [], 0
     for row in rows:
         if row.get('cohort') != CANDIDATES[candidate][0]:
@@ -85,7 +92,7 @@ def review(rows, candidate, as_of):
                 and selected['profit_factor'] is not None and selected['profit_factor'] > 1
                 and stress['mean_net_pct'] > 0
                 and selected['mean_net_pct'] > baseline['mean_net_pct'])
-    return {'candidate': candidate, 'frozen_at': FROZEN_AT, 'as_of': as_of,
+    return {'candidate': candidate, 'frozen_at': frozen_at, 'as_of': as_of,
             'development_n': len(development), 'unknown_n': unknown,
             'forward_baseline': baseline, 'forward_kept': selected,
             'stress_extra_roundtrip_cost_pct': 0.10, 'stress_kept': stress,
@@ -105,3 +112,4 @@ if __name__ == '__main__':
     args = parser.parse_args()
     with open(args.input, encoding='utf-8') as source:
         print(json.dumps(review(json.load(source), args.candidate, args.as_of), indent=2, allow_nan=False))
+

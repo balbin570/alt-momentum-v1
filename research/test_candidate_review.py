@@ -45,6 +45,26 @@ class ReviewTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             review([row], 'TOP20_SPREAD_003_V1', '2026-11-17T00:00:00Z')
 
+    def test_new_candidate_uses_its_own_future_cutoff(self):
+        row=self.row();row.update(cohort='C_ENTRY_BREAKOUT050_V1',
+            entry_utc='2026-11-18T06:49:00Z',exit_utc='2026-11-18T07:00:00Z')
+        r=review([row],'C_ENTRY_SPREAD010_V1','2026-11-19T00:00:00Z')
+        self.assertEqual('2026-11-18T06:50:00+00:00',r['frozen_at'])
+        self.assertEqual(1,r['development_n'])
+        self.assertEqual(0,r['forward_baseline']['n'])
+        self.assertFalse(r['promotion_allowed'])
+
+    def test_new_candidate_boundary_and_old_c_cohort_excluded(self):
+        self.assertTrue(accepts({'cohort':'C_ENTRY_BREAKOUT050_V1','spread_pct':.10},'C_ENTRY_SPREAD010_V1'))
+        self.assertFalse(accepts({'cohort':'C_ENTRY_BREAKOUT050_V1','spread_pct':.1001},'C_ENTRY_SPREAD010_V1'))
+        self.assertIsNone(accepts({'cohort':'C_V2_PROTECT','spread_pct':.01},'C_ENTRY_SPREAD010_V1'))
+
+    def test_new_forward_window_does_not_reclassify_old_hypotheses(self):
+        row=self.row()
+        r=review([row],'TOP20_SPREAD_003_V1','2026-11-17T00:00:00Z')
+        self.assertEqual('2026-11-15T22:45:00+00:00',r['frozen_at'])
+        self.assertEqual(1,r['forward_baseline']['n'])
+
     def test_other_candidate_boundaries(self):
         self.assertTrue(accepts({'cohort':'C_V2_PROTECT','breakout_pct':0.5},'C_BREAKOUT_050_V1'))
         self.assertFalse(accepts({'cohort':'HIZLI_BASELINE_9a0e1d4','ret30':1.01},'HIZLI_RET30_100_V1'))
@@ -52,3 +72,4 @@ class ReviewTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
