@@ -217,9 +217,9 @@ TOP20_SCALPER = Top20Scalper()
 C_MONITOR_SECONDS = 60
 C_FORWARD_VERSION = "C_FORWARD_SAFETY_V1"
 C_RULE_VERSION = "C_V2_PROTECT"
-C_MIN_MOMENTUM = 2.0
-C_ENTRY_VERSION = "C_ENTRY_BREAKOUT050_V1"
-C_ENTRY_BREAKOUT_MAX_PCT = 0.50
+C_MIN_MOMENTUM = 2.5
+C_ENTRY_VERSION = "C_LEGACY_RESTORED_20261119"
+C_ENTRY_BREAKOUT_MAX_PCT = 1.50
 C_MONITOR_STATE = {"last_check_utc": None, "checks": 0, "last_error": None}
 V90_LOCK = None
 # Historical paper trades are never automatically pruned.
@@ -840,7 +840,7 @@ async def v90_scan_once():
                                 "chase_pct":round(chase,5),"max_bid":ask,"min_bid":ask,
                                 "tp1_done":False,"trail_active":False,"research_only":True,"be_armed":False}
                             if variant == "C":
-                                entry_record.update(c_rule_version=C_RULE_VERSION, stop_price=ask * 0.98,
+                                entry_record.update(stop_price=ask * 0.97,
                                     c_entry_version=C_ENTRY_VERSION,
                                     c_entry_breakout_max_pct=C_ENTRY_BREAKOUT_MAX_PCT,
                                     paper_notional_usdt=100, assumed_cost_pct=V90_COST_PCT, orders=False)
