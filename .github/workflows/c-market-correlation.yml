@@ -1,0 +1,23 @@
+name: Legacy C market correlation
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - research/c_market_correlation.py
+      - .github/workflows/c-market-correlation.yml
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install scipy
+      - run: python research/c_market_correlation.py
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: legacy-c-market-analysis
+          path: research/results/
