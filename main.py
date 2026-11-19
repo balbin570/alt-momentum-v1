@@ -215,6 +215,7 @@ TOP20_TASK = None
 TOP20_MONITOR_TASK = None
 TOP20_SCALPER = Top20Scalper()
 C_MONITOR_SECONDS = 60
+C_EARLY_SHADOW_MODELS = ('C_EARLY_EXIT_5M_NEG05', 'C_EARLY_EXIT_10M_NEG')
 C_FORWARD_VERSION = "C_FORWARD_SAFETY_V1"
 C_RULE_VERSION = "C_V2_PROTECT"
 C_MIN_MOMENTUM = 2.5
@@ -483,7 +484,7 @@ async def v90_monitor(client, fast_only=False):
     now_ms = int(time.time()*1000)
     active = [t for t in V90_STATE["trades"] if t["status"] == "OPEN_SHADOW"
               and t.get("variant") not in TOP20_ACTIVE_MODELS
-              and (not fast_only or (t.get("variant") in ("C", *C_SHADOW_MODELS) and
+              and (not fast_only or (t.get("variant") in ("C", *C_SHADOW_MODELS, *C_EARLY_SHADOW_MODELS) and
                    t.get("c_forward_version") == C_FORWARD_VERSION))]
     for sym in set(t["symbol"] for t in active):
         try:
@@ -498,6 +499,29 @@ async def v90_monitor(client, fast_only=False):
             t["max_bid"] = max(t.get("max_bid",t["entry_price"]), bid)
             t["min_bid"] = min(t.get("min_bid",t["entry_price"]), bid)
             t["last_bid"] = bid
+            if t["variant"] in C_EARLY_SHADOW_MODELS:
+                elapsed = (now_ms - t["entry_ms"]) / 60000
+                checkpoint = 5 if t["variant"] == C_EARLY_SHADOW_MODELS[0] else 10
+                if elapsed >= checkpoint and not t.get("early_checked"):
+                    t["early_checked"] = True
+                    t["early_observed_ms"] = now_ms
+                    t["early_observed_bid"] = bid
+                    gross = pct_change(t["entry_price"], bid)
+                    t["early_observed_gross_pct"] = round(gross, 5)
+                    if gross < (-0.5 if checkpoint == 5 else 0.0):
+                        v90_close(t, bid, f"EARLY_{checkpoint}M_EXIT", now_ms)
+                        continue
+                baseline = next((x for x in V90_STATE["trades"]
+                                 if x.get("variant") == "C" and x.get("symbol") == t["symbol"]
+                                 and x.get("entry_ms") == t["entry_ms"]), None)
+                if baseline and baseline["status"] == "CLOSED_SHADOW":
+                    v90_close(t, baseline["exit_price"], "BASELINE_" + baseline["exit_reason"], now_ms)
+                elif not baseline:
+                    if bid <= t["stop_price"]:
+                        v90_close(t, bid, "STOP_MONITORED", now_ms)
+                    elif elapsed >= 120:
+                        v90_close(t, bid, "TIME120", now_ms)
+                continue
             if t["variant"] in C_NEW_VARIANTS:
                 c_new_monitor(t, bid, now_ms)
                 continue
@@ -568,6 +592,14 @@ async def v90_monitor(client, fast_only=False):
                    f"Giris: {t['entry_price']:.10g} | Cikis: {t['exit_price']:.10g}\n"
                    "STOPS UYGULANMADI | PAPER ONLY | GERCEK EMIR YOK")
             await v902_notify(msg, "EXIT_" + C_OBS120, t["symbol"])
+            continue
+        if t["variant"] in C_EARLY_SHADOW_MODELS:
+            msg = (f"C ERKEN CIKIS SHADOW PAPER SATIS\n{t['symbol']} | {t['variant']}\n"
+                   f"Net: {t['net_pct']:+.3f}% | Neden: {t['exit_reason']}\n"
+                   f"Giris: {t['entry_price']:.10g} | Gozlenen bid: {t['exit_price']:.10g}\n"
+                   f"Maliyet: {V90_COST_PCT:.2f}% | Sure: {t['hold_minutes']:.1f} dk\n"
+                   "PAPER ONLY | GERCEK EMIR YOK")
+            await v902_notify(msg, "EXIT_" + t["variant"], t["symbol"])
             continue
         msg = (f"ALT V90.3 PAPER CIKIS\n{t['symbol']} | Model {t['variant']}\n"
                f"Net: {t['net_pct']:+.3f}% | Neden: {t['exit_reason']}\n"
@@ -850,6 +882,16 @@ async def v90_scan_once():
                                     shadow_entry_version="C_SHADOW_MOM1_FORWARD_V1")
                             V90_STATE["trades"].append(entry_record)
                             active_by_model[variant].add(sym)
+                            if variant == "C":
+                                for shadow_variant in C_EARLY_SHADOW_MODELS:
+                                    V90_STATE["trades"].append({
+                                        **entry_record, "variant": shadow_variant,
+                                        "status": "OPEN_SHADOW", "early_checked": False,
+                                        "c_forward_version": C_FORWARD_VERSION,
+                                        "exit_monitor_seconds": C_MONITOR_SECONDS,
+                                        "source_model": "C", "orders": False,
+                                        "stop_price": ask * 0.97,
+                                    })
                             if variant == "C_TREND":
                                 # Five independent shadow exits; entry and stop match C_TREND.
                                 for arm in C_NEW_VARIANTS:
@@ -876,11 +918,20 @@ async def v90_scan_once():
                         scan["new_coins"]+=1
                         V90_STATE["signals"]+=1
                         msg = (f"ALT V91 PAPER GIRIS\n{sym} | {', '.join(selected)}\n"
-                               f"Giris: {ask:.10g} | Stop: {ask*(0.98 if 'C' in selected else 0.97):.10g}\n"
+                               f"Giris: {ask:.10g} | Stop: {ask*0.97:.10g}\n"
                                f"Momentum60: {c['ret60_pct']:+.2f}% | Hacim: {c['volume_ratio']:.2f}x\n"
                                "PAPER ONLY | GERCEK EMIR YOK")
                         v903_save_state()
                         await v902_notify(msg, "ENTRY", sym)
+                        if "C" in selected:
+                            for shadow_variant in C_EARLY_SHADOW_MODELS:
+                                await v902_notify(
+                                    f"C ERKEN CIKIS SHADOW PAPER ALIS\n{sym} | {shadow_variant}\n"
+                                    f"Giris (ask): {ask:.10g} | Nominal: 100 USDT\n"
+                                    f"5dk esik: -0.50% | 10dk esik: <0%\n"
+                                    f"Maliyet: {V90_COST_PCT:.2f}%\n"
+                                    "PAPER ONLY | GERCEK EMIR YOK",
+                                    "ENTRY_" + shadow_variant, sym)
                         v903_save_state()
                     except Exception as exc:
                         scan["errors"]+=1
