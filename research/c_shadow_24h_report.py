@@ -15,3 +15,15 @@ for v in models:
  vals=[t["net_pct"] for t in closed]; wins=[x for x in vals if x>0];losses=[x for x in vals if x<0]
  early=[t for t in closed if str(t.get("exit_reason","")).startswith("EARLY_")]
  print(json.dumps({"model":v,"entries_24h":len(ts),"closed_of_entries":len(closed),"open":len(ts)-len(closed),"wins":len(wins),"win_rate_pct":round(len(wins)/len(vals)*100,2) if vals else None,"mean_net_pct":round(statistics.mean(vals),5) if vals else None,"sum_net_pct":round(sum(vals),5),"profit_factor":round(sum(wins)/-sum(losses),4) if losses else None,"early_exits":len(early),"recent": [{"symbol":t.get("symbol"),"net_pct":t["net_pct"],"reason":t.get("exit_reason")} for t in closed[-6:]]},ensure_ascii=False),flush=True)
+
+# Extra audit: all large realized winners and exits within the window,
+# including positions entered before the 24-hour cutoff.
+print("=== LARGE_WINNERS_ALL_HISTORY ===",flush=True)
+for v in models:
+ winners=sorted([t for t in rows if t.get("variant")==v and t.get("status")=="CLOSED_SHADOW" and isinstance(t.get("net_pct"),(int,float)) and t["net_pct"]>=5],key=lambda t:t["net_pct"],reverse=True)
+ print(json.dumps({"model":v,"large_winners_count":len(winners),"top": [{"symbol":t.get("symbol"),"entry_utc":t.get("entry_utc"),"exit_utc":t.get("exit_utc"),"net_pct":t.get("net_pct"),"reason":t.get("exit_reason")} for t in winners[:30]]}),flush=True)
+print("=== CLOSED_IN_LAST_24H ===",flush=True)
+for v in models:
+ ts=[t for t in rows if t.get("variant")==v and t.get("status")=="CLOSED_SHADOW" and isinstance(t.get("net_pct"),(int,float)) and t.get("exit_utc") and datetime.datetime.fromisoformat(t["exit_utc"].replace("Z","+00:00"))>=start]
+ vals=[t["net_pct"] for t in ts]; gains=[x for x in vals if x>0];loss=[x for x in vals if x<0]
+ print(json.dumps({"model":v,"closed_24h":len(ts),"wins":len(gains),"win_rate_pct":round(100*len(gains)/len(vals),2) if vals else None,"mean_net_pct":round(statistics.mean(vals),5) if vals else None,"sum_net_pct":round(sum(vals),5),"profit_factor":round(sum(gains)/-sum(loss),4) if loss else None,"best": [{"symbol":t.get("symbol"),"net_pct":t["net_pct"],"exit_utc":t.get("exit_utc")} for t in sorted(ts,key=lambda t:t["net_pct"],reverse=True)[:10]]}),flush=True)
