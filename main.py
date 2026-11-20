@@ -217,7 +217,6 @@ TOP20_SCALPER = Top20Scalper()
 C_MONITOR_SECONDS = 60
 C_EARLY_SHADOW_MODELS = ('C_EARLY_EXIT_5M_NEG05', 'C_EARLY_EXIT_10M_NEG')
 # Independent, higher-frequency paper entry cohorts. Original C and mirrored exits stay unchanged.
-C_MORE_ENTRY_MODELS = ('C_5M_MORE_ENTRIES_V1', 'C_10M_MORE_ENTRIES_V1')
 C_FORWARD_VERSION = "C_FORWARD_SAFETY_V1"
 C_RULE_VERSION = "C_V2_PROTECT"
 C_MIN_MOMENTUM = 2.5
@@ -241,6 +240,7 @@ V97_TRAIL_STOPS = {"C_SL5_TRAIL5": 0.95, "C_SL10_TRAIL5": 0.90}
 V93_ALL_ACTIVE = ("C",)
 # New independent forward-only paper research model. Baseline C stays untouched.
 C_SHADOW_MODELS = ("C_SHADOW_MOM1", "C_SHADOW_V4_C_EXIT")
+C_MORE_ENTRY_MODELS = ('C_5M_MORE_ENTRIES_V1', 'C_10M_MORE_ENTRIES_V1')
 C_ENTRY_MODELS = V93_ALL_ACTIVE + C_MORE_ENTRY_MODELS  # baseline C unchanged; two independent paper cohorts
 C_NEW_VARIANTS = ("C_LADDER3", "C_LADDER4", "C_PROTECT", "C_TRAIL_PRO", "C_TIME_ADAPT")
 C_FROZEN_VARIANTS = ("C_TREND", "C_BE", "C_OBS120", "C_CONFIRM1", *C_NEW_VARIANTS)
