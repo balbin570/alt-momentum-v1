@@ -1,0 +1,17 @@
+name: C shadow 24h performance report
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/c-shadow-24h-report.yml
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install requests
+      - name: Compute matched C shadow performance
+        run: python research/c_shadow_24h_report.py
