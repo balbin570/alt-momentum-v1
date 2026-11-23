@@ -1,9 +1,10 @@
-name: C shadow 24h performance report
+name: C and independent 5m/10m 24h performance report
 on:
   workflow_dispatch:
   push:
     paths:
       - .github/workflows/c-shadow-24h-report.yml
+      - research/c_shadow_24h_report.py
 jobs:
   report:
     runs-on: ubuntu-latest
