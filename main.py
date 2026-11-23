@@ -988,6 +988,96 @@ async def v90_scan_once():
                         scan["errors"]+=1
                         for model in selected: model_rejected[model]["entry_exception"] += 1
                         V90_STATE["last_error"] = "entry: " + str(exc)[:180]
+                # Independent pullback paper scanner; existing C and 5m logic stays unchanged.
+                pb_rejected = Counter()
+                pb_open = {t["symbol"] for t in V90_STATE["trades"]
+                           if t.get("variant") == C_PULLBACK_MODEL and t.get("status") == "OPEN_SHADOW"}
+                pb_new = 0
+                for candidate in candidates:
+                    if not 1.5 <= candidate["ret60_pct"] <= 6.0:
+                        pb_rejected["momentum_range"] += 1
+                        continue
+                    sym = candidate["symbol"]
+                    if sym in pb_open or len(pb_open) >= 5:
+                        pb_rejected["open_or_capacity"] += 1
+                        continue
+                    try:
+                        minutes = await get_completed_1m_candles(client, sym, limit=12)
+                        if len(minutes) < 9:
+                            pb_rejected["insufficient_1m"] += 1
+                            continue
+                        latest = minutes[-1]
+                        age_s = (int(time.time() * 1000) - latest["close_time"]) / 1000
+                        if not 0 <= age_s < 120:
+                            pb_rejected["stale_1m"] += 1
+                            continue
+                        prior = minutes[-6:-1]
+                        reference_high = max(x["high"] for x in prior)
+                        pullback_low = min(x["low"] for x in prior)
+                        dip_pct = (reference_high - pullback_low) / reference_high * 100
+                        if not 0.3 <= dip_pct <= 1.2:
+                            pb_rejected["pullback_depth"] += 1
+                            continue
+                        if not (latest["close"] > latest["open"]
+                                and latest["close"] > prior[-1]["close"]
+                                and latest["close"] > candidate["ema20_5m"]):
+                            pb_rejected["reclaim_or_ema"] += 1
+                            continue
+                        avg_vol = sum(x["volume"] for x in minutes[-7:-1]) / 6
+                        ratio = latest["volume"] / avg_vol if avg_vol > 0 else 0
+                        if ratio < 1.3:
+                            pb_rejected["volume_ratio"] += 1
+                            continue
+                        dedup_key = f'{C_PULLBACK_MODEL}:{sym}:{latest["close_time"]}'
+                        if dedup_key in V90_STATE["seen"]:
+                            pb_rejected["already_seen"] += 1
+                            continue
+                        if V915_STORAGE["last_save_ok"] is False:
+                            pb_rejected["storage_unavailable"] += 1
+                            continue
+                        quote = await get_json(client, "/api/v3/ticker/bookTicker", {"symbol": sym})
+                        ask, bid = float(quote["askPrice"]), float(quote["bidPrice"])
+                        if ask <= 0 or bid <= 0:
+                            pb_rejected["invalid_quote"] += 1
+                            continue
+                        spread = (ask - bid) / ask * 100
+                        chase = pct_change(latest["close"], ask)
+                        if spread > 0.08 or chase > 0.5:
+                            pb_rejected["spread_or_chase"] += 1
+                            continue
+                        entry_ms = int(time.time() * 1000)
+                        trade = {**candidate, "variant": C_PULLBACK_MODEL,
+                                 "status": "OPEN_SHADOW", "entry_utc": utc_now(),
+                                 "entry_ms": entry_ms, "entry_price": ask,
+                                 "stop_price": ask * 0.988, "target_price": ask * 1.02,
+                                 "spread_pct": round(spread, 5), "chase_pct": round(chase, 5),
+                                 "pullback_depth_pct": round(dip_pct, 5),
+                                 "reclaim_volume_ratio": round(ratio, 5),
+                                 "reclaim_1m_close_time": latest["close_time"],
+                                 "c_forward_version": C_FORWARD_VERSION,
+                                 "exit_monitor_seconds": C_MONITOR_SECONDS,
+                                 "paper_notional_usdt": 100, "assumed_cost_pct": V90_COST_PCT,
+                                 "research_only": True, "orders": False, "max_bid": ask,
+                                 "min_bid": ask}
+                        V90_STATE["trades"].append(trade)
+                        V90_STATE["seen"][dedup_key] = entry_ms
+                        pb_open.add(sym)
+                        pb_new += 1
+                        V90_STATE["signals"] += 1
+                        v903_save_state()
+                        await v902_notify(
+                            f"C-PULLBACK-5M-V1 PAPER GIRIS\n{sym}\n"
+                            f"Giris ask: {ask:.10g} | Stop -1.2%: {ask * 0.988:.10g}\n"
+                            f"TP +2%: {ask * 1.02:.10g} | Max: 30 dk\n"
+                            f"Momentum60: {candidate['ret60_pct']:+.2f}% | Dip: {dip_pct:.2f}%\n"
+                            f"1m hacim: {ratio:.2f}x | Spread: {spread:.3f}%\n"
+                            "PAPER ONLY | GERCEK EMIR YOK",
+                            "ENTRY_" + C_PULLBACK_MODEL, sym)
+                    except Exception as exc:
+                        pb_rejected["exception"] += 1
+                        V90_STATE["last_error"] = "pullback: " + type(exc).__name__ + ": " + str(exc)[:120]
+                scan["pullback_5m"] = {"evaluated": len(candidates), "new_positions": pb_new,
+                                       "open_positions": len(pb_open), "rejected": dict(pb_rejected)}
                 scan["model_filters"] = {m:{"evaluated":len(candidates), "passed_entry_filters":model_passed[m],
                     "rejected":dict(model_rejected[m]),
                     "new_positions":sum(t["variant"]==m and t["entry_ms"] >= scan_started_ms for t in V90_STATE["trades"]),
