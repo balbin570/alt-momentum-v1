@@ -241,7 +241,9 @@ V93_ALL_ACTIVE = ("C",)
 # New independent forward-only paper research model. Baseline C stays untouched.
 C_SHADOW_MODELS = ("C_SHADOW_MOM1", "C_SHADOW_V4_C_EXIT")
 C_MORE_ENTRY_MODELS = ('C_5M_MORE_ENTRIES_V1', 'C_10M_MORE_ENTRIES_V1')
-C_ENTRY_MODELS = V93_ALL_ACTIVE + C_MORE_ENTRY_MODELS  # baseline C unchanged; two independent paper cohorts
+C_ACTIVE_MORE_ENTRY_MODELS = ('C_5M_MORE_ENTRIES_V1',)  # 10m paused for new entries; retain exit monitoring
+C_ACTIVE_EARLY_SHADOW_MODELS = ('C_EARLY_EXIT_5M_NEG05',)  # 10m paused for new entries; retain exit monitoring
+C_ENTRY_MODELS = V93_ALL_ACTIVE + C_ACTIVE_MORE_ENTRY_MODELS  # only C and independent 5m enter
 C_NEW_VARIANTS = ("C_LADDER3", "C_LADDER4", "C_PROTECT", "C_TRAIL_PRO", "C_TIME_ADAPT")
 C_FROZEN_VARIANTS = ("C_TREND", "C_BE", "C_OBS120", "C_CONFIRM1", *C_NEW_VARIANTS)
 # Passive mirror of C_TREND entries; not an active signal model.
@@ -896,7 +898,7 @@ async def v90_scan_once():
                             V90_STATE["trades"].append(entry_record)
                             active_by_model[variant].add(sym)
                             if variant == "C":
-                                for shadow_variant in C_EARLY_SHADOW_MODELS:
+                                for shadow_variant in C_ACTIVE_EARLY_SHADOW_MODELS:
                                     V90_STATE["trades"].append({
                                         **entry_record, "variant": shadow_variant,
                                         "status": "OPEN_SHADOW", "early_checked": False,
@@ -937,7 +939,7 @@ async def v90_scan_once():
                         v903_save_state()
                         await v902_notify(msg, "ENTRY", sym)
                         if "C" in selected:
-                            for shadow_variant in C_EARLY_SHADOW_MODELS:
+                            for shadow_variant in C_ACTIVE_EARLY_SHADOW_MODELS:
                                 await v902_notify(
                                     f"C ERKEN CIKIS SHADOW PAPER ALIS\n{sym} | {shadow_variant}\n"
                                     f"Giris (ask): {ask:.10g} | Nominal: 100 USDT\n"
