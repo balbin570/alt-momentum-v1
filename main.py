@@ -158,6 +158,14 @@ async def build_universe(client):
         return [dict(x) for x in data]
 
 
+async def get_completed_1m_candles(client, symbol, limit=12):
+    raw = await get_json(client, "/api/v3/klines", {"symbol": symbol, "interval": "1m", "limit": limit})
+    now_ms = int(time.time() * 1000)
+    return [{"open": float(k[1]), "high": float(k[2]), "low": float(k[3]),
+             "close": float(k[4]), "volume": float(k[5]), "close_time": int(k[6])}
+            for k in raw if int(k[6]) < now_ms]
+
+
 async def get_completed_5m_candles(client, symbol, limit=100):
     raw = await get_json(
         client,
@@ -244,6 +252,7 @@ C_MORE_ENTRY_MODELS = ('C_5M_MORE_ENTRIES_V1', 'C_10M_MORE_ENTRIES_V1')
 C_ACTIVE_MORE_ENTRY_MODELS = ('C_5M_MORE_ENTRIES_V1',)  # 10m paused for new entries; retain exit monitoring
 C_ACTIVE_EARLY_SHADOW_MODELS = ('C_EARLY_EXIT_5M_NEG05',)  # 10m paused for new entries; retain exit monitoring
 C_ENTRY_MODELS = V93_ALL_ACTIVE + C_ACTIVE_MORE_ENTRY_MODELS  # only C and independent 5m enter
+C_PULLBACK_MODEL = 'C-PULLBACK-5M-V1'  # separate paper-only strategy
 C_NEW_VARIANTS = ("C_LADDER3", "C_LADDER4", "C_PROTECT", "C_TRAIL_PRO", "C_TIME_ADAPT")
 C_FROZEN_VARIANTS = ("C_TREND", "C_BE", "C_OBS120", "C_CONFIRM1", *C_NEW_VARIANTS)
 # Passive mirror of C_TREND entries; not an active signal model.
@@ -488,7 +497,7 @@ async def v90_monitor(client, fast_only=False):
     now_ms = int(time.time()*1000)
     active = [t for t in V90_STATE["trades"] if t["status"] == "OPEN_SHADOW"
               and t.get("variant") not in TOP20_ACTIVE_MODELS
-              and (not fast_only or (t.get("variant") in ("C", *C_SHADOW_MODELS, *C_EARLY_SHADOW_MODELS, *C_MORE_ENTRY_MODELS) and
+              and (not fast_only or (t.get("variant") in ("C", *C_SHADOW_MODELS, *C_EARLY_SHADOW_MODELS, *C_MORE_ENTRY_MODELS, C_PULLBACK_MODEL) and
                    t.get("c_forward_version") == C_FORWARD_VERSION))]
     for sym in set(t["symbol"] for t in active):
         try:
@@ -503,6 +512,15 @@ async def v90_monitor(client, fast_only=False):
             t["max_bid"] = max(t.get("max_bid",t["entry_price"]), bid)
             t["min_bid"] = min(t.get("min_bid",t["entry_price"]), bid)
             t["last_bid"] = bid
+            if t["variant"] == C_PULLBACK_MODEL:
+                elapsed = (now_ms - t["entry_ms"]) / 60000
+                if bid <= t["stop_price"]:
+                    v90_close(t, bid, "PULLBACK_STOP", now_ms)
+                elif bid >= t["entry_price"] * 1.02:
+                    v90_close(t, bid, "PULLBACK_TP2", now_ms)
+                elif elapsed >= 30:
+                    v90_close(t, bid, "PULLBACK_TIME30", now_ms)
+                continue
             if t["variant"] in (*C_EARLY_SHADOW_MODELS, *C_MORE_ENTRY_MODELS):
                 elapsed = (now_ms - t["entry_ms"]) / 60000
                 checkpoint = 5 if t["variant"] in (C_EARLY_SHADOW_MODELS[0], C_MORE_ENTRY_MODELS[0]) else 10
@@ -596,6 +614,13 @@ async def v90_monitor(client, fast_only=False):
                    f"Giris: {t['entry_price']:.10g} | Cikis: {t['exit_price']:.10g}\n"
                    "STOPS UYGULANMADI | PAPER ONLY | GERCEK EMIR YOK")
             await v902_notify(msg, "EXIT_" + C_OBS120, t["symbol"])
+            continue
+        if t["variant"] == C_PULLBACK_MODEL:
+            msg = (f"C-PULLBACK-5M-V1 PAPER CIKIS\n{t['symbol']}\n"
+                   f"Net: {t['net_pct']:+.3f}% | Neden: {t['exit_reason']}\n"
+                   f"Giris: {t['entry_price']:.10g} | Cikis bid: {t['exit_price']:.10g}\n"
+                   "PAPER ONLY | GERCEK EMIR YOK")
+            await v902_notify(msg, "EXIT_" + C_PULLBACK_MODEL, t["symbol"])
             continue
         if t["variant"] in (*C_EARLY_SHADOW_MODELS, *C_MORE_ENTRY_MODELS):
             msg = (f"C ERKEN CIKIS SHADOW PAPER SATIS\n{t['symbol']} | {t['variant']}\n"
@@ -743,9 +768,13 @@ async def v90_scan_once():
                             if not 0 <= delay < V90_DELAY_SECONDS:
                                 rejected["signal_delay_outside_0_300_seconds"] += 1
                                 return None
+                            ema20 = statistics.mean(cs[:20])
+                            for close in cs[20:]:
+                                ema20 = close * (2 / 21) + ema20 * (19 / 21)
                             return {"symbol":item["symbol"],"ret60_pct":ret60,"volume_ratio":vol,
                                     "z":z,"breakout_pct":breakout,"signal_ms":signal_ms,
                                     "breakout_price":cs[-1],
+                                    "ema20_5m": ema20,
                                     "pullback_reclaim": (cs[-3] < cs[-4] and cs[-2] > cs[-3] and cs[-1] > cs[-2] and cs[-1] > cs[-7]),
                                     "ret15_pct": pct_change(cs[-4], cs[-1])}
                         except Exception:
@@ -1065,7 +1094,7 @@ async def v90_status():
             "frozen_legacy":V90_STATE["frozen_legacy"],
              "frozen_models":list(dict.fromkeys(V91_FROZEN + V92_RETIRED + V96_RETIRED +
                  tuple(m for m in (V91_MODELS + tuple(V93_TP_TARGETS) + V93_RISK_MODELS) if m not in V93_ALL_ACTIVE) + C_FROZEN_VARIANTS)),
-             "active_models":list(C_ENTRY_MODELS),
+             "active_models":list(C_ENTRY_MODELS) + [C_PULLBACK_MODEL],
             "observation_models": [],
             "independent_shadow_models":list(C_SHADOW_MODELS),
             "retained_exit_observation_models": list(C_NEW_VARIANTS),
