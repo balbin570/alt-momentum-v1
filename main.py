@@ -63,6 +63,26 @@ def pct_change(old, new):
     return ((new / old) - 1.0) * 100.0
 
 
+# Binance hisse/ETF tokenleri (ornek: TQQQB, NBISB, SNDKB). Bu bir alt coin stratejisi;
+# hisse tokenleri evrene girmemeli. Liste: S&P 500 + yaygin ABD ETF/hisseleri (us_tickers.txt).
+def _load_us_tickers():
+    path = Path(__file__).with_name("us_tickers.txt")
+    try:
+        return {x.strip().upper() for x in path.read_text(encoding="utf-8").split() if x.strip()}
+    except OSError:
+        return set()
+
+
+US_STOCK_TICKERS = _load_us_tickers()
+
+
+def is_tokenized_stock(base):
+    b = (base or "").upper()
+    if b in V26_NON_ALT_BASE_EXCLUSIONS:
+        return True
+    return len(b) >= 3 and b.endswith("B") and b[:-1] in US_STOCK_TICKERS
+
+
 def valid_base(base):
     return bool(base) and base not in EXCLUDED_BASES and not base.endswith(("UP","DOWN","BULL","BEAR"))
 
@@ -90,7 +110,7 @@ async def _build_universe_uncached(client):
         base = s.get("baseAsset")
         quote = s.get("quoteAsset")
 
-        if base and base.upper() in V26_NON_ALT_BASE_EXCLUSIONS:
+        if base and is_tokenized_stock(base):
             continue
 
         if quote != "USDT":
@@ -387,6 +407,29 @@ async def v915_storage_status():
             "current_trades_in_memory": len(V90_STATE["trades"]),
             "note": "Read-only endpoint; checkpoint is not overwritten or restarted."}
 
+
+
+# C durdurma kurali (onceden sabitlendi, 2026-11-24): bu tarihten sonra acilan C islemlerinden
+# 150'si kapandiginda ortalama net getiri pozitif degilse yeni C girisleri durur.
+# Mevcut acik islemlerin cikislari normal devam eder. Yeniden acmak bilincli bir kod degisikligi gerektirir.
+C_REVIEW_START_UTC = "2026-11-25T00:00:00+00:00"
+C_REVIEW_TRADES = 150
+
+
+def c_review_status():
+    closed = [t for t in V90_STATE.get("trades", [])
+              if t.get("variant") == "C" and t.get("status") == "CLOSED_SHADOW"
+              and str(t.get("entry_utc", "")) >= C_REVIEW_START_UTC
+              and isinstance(t.get("net_pct"), (int, float))]
+    closed.sort(key=lambda t: str(t.get("exit_utc", "")))
+    sample = closed[:C_REVIEW_TRADES]
+    mean = round(sum(t["net_pct"] for t in sample) / len(sample), 4) if sample else None
+    done = len(sample) >= C_REVIEW_TRADES
+    return {"rule": f"{C_REVIEW_TRADES} islem sonunda ortalama net <= 0 ise yeni C girisleri durur",
+            "start_utc": C_REVIEW_START_UTC, "closed": len(sample), "target": C_REVIEW_TRADES,
+            "mean_net_pct": mean, "complete": done,
+            "blocked": bool(done and mean is not None and mean <= 0),
+            "verdict": ("DURDURULDU" if done and mean <= 0 else "GECTI" if done else "DEVAM EDIYOR")}
 
 
 async def v902_notify(message, event, symbol):
@@ -730,6 +773,14 @@ async def v90_scan_once():
             async with httpx.AsyncClient(timeout=30.0, limits=httpx.Limits(max_connections=4, max_keepalive_connections=2)) as client:
                 await v90_monitor(client)
                 await cconfirm1_monitor(client)  # finish existing pending confirmations; no new ones
+                c_review = c_review_status()
+                if c_review["complete"] and not V90_STATE.get("c_review_notified"):
+                    V90_STATE["c_review_notified"] = c_review["verdict"]
+                    await v902_notify(f"ALT C DEGERLENDIRME ({c_review['closed']} islem)\n"
+                                      f"Ortalama net: {c_review['mean_net_pct']:+.3f}%\n"
+                                      f"Karar: {c_review['verdict']}"
+                                      + ("\nYeni C girisleri durduruldu. GERCEK EMIR YOK." if c_review["blocked"] else ""),
+                                      "C_REVIEW", "C")
                 universe = (await build_universe(client))[:100]
                 # Only one network scan, three paper valuation models.
                 semaphore = asyncio.Semaphore(3)
@@ -865,7 +916,9 @@ async def v90_scan_once():
                         else:
                             model_passed[model] += 1
                             # Dedup per model so one model cannot block another.
-                            if model in V94_MODELS and regimes[model]["mode"] == "PAUSE":
+                            if model == "C" and c_review["blocked"]:
+                                model_rejected[model]["c_review_stop"] += 1
+                            elif model in V94_MODELS and regimes[model]["mode"] == "PAUSE":
                                 model_rejected[model]["regime_pause"] += 1
                             elif model in V95_MODELS and early_regimes[model]["mode"] == "PAUSE":
                                 model_rejected[model]["regime_pause"] += 1
@@ -1145,6 +1198,11 @@ async def v90_startup():
 @app.get("/top20-scalp-status")
 async def top20_scalp_status():
     return TOP20_SCALPER.status(__import__(__name__), bool(TOP20_TASK and not TOP20_TASK.done() and TOP20_MONITOR_TASK and not TOP20_MONITOR_TASK.done()))
+
+
+@app.get("/c-review-status")
+async def c_review_endpoint():
+    return {**MODE_INFO, **c_review_status(), "tokenized_stock_tickers_loaded": len(US_STOCK_TICKERS)}
 
 
 @app.get("/c-shadow-mom1-status")
