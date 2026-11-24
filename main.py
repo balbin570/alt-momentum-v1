@@ -269,9 +269,9 @@ V93_ALL_ACTIVE = ("C",)
 # New independent forward-only paper research model. Baseline C stays untouched.
 C_SHADOW_MODELS = ("C_SHADOW_MOM1", "C_SHADOW_V4_C_EXIT")
 C_MORE_ENTRY_MODELS = ('C_5M_MORE_ENTRIES_V1', 'C_10M_MORE_ENTRIES_V1')
-C_ACTIVE_MORE_ENTRY_MODELS = ('C_5M_MORE_ENTRIES_V1',)  # 10m paused for new entries; retain exit monitoring
-C_ACTIVE_EARLY_SHADOW_MODELS = ('C_EARLY_EXIT_5M_NEG05',)  # 10m paused for new entries; retain exit monitoring
-C_ENTRY_MODELS = V93_ALL_ACTIVE + C_ACTIVE_MORE_ENTRY_MODELS  # only C and independent 5m enter
+C_ACTIVE_MORE_ENTRY_MODELS = ()  # 2026-11-24: kullanici istegiyle yeni giris kapali (5m ve 10m); acik islemlerin cikis takibi surer
+C_ACTIVE_EARLY_SHADOW_MODELS = ()  # 2026-11-24: kullanici istegiyle yeni giris kapali; acik islemlerin cikis takibi surer
+C_ENTRY_MODELS = V93_ALL_ACTIVE + C_ACTIVE_MORE_ENTRY_MODELS  # yalniz C (ve ayri dongude C-PULLBACK-5M-V1) yeni giris acar
 C_PULLBACK_MODEL = 'C-PULLBACK-5M-V1'  # separate paper-only strategy
 C_NEW_VARIANTS = ("C_LADDER3", "C_LADDER4", "C_PROTECT", "C_TRAIL_PRO", "C_TIME_ADAPT")
 C_FROZEN_VARIANTS = ("C_TREND", "C_BE", "C_OBS120", "C_CONFIRM1", *C_NEW_VARIANTS)
