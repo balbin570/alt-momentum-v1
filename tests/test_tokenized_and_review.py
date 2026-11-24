@@ -47,5 +47,13 @@ class CReviewTests(unittest.TestCase):
         self.assertEqual(app.c_review_status()["closed"], 0)
 
 
+
+class ActiveModelTests(unittest.TestCase):
+    def test_only_c_and_pullback_open_new_entries(self):
+        self.assertEqual(app.C_ENTRY_MODELS, ("C",))
+        self.assertEqual(app.C_ACTIVE_EARLY_SHADOW_MODELS, ())
+        self.assertEqual(app.C_PULLBACK_MODEL, "C-PULLBACK-5M-V1")
+
+
 if __name__ == "__main__":
     unittest.main()
