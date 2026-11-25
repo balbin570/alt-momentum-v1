@@ -250,6 +250,12 @@ C_RULE_VERSION = "C_V2_PROTECT"
 C_MIN_MOMENTUM = 2.5
 C_ENTRY_VERSION = "C_LEGACY_RESTORED_20261119"
 C_ENTRY_BREAKOUT_MAX_PCT = 1.50
+# 2026-11-25 (kullanici istegi): yeni C islemlerinde tek cikis kurali:
+# en yuksek bid'in %3 altinda takip eden stop + 120 dk sure dolumu. Baska cikis yok
+# (+%3 kismi kar hesabi, basabas ve C_V2 koruma kurallari bu islemlere uygulanmaz).
+C_EXIT_VERSION = "C_TRAIL3_TIME120"
+C_TRAIL_PCT = 3.0
+C_MAX_HOLD_MINUTES = 120
 C_MONITOR_STATE = {"last_check_utc": None, "checks": 0, "last_error": None}
 V90_LOCK = None
 # Historical paper trades are never automatically pruned.
@@ -598,6 +604,14 @@ async def v90_monitor(client, fast_only=False):
                     if field not in t and now_ms >= t["entry_ms"] + minute * 60000:
                         t[field] = {"observed_ms": now_ms,
                                     "gross_pct": round((bid / t["entry_price"] - 1) * 100, 5)}
+            if t["variant"] == "C" and t.get("c_exit_version") == C_EXIT_VERSION:
+                t["trail_active"] = True
+                t["stop_price"] = max(t["stop_price"], t["max_bid"] * (1 - C_TRAIL_PCT / 100))
+                if bid <= t["stop_price"]:
+                    v90_close(t, bid, "C_TRAIL3", now_ms)
+                elif now_ms >= t["entry_ms"] + C_MAX_HOLD_MINUTES * 60000:
+                    v90_close(t, bid, "TIME120", now_ms)
+                continue
             if t["variant"] == "B" and t["max_bid"] >= t["entry_price"] * 1.02:
                 t["stop_price"] = max(t["stop_price"], t["entry_price"])
             if (t["variant"] in V92_ALL_MODELS or t["variant"] in ("C_SL2", "C_SL25", "C_BE", "C_SHADOW_V4_C_EXIT", *V94_MODELS, *V95_MODELS)) and not t.get("tp1_done") and bid >= t["entry_price"]*1.03:
@@ -964,7 +978,8 @@ async def v90_scan_once():
                                 "chase_pct":round(chase,5),"max_bid":ask,"min_bid":ask,
                                 "tp1_done":False,"trail_active":False,"research_only":True,"be_armed":False}
                             if variant == "C":
-                                entry_record.update(stop_price=ask * 0.97,
+                                entry_record.update(stop_price=ask * (1 - C_TRAIL_PCT / 100),
+                                    c_exit_version=C_EXIT_VERSION,
                                     c_entry_version=C_ENTRY_VERSION,
                                     c_entry_breakout_max_pct=C_ENTRY_BREAKOUT_MAX_PCT,
                                     paper_notional_usdt=100, assumed_cost_pct=V90_COST_PCT, orders=False)
@@ -1015,7 +1030,8 @@ async def v90_scan_once():
                         scan["new_coins"]+=1
                         V90_STATE["signals"]+=1
                         msg = (f"ALT V91 PAPER GIRIS\n{sym} | {', '.join(selected)}\n"
-                               f"Giris: {ask:.10g} | Stop: {ask*0.97:.10g}\n"
+                               f"Giris: {ask:.10g} | Stop: {ask*0.97:.10g}"
+                               + (" (C: %3 takip eden stop, en fazla 120 dk)" if "C" in selected else "") + "\n"
                                f"Momentum60: {c['ret60_pct']:+.2f}% | Hacim: {c['volume_ratio']:.2f}x\n"
                                "PAPER ONLY | GERCEK EMIR YOK")
                         v903_save_state()
