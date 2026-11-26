@@ -415,27 +415,39 @@ async def v915_storage_status():
 
 
 
-# C durdurma kurali (onceden sabitlendi, 2026-11-24): bu tarihten sonra acilan C islemlerinden
-# 150'si kapandiginda ortalama net getiri pozitif degilse yeni C girisleri durur.
-# Mevcut acik islemlerin cikislari normal devam eder. Yeniden acmak bilincli bir kod degisikligi gerektirir.
-C_REVIEW_START_UTC = "2026-11-25T00:00:00+00:00"
+# Model durdurma kurallari (onceden sabitlendi). Baslangictan sonra acilan islemlerden 150'si kapandiginda
+# ortalama net getiri pozitif degilse modelin YENI girisleri durur; acik islemlerin cikislari normal devam eder.
+# C: 2026-11-26'da baslangic, yeni cikis kuralinin (PR #7, %3 takip eden stop + 120 dk) devreye girdigi ana alindi.
+# C-PULLBACK-5M-V1: kural 2026-11-26'da eklendi; sayim eklendigi andan baslar.
+C_REVIEW_START_UTC = "2026-11-25T19:10:00+00:00"
 C_REVIEW_TRADES = 150
+PB_REVIEW_START_UTC = "2026-11-26T19:00:00+00:00"
+PB_REVIEW_TRADES = 150
+
+
+def model_review_status(variant, start_utc, target):
+    closed = [t for t in V90_STATE.get("trades", [])
+              if t.get("variant") == variant and t.get("status") == "CLOSED_SHADOW"
+              and str(t.get("entry_utc", "")) >= start_utc
+              and isinstance(t.get("net_pct"), (int, float))]
+    closed.sort(key=lambda t: str(t.get("exit_utc", "")))
+    sample = closed[:target]
+    mean = round(sum(t["net_pct"] for t in sample) / len(sample), 4) if sample else None
+    done = len(sample) >= target
+    return {"model": variant, "rule": f"{target} islem sonunda ortalama net <= 0 ise yeni {variant} girisleri durur",
+            "start_utc": start_utc, "closed": len(sample), "target": target,
+            "mean_net_pct": mean, "complete": done,
+            "win_rate_pct": round(100 * sum(1 for t in sample if t["net_pct"] > 0) / len(sample), 2) if sample else None,
+            "blocked": bool(done and mean is not None and mean <= 0),
+            "verdict": ("DURDURULDU" if done and mean <= 0 else "GECTI" if done else "DEVAM EDIYOR")}
 
 
 def c_review_status():
-    closed = [t for t in V90_STATE.get("trades", [])
-              if t.get("variant") == "C" and t.get("status") == "CLOSED_SHADOW"
-              and str(t.get("entry_utc", "")) >= C_REVIEW_START_UTC
-              and isinstance(t.get("net_pct"), (int, float))]
-    closed.sort(key=lambda t: str(t.get("exit_utc", "")))
-    sample = closed[:C_REVIEW_TRADES]
-    mean = round(sum(t["net_pct"] for t in sample) / len(sample), 4) if sample else None
-    done = len(sample) >= C_REVIEW_TRADES
-    return {"rule": f"{C_REVIEW_TRADES} islem sonunda ortalama net <= 0 ise yeni C girisleri durur",
-            "start_utc": C_REVIEW_START_UTC, "closed": len(sample), "target": C_REVIEW_TRADES,
-            "mean_net_pct": mean, "complete": done,
-            "blocked": bool(done and mean is not None and mean <= 0),
-            "verdict": ("DURDURULDU" if done and mean <= 0 else "GECTI" if done else "DEVAM EDIYOR")}
+    return model_review_status("C", C_REVIEW_START_UTC, C_REVIEW_TRADES)
+
+
+def pullback_review_status():
+    return model_review_status(C_PULLBACK_MODEL, PB_REVIEW_START_UTC, PB_REVIEW_TRADES)
 
 
 async def v902_notify(message, event, symbol):
@@ -795,6 +807,14 @@ async def v90_scan_once():
                                       f"Karar: {c_review['verdict']}"
                                       + ("\nYeni C girisleri durduruldu. GERCEK EMIR YOK." if c_review["blocked"] else ""),
                                       "C_REVIEW", "C")
+                pb_review = pullback_review_status()
+                if pb_review["complete"] and not V90_STATE.get("pb_review_notified"):
+                    V90_STATE["pb_review_notified"] = pb_review["verdict"]
+                    await v902_notify(f"ALT C-PULLBACK DEGERLENDIRME ({pb_review['closed']} islem)\n"
+                                      f"Ortalama net: {pb_review['mean_net_pct']:+.3f}%\n"
+                                      f"Karar: {pb_review['verdict']}"
+                                      + ("\nYeni C-PULLBACK girisleri durduruldu. GERCEK EMIR YOK." if pb_review["blocked"] else ""),
+                                      "PB_REVIEW", C_PULLBACK_MODEL)
                 universe = (await build_universe(client))[:100]
                 # Only one network scan, three paper valuation models.
                 semaphore = asyncio.Semaphore(3)
@@ -1062,7 +1082,7 @@ async def v90_scan_once():
                 pb_open = {t["symbol"] for t in V90_STATE["trades"]
                            if t.get("variant") == C_PULLBACK_MODEL and t.get("status") == "OPEN_SHADOW"}
                 pb_new = 0
-                for candidate in candidates:
+                for candidate in (candidates if not pb_review["blocked"] else []):
                     if not 1.5 <= candidate["ret60_pct"] <= 6.0:
                         pb_rejected["momentum_range"] += 1
                         continue
@@ -1145,6 +1165,8 @@ async def v90_scan_once():
                     except Exception as exc:
                         pb_rejected["exception"] += 1
                         V90_STATE["last_error"] = "pullback: " + type(exc).__name__ + ": " + str(exc)[:120]
+                if pb_review["blocked"]:
+                    pb_rejected["review_stop"] = len(candidates)
                 scan["pullback_5m"] = {"evaluated": len(candidates), "new_positions": pb_new,
                                        "open_positions": len(pb_open), "rejected": dict(pb_rejected)}
                 scan["model_filters"] = {m:{"evaluated":len(candidates), "passed_entry_filters":model_passed[m],
@@ -1218,7 +1240,23 @@ async def top20_scalp_status():
 
 @app.get("/c-review-status")
 async def c_review_endpoint():
-    return {**MODE_INFO, **c_review_status(), "tokenized_stock_tickers_loaded": len(US_STOCK_TICKERS)}
+    return {**MODE_INFO, **c_review_status(), "tokenized_stock_tickers_loaded": len(US_STOCK_TICKERS),
+            "pullback": pullback_review_status()}
+
+
+@app.get("/pullback-status")
+async def pullback_status_endpoint():
+    rows = [t for t in V90_STATE["trades"] if t.get("variant") == C_PULLBACK_MODEL]
+    closed = [t for t in rows if t.get("status") == "CLOSED_SHADOW"]
+    reasons = {}
+    for t in closed:
+        reasons.setdefault(t.get("exit_reason", "UNKNOWN"), []).append(t)
+    return {**MODE_INFO, "model": C_PULLBACK_MODEL,
+            "all_time": v90_stats(rows),
+            "exit_reasons": {k: v90_stats(v) for k, v in sorted(reasons.items())},
+            "review": pullback_review_status(),
+            "open": [{"symbol": t["symbol"], "entry_utc": t.get("entry_utc"), "entry_price": t.get("entry_price")}
+                     for t in rows if t.get("status") == "OPEN_SHADOW"]}
 
 
 @app.get("/c-shadow-mom1-status")
