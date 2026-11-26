@@ -55,5 +55,30 @@ class ActiveModelTests(unittest.TestCase):
         self.assertEqual(app.C_PULLBACK_MODEL, "C-PULLBACK-5M-V1")
 
 
+class PullbackReviewTests(unittest.TestCase):
+    def setUp(self):
+        self.saved = list(app.V90_STATE.get("trades", []))
+
+    def tearDown(self):
+        app.V90_STATE["trades"] = self.saved
+
+    def trades(self, n, net, entry="2026-11-27T00:00:00+00:00"):
+        return [{"variant": app.C_PULLBACK_MODEL, "status": "CLOSED_SHADOW", "entry_utc": entry,
+                 "exit_utc": f"2026-12-01T00:{i // 60:02d}:{i % 60:02d}+00:00", "net_pct": net} for i in range(n)]
+
+    def test_blocks_when_negative(self):
+        app.V90_STATE["trades"] = self.trades(150, -0.2)
+        r = app.pullback_review_status()
+        self.assertTrue(r["blocked"])
+        self.assertFalse(app.c_review_status()["blocked"])
+
+    def test_counts_only_after_start(self):
+        app.V90_STATE["trades"] = self.trades(150, -0.2, entry="2026-11-26T10:00:00+00:00")
+        self.assertEqual(app.pullback_review_status()["closed"], 0)
+
+    def test_c_review_starts_at_new_exit_rule(self):
+        self.assertEqual(app.C_REVIEW_START_UTC, "2026-11-25T19:10:00+00:00")
+
+
 if __name__ == "__main__":
     unittest.main()
